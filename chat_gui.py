@@ -1,8 +1,12 @@
-#!/usr/bin/env python3
+##!/usr/bin/env python3
 """
-chat_gui.py — v1.4.2 — ENCRYPTED instant messenger with a desktop GUI.
+chat_gui.py — v1.4.3 — ENCRYPTED instant messenger with a desktop GUI.to be added
 
 Fixes in this version:
+- Fixed roster synchronization so guests accurately see when a user disconnects.
+- Prevented admins from running moderation commands (kick/ban/etc) on the host.
+
+Fixes in 1.4.2:
 - Added an in-app, signature-verified update checker (see UPDATE_MANIFEST_URL below).
 - Minor UI/UX polish and cleanup pass.
 
@@ -82,7 +86,7 @@ except ImportError:
 if sys.platform == "darwin":
     ensure_installed("pyobjus", required=False)
 
-VERSION = "1.4.2"
+VERSION = "1.4.2a"
 MSG_LEN_BYTES = 4
 MAX_GUESTS = 4
 MAX_FILE_BYTES = 500 * 1024 * 1024 # 500MB Limit
