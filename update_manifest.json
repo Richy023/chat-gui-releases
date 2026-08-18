@@ -1,0 +1,7 @@
+{
+  "version": "1.4.2",
+  "url": "https://raw.githubusercontent.com/Richy023/chat-gui-releases/main/chat_gui.py",
+  "sha256": "0b1dc631dec0540859d941b24cd206bfcf5e5e5bd6f1424375a86e9886a70754",
+  "signature": "ZnwPo6tQEU2B0kPZ+6ATxcNTngg9rV5WWMdCRHqRKBQh1KciShOBhIvpnWgx2ZIRoeLsWnafkNvodZhn84E6Bg==",
+  "notes": "Initial OTA-enabled release"
+}
