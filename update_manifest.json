@@ -1,7 +1,7 @@
 {
-  "version": "1.4.4",
+  "version": "1.4.4b",
   "url": "https://raw.githubusercontent.com/Richy023/chat-gui-releases/main/chat_gui.py",
-  "sha256": "18a7c73a8d6c739896fd2fd9fdbfd5ed38a446815b0fd12871317d94f91741b7",
-  "signature": "Ovb9SaOEPd+MD/h2dvGbTPaCUx/X1RhTj7GBhDQ8qEjI7VYgx1QCK2pRF2sDuVV6w97fK4Cv+HgZRBakI7iRAQ==",
-  "notes": "fixed issue where mute doesn't automatically lift after time expires. versions now also correctly update with letters as well, when admin user attempts to moderate the host, it will now say \"you can't <action> host\" instead of generic user does not exist error."
+  "sha256": "1408e3a352b84c477b8215d7f3113f714f667a7078f126efd81b2708fbc6d16b",
+  "signature": "WxU4x3YvBYZPZMOOVHyRZZhksxSNvJXv8WIf0C86DcFphH9v63xzQYXdQGuRZuOC9PgjI7VxFrXZYnLEE4vlAw==",
+  "notes": "fixed manifest url"
 }

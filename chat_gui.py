@@ -1,8 +1,16 @@
 #!/usr/bin/env python3
 """
-chat_gui.py — v1.4.4 — ENCRYPTED instant messenger with a desktop GUI.
+chat_gui.py — v1.4.4a — ENCRYPTED instant messenger with a desktop GUI.
 
 Fixes in this version:
+- Added an in-app Changelog viewer (see the "View Changelog" link on the
+  connect screen) — shows version, install date, and release notes for
+  every version, including anything installed later via OTA.
+- Slowmode now shows a live countdown above the chat box while the input
+  is locked ("Slowmode is active, you cannot send messages for X.Xs"),
+  instead of just silently disabling it with no explanation.
+
+Fixes in 1.4.4:
 - Version strings can now carry an optional trailing letter (e.g. 1.4.2c)
   for small QOL patches that don't warrant a full numeric bump; the
   updater sorts these correctly (1.4.2 < 1.4.2a < ... < 1.4.2d < 1.4.3).
@@ -93,7 +101,7 @@ except ImportError:
 if sys.platform == "darwin":
     ensure_installed("pyobjus", required=False)
 
-VERSION = "1.4.4"
+VERSION = "1.4.4a"
 MSG_LEN_BYTES = 4
 MAX_GUESTS = 4
 MAX_FILE_BYTES = 500 * 1024 * 1024 # 500MB Limit
@@ -107,7 +115,7 @@ DISCOVERY_PORT = 5005
 # home on its own. See sign_release.py / generate_signing_key.py for
 # how to produce a manifest and keep the signing key itself OFFLINE —
 # only the public key belongs in this file.
-UPDATE_MANIFEST_URL = ""
+UPDATE_MANIFEST_URL = "https://raw.githubusercontent.com/Richy023/chat-gui-releases/main/update_manifest.json"
 UPDATE_PUBLIC_KEY_B64 = "buYuGiOKh5LYltgmbUH9S63A10/DGcuyGWz9PzZp85A="
 
 TYPING_IDLE_TIMEOUT = 2
@@ -399,6 +407,68 @@ def apply_update(payload: bytes) -> str:
         f.write(payload)
     os.replace(tmp_path, target_path)
     return backup_path
+
+
+# ---- Changelog ----
+# EMBEDDED_CHANGELOG is the static release history baked into this
+# build — add one entry per release when you bump VERSION. Anything
+# installed via OTA *after* this build additionally gets appended to
+# CHANGELOG_FILE (a small local JSON file next to the script) at
+# install time, so the in-app viewer stays complete going forward
+# without needing the whole history re-embedded on every release.
+EMBEDDED_CHANGELOG = [
+    {
+        "version": "1.4.4a",
+        "date": "2026-08-19",
+        "notes": (
+            "Added an in-app Changelog viewer. Slowmode now shows a live countdown "
+            "above the chat box while the input is locked, instead of just silently "
+            "disabling it with no explanation."
+        ),
+    },
+    {
+        "version": "1.4.4",
+        "date": "2026-08-19",
+        "notes": (
+            "Fixed issue where mute doesn't automatically lift after time expires. "
+            "Versions now also correctly update with letters as well. When an admin "
+            "user attempts to moderate the host, it will now say \"you can't <action> "
+            "the host\" instead of a generic user does not exist error."
+        ),
+    },
+]
+
+CHANGELOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "chat_gui_changelog.json")
+
+def _load_local_changelog() -> list:
+    try:
+        with open(CHANGELOG_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            return data if isinstance(data, list) else []
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return []
+
+def _save_local_changelog(entries: list):
+    try:
+        with open(CHANGELOG_FILE, "w", encoding="utf-8") as f:
+            json.dump(entries, f, indent=2)
+    except OSError:
+        pass
+
+def record_changelog_entry(version: str, notes: str):
+    """Called after an OTA update is successfully applied, so the
+    changelog viewer picks up releases beyond what's embedded here."""
+    entries = [e for e in _load_local_changelog() if e.get("version") != version]
+    entries.append({"version": version, "date": time.strftime("%Y-%m-%d"), "notes": notes})
+    _save_local_changelog(entries)
+
+def full_changelog() -> list:
+    """Embedded history plus anything recorded locally since, deduped
+    by version and sorted newest-first (letter-suffix aware)."""
+    by_version = {e["version"]: e for e in EMBEDDED_CHANGELOG}
+    for e in _load_local_changelog():
+        by_version[e["version"]] = e
+    return sorted(by_version.values(), key=lambda e: _version_tuple(e["version"]), reverse=True)
 
 class Hub:
     def __init__(self, fernet: Fernet, host_name: str, on_typing_change, on_admin_log):
@@ -1400,6 +1470,8 @@ class ChatApp(tk.Tk):
         self.typing_last_seen = {}
         self.message_reactions = {}
         self.slowmode_delay = 0.0
+        self._slowmode_cd_timer = None
+        self._slowmode_cd_end = 0.0
         
         self.suggest_popup = None
         self.current_suggestions = []
@@ -1425,6 +1497,13 @@ class ChatApp(tk.Tk):
         card.place(relx=0.5, rely=0.5, anchor="center")
 
         self._update_popup = None
+        changelog_label = tk.Label(
+            f, text="View Changelog", bg=BG_DARK, fg=FG_MUTED,
+            font=(CHAT_FONT[0], 8, "underline"), cursor="hand2"
+        )
+        changelog_label.place(relx=1.0, rely=1.0, anchor="se", x=-10, y=-24)
+        changelog_label.bind("<Button-1>", lambda e: self.on_show_changelog())
+
         version_label = tk.Label(
             f, text=f"v{VERSION} — Check for Updates", bg=BG_DARK, fg=FG_MUTED,
             font=(CHAT_FONT[0], 8, "underline"), cursor="hand2"
@@ -1767,6 +1846,10 @@ class ChatApp(tk.Tk):
         self.typing_var.set("")
         self.dnd_active, self._dnd_cd, self.dnd_btn.disabled, self.slowmode_delay = False, 0.0, False, 0.0
         self._set_dnd_button_style(False)
+        if getattr(self, "_slowmode_cd_timer", None):
+            try: self.after_cancel(self._slowmode_cd_timer)
+            except Exception: pass
+            self._slowmode_cd_timer = None
         self._apply_mute_state(False)
         
         for child in self.member_list_frame.winfo_children(): child.destroy()
@@ -1862,6 +1945,33 @@ class ChatApp(tk.Tk):
         self.dnd_btn.base_bg = bg
         self.dnd_btn.label.configure(text=text, bg=bg)
 
+    def on_show_changelog(self):
+        entries = full_changelog()
+        popup = tk.Toplevel(self)
+        popup.title("Changelog")
+        popup.configure(bg=BG_PANEL, padx=16, pady=14)
+        popup.resizable(False, False)
+        popup.transient(self)
+
+        text = scrolledtext.ScrolledText(
+            popup, width=56, height=16, bg=BG_INPUT, fg=FG_TEXT, font=CHAT_FONT,
+            wrap="word", relief="flat", padx=8, pady=8
+        )
+        text.pack()
+        text.tag_configure("ver", font=(CHAT_FONT[0], CHAT_FONT[1], "bold"), foreground=COLOR_PALETTE["blue"])
+
+        if not entries:
+            text.insert("1.0", "No changelog entries yet.")
+        else:
+            for i, e in enumerate(entries):
+                if i:
+                    text.insert("end", "\n\n")
+                text.insert("end", f"v{e.get('version', '?')} — {e.get('date', 'unknown date')}\n", ("ver",))
+                text.insert("end", e.get("notes") or "(no notes)")
+        text.configure(state="disabled")
+
+        make_button(popup, "Close", popup.destroy, bg=BTN_NEUTRAL, hover_bg=BTN_NEUTRAL_HOVER, padx=12, pady=5).pack(pady=(10, 0))
+
     def on_check_updates(self):
         if not UPDATE_MANIFEST_URL:
             messagebox.showinfo(
@@ -1951,6 +2061,7 @@ class ChatApp(tk.Tk):
         try:
             payload = download_and_verify_update(manifest)
             backup_path = apply_update(payload)
+            record_changelog_entry(manifest.get("version", "?"), manifest.get("notes", ""))
         except Exception as e:
             self.event_queue.put(("update_apply_result", {"ok": False, "error": str(e)}))
             return
@@ -1991,11 +2102,30 @@ class ChatApp(tk.Tk):
     def _start_slowmode_cooldown(self):
         self._set_input_state(False)
         self.msg_entry.update()
-        self.after(int(self.slowmode_delay * 1000), self._end_slowmode_cooldown)
+        self._slowmode_cd_end = time.time() + self.slowmode_delay
+        if getattr(self, "_slowmode_cd_timer", None):
+            try: self.after_cancel(self._slowmode_cd_timer)
+            except Exception: pass
+        self._tick_slowmode_cooldown()
+
+    def _tick_slowmode_cooldown(self):
+        remaining = self._slowmode_cd_end - time.time()
+        if remaining <= 0:
+            self._end_slowmode_cooldown()
+            return
+        if not self.mute_status_var.get().startswith("🔇"):
+            self.mute_status_var.set(f"⏳ Slowmode is active, you cannot send messages for {remaining:.1f}s")
+        self._slowmode_cd_timer = self.after(100, self._tick_slowmode_cooldown)
 
     def _end_slowmode_cooldown(self):
-        if not self.mute_status_var.get().startswith("🔇"):
-            self._set_input_state(True)
+        if getattr(self, "_slowmode_cd_timer", None):
+            try: self.after_cancel(self._slowmode_cd_timer)
+            except Exception: pass
+            self._slowmode_cd_timer = None
+        if self.mute_status_var.get().startswith("🔇"):
+            return  # still muted for a separate reason — leave that message/lock alone
+        self.mute_status_var.set("")
+        self._set_input_state(True)
 
     def _maybe_start_slowmode_cooldown(self):
         if getattr(self, "slowmode_delay", 0) > 0 and not self.is_admin:
