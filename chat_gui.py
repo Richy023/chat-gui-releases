@@ -101,7 +101,7 @@ except ImportError:
 if sys.platform == "darwin":
     ensure_installed("pyobjus", required=False)
 
-VERSION = "1.4.4a"
+VERSION = "1.4.4c"
 MSG_LEN_BYTES = 4
 MAX_GUESTS = 4
 MAX_FILE_BYTES = 500 * 1024 * 1024 # 500MB Limit
@@ -417,6 +417,18 @@ def apply_update(payload: bytes) -> str:
 # install time, so the in-app viewer stays complete going forward
 # without needing the whole history re-embedded on every release.
 EMBEDDED_CHANGELOG = [
+    {   "version": "1.4.4c",
+        "date": "2026-08-19",
+        "notes": (
+            "literally nothing just had to fix version number"
+        ),
+    },
+    {   "version": "1.4.4b",
+        "date": "2026-08-19",
+        "notes": (
+            "Fixed manifest_url."
+        ),
+    },
     {
         "version": "1.4.4a",
         "date": "2026-08-19",
