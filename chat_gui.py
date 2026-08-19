@@ -1,10 +1,17 @@
-##!/usr/bin/env python3
+#!/usr/bin/env python3
 """
-chat_gui.py — v1.4.4 — ENCRYPTED instant messenger with a desktop GUI. to be added
+chat_gui.py — v1.4.4 — ENCRYPTED instant messenger with a desktop GUI.
 
 Fixes in this version:
-- Fixed roster synchronization so guests accurately see when a user disconnects.
-- Prevented admins from running moderation commands (kick/ban/etc) on the host.
+- Version strings can now carry an optional trailing letter (e.g. 1.4.2c)
+  for small QOL patches that don't warrant a full numeric bump; the
+  updater sorts these correctly (1.4.2 < 1.4.2a < ... < 1.4.2d < 1.4.3).
+- Mute now actually lifts on its own when the timer runs out, instead of
+  leaving the input box stuck disabled until an explicit /unmute.
+- Moderating the host (/mute, /unmute, /kick, /ban, /admin, /unadmin) now
+  replies "You cannot <action> the host." instead of the misleading
+  "No one named '<host>' is connected." (the host was never in the
+  guest-socket table those commands were checking).
 
 Fixes in 1.4.2:
 - Added an in-app, signature-verified update checker (see UPDATE_MANIFEST_URL below).
@@ -86,7 +93,7 @@ except ImportError:
 if sys.platform == "darwin":
     ensure_installed("pyobjus", required=False)
 
-VERSION = "1.4.3"
+VERSION = "1.4.4"
 MSG_LEN_BYTES = 4
 MAX_GUESTS = 4
 MAX_FILE_BYTES = 500 * 1024 * 1024 # 500MB Limit
@@ -100,7 +107,7 @@ DISCOVERY_PORT = 5005
 # home on its own. See sign_release.py / generate_signing_key.py for
 # how to produce a manifest and keep the signing key itself OFFLINE —
 # only the public key belongs in this file.
-UPDATE_MANIFEST_URL = "https://raw.githubusercontent.com/Richy023/chat-gui-releases/main/update_manifest.json"
+UPDATE_MANIFEST_URL = ""
 UPDATE_PUBLIC_KEY_B64 = "buYuGiOKh5LYltgmbUH9S63A10/DGcuyGWz9PzZp85A="
 
 TYPING_IDLE_TIMEOUT = 2
@@ -336,14 +343,20 @@ def fetch_update_manifest(manifest_url: str) -> dict:
         raise ValueError(f"Update manifest is missing required field(s): {', '.join(missing)}")
     return manifest
 
+def _parse_version_segment(seg: str) -> tuple:
+    """'2' -> (2, ''), '2c' -> (2, 'c'). Lets a release use a trailing
+    letter (recommended: a-d) for a small QOL patch that doesn't
+    deserve a full numeric bump, while still sorting correctly against
+    plain numeric versions: 1.4.2 < 1.4.2a < 1.4.2b < ... < 1.4.3."""
+    seg = seg.strip()
+    m = re.match(r"^(\d+)([a-zA-Z]?)$", seg)
+    if not m:
+        digits = "".join(ch for ch in seg if ch.isdigit())
+        return (int(digits) if digits else 0, "")
+    return (int(m.group(1)), m.group(2).lower())
+
 def _version_tuple(v: str) -> tuple:
-    parts = []
-    for p in str(v).strip().split("."):
-        try:
-            parts.append(int(p))
-        except ValueError:
-            parts.append(0)
-    return tuple(parts)
+    return tuple(_parse_version_segment(p) for p in str(v).strip().split("."))
 
 def is_newer_version(remote: str, local: str) -> bool:
     return _version_tuple(remote) > _version_tuple(local)
@@ -862,6 +875,9 @@ def run_mod_command(msg: str, hub: Hub, my_name: str, reply_func) -> bool:
 
     if stripped.startswith("/admin "):
         target = stripped[len("/admin "):].strip()
+        if target.lower() == hub.host_name.lower():
+            reply_func("You cannot admin the host.")
+            return True
         target_sock = hub.find_socket_by_name(target)
         if target_sock:
             hub.admins.add(target.lower())
@@ -875,6 +891,9 @@ def run_mod_command(msg: str, hub: Hub, my_name: str, reply_func) -> bool:
 
     if stripped.startswith("/unadmin "):
         target = stripped[len("/unadmin "):].strip()
+        if target.lower() == hub.host_name.lower():
+            reply_func("You cannot unadmin the host.")
+            return True
         if target.lower() in hub.admins:
             hub.admins.remove(target.lower())
             target_sock = hub.find_socket_by_name(target)
@@ -909,6 +928,9 @@ def run_mod_command(msg: str, hub: Hub, my_name: str, reply_func) -> bool:
             reply_func("Usage: /ban <name> [minutes|perm] [reason]")
             return True
         name = parts[0]
+        if name.lower() == hub.host_name.lower():
+            reply_func("You cannot ban the host.")
+            return True
         dur_str = parts[1].lower() if len(parts) > 1 else "perm"
         reason = parts[2] if len(parts) > 2 else "no reason given"
         
@@ -957,6 +979,9 @@ def run_mod_command(msg: str, hub: Hub, my_name: str, reply_func) -> bool:
             reply_func("Usage: /mute <name> <minutes> [reason]")
             return True
         name, minutes_str = parts[0], parts[1]
+        if name.lower() == hub.host_name.lower():
+            reply_func("You cannot mute the host.")
+            return True
         reason = parts[2] if len(parts) > 2 else "no reason given"
         try: minutes = float(minutes_str)
         except ValueError:
@@ -979,6 +1004,9 @@ def run_mod_command(msg: str, hub: Hub, my_name: str, reply_func) -> bool:
 
     if stripped.startswith("/unmute "):
         name = stripped[len("/unmute "):].strip()
+        if name.lower() == hub.host_name.lower():
+            reply_func("You cannot unmute the host.")
+            return True
         target_sock = hub.find_socket_by_name(name)
         if not hub.unmute(name):
             reply_func(f"No one named '{name}' is connected or muted.")
@@ -994,6 +1022,9 @@ def run_mod_command(msg: str, hub: Hub, my_name: str, reply_func) -> bool:
     if stripped.startswith("/kick "):
         parts = stripped[len("/kick "):].split(maxsplit=1)
         name = parts[0] if parts else ""
+        if name.lower() == hub.host_name.lower():
+            reply_func("You cannot kick the host.")
+            return True
         reason = parts[1] if len(parts) > 1 else "no reason given"
         target = hub.find_socket_by_name(name)
         if not target:
@@ -1357,6 +1388,7 @@ class ChatApp(tk.Tk):
         self.connection = None
         self.my_name = ""
         self.is_admin = False 
+        self._mute_expiry_timer = None
         self.current_roster = []
         self.event_queue = queue.Queue()
         self.known_colors = {}
@@ -1547,8 +1579,30 @@ class ChatApp(tk.Tk):
             self._set_button_enabled(btn, enabled)
 
     def _apply_mute_state(self, muted: bool, until: float = 0.0):
+        if getattr(self, "_mute_expiry_timer", None):
+            try:
+                self.after_cancel(self._mute_expiry_timer)
+            except Exception:
+                pass
+            self._mute_expiry_timer = None
+
         self._set_input_state(not muted)
         self.mute_status_var.set(f"🔇 You are muted{f' until {format_time(until)}' if until else ''} — messages won't send." if muted else "")
+
+        if muted and until:
+            # The server only tells us "you're muted until X" once, up
+            # front — nothing proactively pushes an unmute when the
+            # timer simply runs out (as opposed to an explicit
+            # /unmute). Schedule our own local re-check so the input
+            # box doesn't stay stuck disabled after the mute has
+            # actually expired.
+            remaining_ms = max(0, int((until - time.time()) * 1000)) + 250
+            self._mute_expiry_timer = self.after(remaining_ms, self._on_mute_expired)
+
+    def _on_mute_expired(self):
+        self._mute_expiry_timer = None
+        self._apply_mute_state(False)
+        self.append_system_line("🔇 Your mute has expired — you can send messages again.")
 
     def evaluate_live_suggestions(self):
         text, cursor_pos = self.msg_entry.get(), self.msg_entry.index("insert")
