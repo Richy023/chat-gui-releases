@@ -1,7 +1,7 @@
 {
-  "version": "1.4.4c",
+  "version": "1.4.4d",
   "url": "https://raw.githubusercontent.com/Richy023/chat-gui-releases/main/chat_gui.py",
-  "sha256": "07f4ec9a0ab3a7dafe41449fd7129ae6449782b5e8095d7517c3655e15a22d80",
-  "signature": "gCLsz93MCVpaqKLvUP8/642nOrqQHIqvIUAy5DByw6vMwK3+8+EmC8QLDhT5WgOJ3e6U3w4mFrDkIT1vceUtCQ==",
-  "notes": "fixed version number nothing else lol"
+  "sha256": "c223d4cee467966d7d97351ca753535ddf572da06ddea41890cf3082243cb797",
+  "signature": "Emk5dFykOOD78Xb0lXKgsnaYV7csmRqLLI7xBONyvs3O8zcTV3qPiFB5cUspqOqXFV4rtLCKmHsNXdHkl2srCQ==",
+  "notes": "Fixed the DND keybind picker not being able to reopen after already setting a non-default bind once (had to restart the app). Letter-key DND binds no longer also type that letter into the chat box. Clicking a slash-command suggestion now actually inserts it instead of just making the suggestion box vanish (and no longer causes the chat box to get stuck/unresponsive on Mac afterward). Fixed the room code on the host setup screen showing unreadable white-on-white text."
 }

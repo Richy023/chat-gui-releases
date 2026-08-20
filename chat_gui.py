@@ -1,8 +1,18 @@
 #!/usr/bin/env python3
 """
-chat_gui.py — v1.4.4a — ENCRYPTED instant messenger with a desktop GUI.
+chat_gui.py — v1.4.4d — ENCRYPTED instant messenger with a desktop GUI.
 
 Fixes in this version:
+- DND keybind picker can now be reopened after already setting a
+  non-default bind once, instead of requiring an app restart.
+- A letter-key DND bind no longer also types that letter into the chat box.
+- Clicking a slash-command suggestion now actually inserts it, instead of
+  just making the suggestion box vanish — and no longer leaves the chat
+  box stuck/unresponsive on Mac afterward.
+- Fixed the room code on the host setup screen showing unreadable
+  white-on-white text (Tk's readonly-state background wasn't set).
+
+Fixes in 1.4.4a:
 - Added an in-app Changelog viewer (see the "View Changelog" link on the
   connect screen) — shows version, install date, and release notes for
   every version, including anything installed later via OTA.
@@ -24,12 +34,6 @@ Fixes in 1.4.4:
 Fixes in 1.4.2:
 - Added an in-app, signature-verified update checker (see UPDATE_MANIFEST_URL below).
 - Minor UI/UX polish and cleanup pass.
-
-Fixes in 1.4.1:
-- Added 🛡️ [Admin Log] broadcasting so admins can see each other's moderation actions in real-time.
-- Optimized live suggestion evaluating with sets and comprehensions.
-- Refactored UI toggle states to DRY up Slowmode & Mute logic.
-- Optimized ping targeting string searches.
 """
 
 import sys
@@ -101,7 +105,7 @@ except ImportError:
 if sys.platform == "darwin":
     ensure_installed("pyobjus", required=False)
 
-VERSION = "1.4.4c"
+VERSION = "1.4.4d"
 MSG_LEN_BYTES = 4
 MAX_GUESTS = 4
 MAX_FILE_BYTES = 500 * 1024 * 1024 # 500MB Limit
@@ -417,6 +421,18 @@ def apply_update(payload: bytes) -> str:
 # install time, so the in-app viewer stays complete going forward
 # without needing the whole history re-embedded on every release.
 EMBEDDED_CHANGELOG = [
+    {   "version": "1.4.4d",
+        "date": "2026-08-20",
+        "notes": (
+            "Fixed the DND keybind picker not being able to reopen after already "
+            "setting a non-default bind once (had to restart the app). Letter-key "
+            "DND binds no longer also type that letter into the chat box. Clicking "
+            "a slash-command suggestion now actually inserts it instead of just "
+            "making the suggestion box vanish (and no longer causes the chat box "
+            "to get stuck/unresponsive on Mac afterward). Fixed the room code on "
+            "the host setup screen showing unreadable white-on-white text."
+        ),
+    },
     {   "version": "1.4.4c",
         "date": "2026-08-19",
         "notes": (
@@ -1540,7 +1556,14 @@ class ChatApp(tk.Tk):
             label_widget = tk.Label(card, text=label, bg=BG_PANEL, fg=FG_MUTED, anchor="w", font=CHAT_FONT)
             label_widget.grid(row=row, column=0, sticky="w", pady=(6, 0))
             kwargs = {"validate": "key", "validatecommand": validate_cmd} if validate_cmd else {}
-            entry = tk.Entry(card, bg=BG_INPUT, fg=FG_TEXT, insertbackground=FG_TEXT, relief="flat", width=entry_width, font=CHAT_FONT, **kwargs)
+            entry = tk.Entry(
+                card, bg=BG_INPUT, fg=FG_TEXT, insertbackground=FG_TEXT, relief="flat",
+                width=entry_width, font=CHAT_FONT,
+                readonlybackground=BG_INPUT,  # Tk uses a separate bg for state="readonly";
+                                               # left unset it defaults to a near-white system
+                                               # color, making light text unreadable on it.
+                **kwargs
+            )
             entry.grid(row=row, column=1, sticky="ew", pady=(6, 0), padx=(10, 0))
             entry.label = label_widget
             return entry
@@ -1655,6 +1678,8 @@ class ChatApp(tk.Tk):
         self.msg_entry.bind("<Down>", self._on_down_arrow)
         self.msg_entry.bind("<FocusOut>", lambda e: self.after(150, self.destroy_suggestions))
 
+        self._apply_dnd_keybind()  # re-apply now that msg_entry exists (see _apply_dnd_keybind)
+
         self.send_btn = make_button(self.bottom_bar, "Send", self.on_send, bg=COLOR_PALETTE["blue"], hover_bg=BTN_BLUE_HOVER, padx=16, pady=6)
         self.send_btn.pack(side="left", padx=(6, 0))
 
@@ -1731,13 +1756,21 @@ class ChatApp(tk.Tk):
             self.suggest_popup.wm_overrideredirect(True)
             self.suggest_popup.configure(bg=BG_PANEL, bd=1, relief="solid")
             self.suggest_popup.attributes("-topmost", True)
-            
+            # Clicking the popup's own background (e.g. the padding around
+            # the listbox) should dismiss it and hand focus straight back
+            # to the entry — without this, losing focus to a borderless
+            # overrideredirect window can leave the entry in a stuck,
+            # unresponsive state on macOS until the user clicks elsewhere
+            # and back.
+            self.suggest_popup.bind("<Button-1>", self._on_suggestion_popup_clicked)
+
             self.suggest_listbox = tk.Listbox(
                 self.suggest_popup, bg=BG_PANEL, fg=FG_TEXT, font=CHAT_FONT,
                 selectbackground=BTN_NEUTRAL, selectforeground="white",
                 relief="flat", highlightthickness=0
             )
             self.suggest_listbox.pack(fill="both", expand=True, padx=4, pady=4)
+            self.suggest_listbox.bind("<Button-1>", self._on_suggestion_clicked)
         
         self.suggest_listbox.delete(0, "end")
         for item in self.current_suggestions: self.suggest_listbox.insert("end", f"  {item}  ")
@@ -1752,6 +1785,39 @@ class ChatApp(tk.Tk):
             try: self.suggest_popup.destroy()
             except Exception: pass
             self.suggest_popup, self.current_suggestions = None, []
+
+    def _on_suggestion_popup_clicked(self, event):
+        self.destroy_suggestions()
+        self.msg_entry.focus_set()
+        return "break"
+
+    def _on_suggestion_clicked(self, event):
+        if not self.current_suggestions:
+            return "break"
+        index = self.suggest_listbox.nearest(event.y)
+        if 0 <= index < len(self.current_suggestions):
+            self._apply_chosen_suggestion(self.current_suggestions[index])
+        else:
+            self.destroy_suggestions()
+            self.msg_entry.focus_set()
+        return "break"
+
+    def _apply_chosen_suggestion(self, chosen):
+        text, cursor_pos = self.msg_entry.get(), self.msg_entry.index("insert")
+        left_text, right_text, words = text[:cursor_pos], text[cursor_pos:], text[:cursor_pos].split(" ")
+
+        if len(words) == 1: new_left = chosen + " "
+        elif left_text[-1] == " ": new_left = left_text + chosen + " "
+        else:
+            words[-1] = chosen
+            new_left = " ".join(words) + " "
+
+        self.msg_entry.delete(0, "end")
+        self.msg_entry.insert(0, new_left + right_text)
+        self.msg_entry.icursor(len(new_left))
+
+        self.destroy_suggestions()
+        self.msg_entry.focus_set()
 
     def _on_up_arrow(self, event):
         if self.suggest_popup and self.current_suggestions:
@@ -1773,22 +1839,8 @@ class ChatApp(tk.Tk):
 
     def on_tab_autocomplete(self, event):
         if not self.suggest_popup or not self.current_suggestions: return "break"
-            
         chosen = self.current_suggestions[self.suggest_listbox.curselection()[0]] if self.suggest_listbox.curselection() else self.current_suggestions[0]
-        text, cursor_pos = self.msg_entry.get(), self.msg_entry.index("insert")
-        left_text, right_text, words = text[:cursor_pos], text[cursor_pos:], text[:cursor_pos].split(" ")
-        
-        if len(words) == 1: new_left = chosen + " "
-        elif left_text[-1] == " ": new_left = left_text + chosen + " "
-        else:
-            words[-1] = chosen
-            new_left = " ".join(words) + " "
-
-        self.msg_entry.delete(0, "end")
-        self.msg_entry.insert(0, new_left + right_text)
-        self.msg_entry.icursor(len(new_left))
-        
-        self.destroy_suggestions()
+        self._apply_chosen_suggestion(chosen)
         return "break"
 
     def on_connect_clicked(self):
@@ -1918,7 +1970,23 @@ class ChatApp(tk.Tk):
     def _apply_dnd_keybind(self):
         try: self.unbind_all(self.dnd_keybind)
         except Exception: pass
-        if self.dnd_keybind: self.bind_all(self.dnd_keybind, lambda e: self.on_dnd_toggle())
+        if hasattr(self, "msg_entry"):
+            try: self.msg_entry.unbind(self.dnd_keybind)
+            except Exception: pass
+        if self.dnd_keybind:
+            self.bind_all(self.dnd_keybind, lambda e: self._trigger_dnd_toggle())
+            if hasattr(self, "msg_entry"):
+                # Bound directly on the entry too: instance-level bindings
+                # fire before the Entry widget's own class binding (which
+                # is what types the character in), so returning "break"
+                # here actually stops a letter-key DND bind from also
+                # typing that letter into the chat box. bind_all alone
+                # can't do this — "all" bindings are checked last.
+                self.msg_entry.bind(self.dnd_keybind, lambda e: self._trigger_dnd_toggle())
+
+    def _trigger_dnd_toggle(self):
+        self.on_dnd_toggle()
+        return "break"
 
     def on_dnd_keybind_picker(self):
         if self._dnd_keybind_popup is not None: return
@@ -1942,9 +2010,13 @@ class ChatApp(tk.Tk):
             
             try: self.unbind_all(self.dnd_keybind)
             except Exception: pass
+            if hasattr(self, "msg_entry"):
+                try: self.msg_entry.unbind(self.dnd_keybind)
+                except Exception: pass
                 
             self.dnd_keybind = "<" + "-".join(parts) + ">"
             self._apply_dnd_keybind()
+            self._dnd_keybind_popup = None
             popup.destroy()
 
         popup.bind("<KeyPress>", capture)
