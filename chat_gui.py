@@ -1,8 +1,15 @@
 #!/usr/bin/env python3
 """
-chat_gui.py — v1.4.5a — ENCRYPTED instant messenger with a desktop GUI.
+chat_gui.py — v1.4.5b — ENCRYPTED instant messenger with a desktop GUI.
 
 Fixes/features in this version:
+- Host can now change their own color as many times as they want,
+  overriding the usual once-per-session limit that still applies to guests.
+
+Fixes in 1.4.5a:
+- Fixed a major bug where the connection handshake kept failing.
+
+Fixes/features in 1.4.5:
 - Custom sticker upload: pick an image, name it, it's converted to JPEG
   and saved locally (chat_gui_stickers.json) so it persists across
   sessions — no re-uploading every time. Shown as thumbnails in the
@@ -129,7 +136,7 @@ except ImportError:
 if sys.platform == "darwin":
     ensure_installed("pyobjus", required=False)
 
-VERSION = "1.4.5a"
+VERSION = "1.4.5b"
 MSG_LEN_BYTES = 4
 MAX_GUESTS = 4
 MAX_FILE_BYTES = 500 * 1024 * 1024 # 500MB Limit
@@ -463,10 +470,17 @@ def apply_update(payload: bytes) -> str:
 # install time, so the in-app viewer stays complete going forward
 # without needing the whole history re-embedded on every release.
 EMBEDDED_CHANGELOG = [
+    {   "version": "1.4.5b",
+        "date": "2026-08-21",
+        "notes": (
+            "Host can now change their own color as many times as they want, "
+            "overriding the usual once-per-session limit that still applies to guests."
+        ),
+    },
     {   "version": "1.4.5a",
         "date": "2026-08-21",
         "notes": (
-            "Fixed major bug fixes in 1.4.5"
+            "Fixed a major bug where the connection handshake kept failing."
         ),
     },
     {   "version": "1.4.5",
@@ -1031,11 +1045,13 @@ def run_mod_command(msg: str, hub: Hub, my_name: str, reply_func) -> bool:
 
     if stripped.startswith("/color "):
         color = stripped[len("/color "):].strip().lower()
-        if my_name.lower() in hub.color_changed_once:
+        is_host = my_name.lower() == hub.host_name.lower()
+        if not is_host and my_name.lower() in hub.color_changed_once:
             reply_func("You can only change your color once in one chat session.")
         elif color in COLOR_PALETTE:
             hub.colors[my_name.lower()] = COLOR_PALETTE[color]
-            hub.color_changed_once.add(my_name.lower())
+            if not is_host:
+                hub.color_changed_once.add(my_name.lower())
             hub.broadcast(COLORMAP_PREFIX + hub.colormap_string())
             reply_func(f"Color changed successfully to {color}.")
         else:
