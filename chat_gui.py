@@ -463,8 +463,8 @@ def apply_update(payload: bytes) -> str:
 # install time, so the in-app viewer stays complete going forward
 # without needing the whole history re-embedded on every release.
 EMBEDDED_CHANGELOG = [
-    {   "version": "1.4.5a"
-        "date": "2026-08-21"
+    {   "version": "1.4.5a",
+        "date": "2026-08-21",
         "notes": (
             "Fixed major bug fixes in 1.4.5"
         ),
