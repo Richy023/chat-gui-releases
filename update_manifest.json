@@ -1,7 +1,7 @@
 {
-  "version": "1.4.4d",
+  "version": "1.4.5",
   "url": "https://raw.githubusercontent.com/Richy023/chat-gui-releases/main/chat_gui.py",
-  "sha256": "c223d4cee467966d7d97351ca753535ddf572da06ddea41890cf3082243cb797",
-  "signature": "Emk5dFykOOD78Xb0lXKgsnaYV7csmRqLLI7xBONyvs3O8zcTV3qPiFB5cUspqOqXFV4rtLCKmHsNXdHkl2srCQ==",
-  "notes": "Fixed the DND keybind picker not being able to reopen after already setting a non-default bind once (had to restart the app). Letter-key DND binds no longer also type that letter into the chat box. Clicking a slash-command suggestion now actually inserts it instead of just making the suggestion box vanish (and no longer causes the chat box to get stuck/unresponsive on Mac afterward). Fixed the room code on the host setup screen showing unreadable white-on-white text."
+  "sha256": "8c800439fdd1581880c731b7b217b310eb4e2010709d556c30fe5ed3aaa2ed51",
+  "signature": "P7r7wNMk1Kv7s1liIfK0ConWFFny8FFvKjcTNK8LspsNFPTl/LKxKH3b+WRACj0L96oyOJjvyYkJmS4VwEZYAQ==",
+  "notes": "You can now upload stickers and it will save. DND keybinds fixed, especailly on Mac. Moderation commands now autofill/suggest users as well, and will smart detect. GIFs also working, hover to see it animated. Minor bug fixes."
 }
