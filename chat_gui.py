@@ -1,8 +1,14 @@
 #!/usr/bin/env python3
 """
-chat_gui.py — v1.4.5b — ENCRYPTED instant messenger with a desktop GUI.
+chat_gui.py — v1.4.5c — ENCRYPTED instant messenger with a desktop GUI.
 
 Fixes/features in this version:
+- Fixed "View Changelog" clipping into "Check for Updates" on the connect
+  screen (Mac only) — the gap was a hardcoded pixel offset that didn't
+  account for macOS rendering text taller at the same font size. Now
+  sized from actual rendered text height instead of a fixed guess.
+
+Fixes in 1.4.5b:
 - Host can now change their own color as many times as they want,
   overriding the usual once-per-session limit that still applies to guests.
 
@@ -136,7 +142,7 @@ except ImportError:
 if sys.platform == "darwin":
     ensure_installed("pyobjus", required=False)
 
-VERSION = "1.4.5b"
+VERSION = "1.4.5c"
 MSG_LEN_BYTES = 4
 MAX_GUESTS = 4
 MAX_FILE_BYTES = 500 * 1024 * 1024 # 500MB Limit
@@ -470,6 +476,16 @@ def apply_update(payload: bytes) -> str:
 # install time, so the in-app viewer stays complete going forward
 # without needing the whole history re-embedded on every release.
 EMBEDDED_CHANGELOG = [
+    {   "version": "1.4.5c",
+        "date": "2026-08-21",
+        "notes": (
+            "Fixed 'View Changelog' clipping into 'Check for Updates' on the "
+            "connect screen (Mac only) — the gap between them was a hardcoded "
+            "pixel offset that didn't account for macOS rendering text taller "
+            "than other platforms at the same font size. Now sized from the "
+            "actual rendered text height instead of a fixed guess."
+        ),
+    },
     {   "version": "1.4.5b",
         "date": "2026-08-21",
         "notes": (
@@ -1631,18 +1647,21 @@ class ChatApp(tk.Tk):
         card.place(relx=0.5, rely=0.5, anchor="center")
 
         self._update_popup = None
+        corner_frame = tk.Frame(f, bg=BG_DARK)
+        corner_frame.place(relx=1.0, rely=1.0, anchor="se", x=-10, y=-8)
+
         changelog_label = tk.Label(
-            f, text="View Changelog", bg=BG_DARK, fg=FG_MUTED,
+            corner_frame, text="View Changelog", bg=BG_DARK, fg=FG_MUTED,
             font=(CHAT_FONT[0], 8, "underline"), cursor="hand2"
         )
-        changelog_label.place(relx=1.0, rely=1.0, anchor="se", x=-10, y=-24)
+        changelog_label.pack(anchor="e", pady=(0, 2))
         changelog_label.bind("<Button-1>", lambda e: self.on_show_changelog())
 
         version_label = tk.Label(
-            f, text=f"v{VERSION} — Check for Updates", bg=BG_DARK, fg=FG_MUTED,
+            corner_frame, text=f"v{VERSION} — Check for Updates", bg=BG_DARK, fg=FG_MUTED,
             font=(CHAT_FONT[0], 8, "underline"), cursor="hand2"
         )
-        version_label.place(relx=1.0, rely=1.0, anchor="se", x=-10, y=-8)
+        version_label.pack(anchor="e")
         version_label.bind("<Button-1>", lambda e: self.on_check_updates())
 
         tk.Label(card, text="chat_gui", font=(CHAT_FONT[0], 20, "bold"), bg=BG_PANEL, fg=FG_TEXT).grid(
