@@ -1,7 +1,7 @@
 {
-  "version": "1.4.5",
+  "version": "1.4.5a",
   "url": "https://raw.githubusercontent.com/Richy023/chat-gui-releases/main/chat_gui.py",
-  "sha256": "8c800439fdd1581880c731b7b217b310eb4e2010709d556c30fe5ed3aaa2ed51",
-  "signature": "P7r7wNMk1Kv7s1liIfK0ConWFFny8FFvKjcTNK8LspsNFPTl/LKxKH3b+WRACj0L96oyOJjvyYkJmS4VwEZYAQ==",
-  "notes": "You can now upload stickers and it will save. DND keybinds fixed, especailly on Mac. Moderation commands now autofill/suggest users as well, and will smart detect. GIFs also working, hover to see it animated. Minor bug fixes."
+  "sha256": "6fce259aed19f7b7b014b536cb293c4b2fc9fe1969653a661e7c4b6b4b7a0c41",
+  "signature": "7JA5rY+S81hHT+k4icNSwyY+HQZTYahS8kP76vWa8Y3FvgHPcAbc2+5UiIVea8fmYWsCWsFvMPnRFt/qZP1SCA==",
+  "notes": "fixed major issues/bugs in 1.4.5"
 }

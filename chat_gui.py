@@ -1,31 +1,26 @@
 #!/usr/bin/env python3
 """
-chat_gui.py — v1.4.5 — ENCRYPTED instant messenger with a desktop GUI.
+chat_gui.py — v1.4.5a — ENCRYPTED instant messenger with a desktop GUI.
 
-Fixes in this version:
-- Guests now see "You joined the chat." as soon as they connect, instead
-  of a large empty box until someone else sends a message.
-- Custom stickers: upload your own images from the sticker picker (the
-  ➕ tile) and they're saved to disk, so you only upload once — they're
-  there the next time you open the app, right alongside the built-in set.
-- GIF search (via a GIF provider) with its own picker button next to
-  Stickers/Emoji. Received GIFs render as a still first frame by default
-  and only animate while you hover over them ("hover to watch" appears
-  in small text beside them), so they don't churn the CPU in the
-  background.
-- Moderation commands (/mute, /kick, /ban) now sort their name-suggestion
-  list to surface whoever's been posting the fastest/most recently first;
-  @ping suggestions do the opposite and surface the quietest people
-  first — both were already showing a suggestion box, just unsorted.
-- Fixed the DND keybind picker on macOS: Command was being reported as
-  "Alt" (Tk maps Command to the same state bit Alt uses elsewhere), and
-  holding Option while pressing a letter could rebind to whatever
-  composed/dead-key symbol macOS produced instead of the letter itself.
-- Text entry fields and the chat log no longer show a bright focus
-  ring/highlight on click on macOS — borders stay the same subtle grey.
-- Fixed "View Changelog" clipping slightly into "Check for Updates" on
-  some displays (now stacked with guaranteed spacing instead of fixed
-  pixel offsets).
+Fixes/features in this version:
+- Custom sticker upload: pick an image, name it, it's converted to JPEG
+  and saved locally (chat_gui_stickers.json) so it persists across
+  sessions — no re-uploading every time. Shown as thumbnails in the
+  picker alongside the built-ins; right-click a custom one to delete it.
+- Guests now see "You joined Room ... as ..." immediately on connecting,
+  instead of a blank chat box until someone else sends a message.
+- /mute, /kick, /ban suggestions now rank whoever's sent the most
+  messages recently (last 60s) first — usually who you're about to
+  target. @ ping suggestions rank whoever's gone longest without
+  sending a message first (never-spoken users rank highest of all).
+- Fixed macOS DND keybinds: Command was being detected/labeled as Alt
+  (so a Command-based bind never actually matched a real Command press
+  on Mac — not just a display bug), and Option was corrupting the
+  captured key through its own accent/dead-key composition. Both fixed
+  via correct Mac modifier names and a stable keycode-based fallback —
+  not verified on a real Mac, worth double-checking on your end.
+
+Fixes in 1.4.4d:
 - DND keybind picker can now be reopened after already setting a
   non-default bind once, instead of requiring an app restart.
 - A letter-key DND bind no longer also types that letter into the chat box.
@@ -57,6 +52,12 @@ Fixes in 1.4.4:
 Fixes in 1.4.2:
 - Added an in-app, signature-verified update checker (see UPDATE_MANIFEST_URL below).
 - Minor UI/UX polish and cleanup pass.
+
+Fixes in 1.4.1:
+- Added 🛡️ [Admin Log] broadcasting so admins can see each other's moderation actions in real-time.
+- Optimized live suggestion evaluating with sets and comprehensions.
+- Refactored UI toggle states to DRY up Slowmode & Mute logic.
+- Optimized ping targeting string searches.
 """
 
 import sys
@@ -76,9 +77,8 @@ import json
 import shutil
 import urllib.request
 import urllib.error
-import urllib.parse
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox, scrolledtext
+from tkinter import ttk, filedialog, messagebox, scrolledtext, simpledialog
 
 # FEATURE TOGGLE: WAN (Wide Area Network) / Global Room Support
 ENABLE_WAN_RELAY = False
@@ -120,41 +120,38 @@ except ImportError:
 
 ensure_installed("PIL", pip_name="Pillow", required=False)
 try:
-    from PIL import Image, ImageTk, ImageDraw, ImageSequence
+    from PIL import Image, ImageTk, ImageDraw
 except ImportError:
     Image = None
     ImageTk = None
     ImageDraw = None
-    ImageSequence = None
 
 if sys.platform == "darwin":
     ensure_installed("pyobjus", required=False)
 
-IS_MAC = sys.platform == "darwin"
-
-# macOS Tk reports the *physical* key location in event.keycode using
-# stable Carbon virtual-keycode numbers — unlike event.keysym, which on
-# macOS changes when a modifier composes a different character (most
-# notably: holding Option turns a plain letter keysym into whatever
-# dead-key/special-character symbol Option+that key produces). Used by
-# the DND keybind picker so an Option-based bind captures the physical
-# key you pressed, not the composed symbol.
-MAC_KEYCODE_LABELS = {
-    0: "A", 1: "S", 2: "D", 3: "F", 4: "H", 5: "G", 6: "Z", 7: "X", 8: "C", 9: "V",
-    11: "B", 12: "Q", 13: "W", 14: "E", 15: "R", 16: "Y", 17: "T",
-    18: "1", 19: "2", 20: "3", 21: "4", 22: "6", 23: "5", 24: "=", 25: "9",
-    26: "7", 27: "-", 28: "8", 29: "0", 30: "]", 31: "O", 32: "U", 33: "[",
-    34: "I", 35: "P", 37: "L", 38: "J", 39: "'", 40: "K", 41: ";", 42: "\\",
-    43: ",", 44: "/", 45: "N", 46: "M", 47: ".", 50: "`",
-    36: "Return", 48: "Tab", 49: "Space", 51: "Delete", 53: "Escape",
-    123: "Left", 124: "Right", 125: "Down", 126: "Up",
-}
-
-VERSION = "1.4.5"
+VERSION = "1.5.0"
 MSG_LEN_BYTES = 4
 MAX_GUESTS = 4
 MAX_FILE_BYTES = 500 * 1024 * 1024 # 500MB Limit
 DND_ANNOUNCE_COOLDOWN = 2.0
+SPAM_SUGGESTION_WINDOW = 60.0  # seconds — how far back "recent" message activity counts for /mute /kick /ban suggestion ranking
+
+# macOS reports physical key presses via event.keycode using Apple's
+# stable "virtual keycode" numbering (same across all Mac hardware,
+# unaffected by keyboard layout or which modifiers are held) — unlike
+# event.keysym, which the Option key can corrupt into an entirely
+# different character via Unicode composition (e.g. Option+e can dead-key
+# into an accented letter instead of reporting a clean "e"). Used only
+# as a fallback when Option is held, to recover the actual key pressed.
+MAC_VIRTUAL_KEYCODE_TO_KEY = {
+    0x00: "a", 0x0B: "b", 0x08: "c", 0x02: "d", 0x0E: "e", 0x03: "f",
+    0x05: "g", 0x04: "h", 0x22: "i", 0x26: "j", 0x28: "k", 0x25: "l",
+    0x2E: "m", 0x2D: "n", 0x1F: "o", 0x23: "p", 0x0C: "q", 0x0F: "r",
+    0x01: "s", 0x11: "t", 0x20: "u", 0x09: "v", 0x0D: "w", 0x07: "x",
+    0x10: "y", 0x06: "z",
+    0x1D: "0", 0x12: "1", 0x13: "2", 0x14: "3", 0x15: "4", 0x17: "5",
+    0x16: "6", 0x1A: "7", 0x1C: "8", 0x19: "9",
+}
 DISCOVERY_PORT = 5005
 
 # ---- OTA updates ----
@@ -466,21 +463,26 @@ def apply_update(payload: bytes) -> str:
 # install time, so the in-app viewer stays complete going forward
 # without needing the whole history re-embedded on every release.
 EMBEDDED_CHANGELOG = [
+    {   "version": "1.4.5a"
+        "date": "2026-08-21"
+        "notes": (
+            "Fixed major bug fixes in 1.4.5"
+        ),
+    },
     {   "version": "1.4.5",
         "date": "2026-08-21",
         "notes": (
-            "Guests now see \"You joined the chat.\" immediately instead of an "
-            "empty box. Sticker picker can upload and save custom stickers so "
-            "you don't need to re-upload them. Added a GIF picker (search + "
-            "send via a GIF provider); received GIFs stay on a still frame and "
-            "only animate on hover, labeled \"hover to watch\". Moderation "
-            "command (/mute, /kick, /ban) name suggestions now surface the "
-            "most recently/rapidly active person first, and @ping suggestions "
-            "surface the quietest person first. Fixed the DND keybind picker "
-            "on macOS reporting Command as \"Alt\" and Option producing "
-            "composed/dead-key symbols instead of the plain key. Removed the "
-            "bright focus-highlight ring on text entries/chat log on macOS. "
-            "Fixed \"View Changelog\" clipping into \"Check for Updates\"."
+            "Stickers can now be uploaded (image -> JPEG, with a name you pick) and "
+            "are saved locally so you don't need to re-upload them every session — "
+            "the sticker picker shows your saved ones as thumbnails alongside the "
+            "built-ins, and right-click deletes one. Guests now see a 'You joined "
+            "Room...' message immediately instead of an empty chat box. /mute, "
+            "/kick, and /ban suggestions now put whoever's been most active "
+            "recently first; @ ping suggestions put whoever's been quiet the "
+            "longest first. Fixed macOS DND keybinds: Command was being detected "
+            "as Alt (so Command-based binds never actually fired), and Option was "
+            "corrupting the captured key via its accent/dead-key composition — "
+            "both fixed, though not verified on an actual Mac, so worth checking."
         ),
     },
     {   "version": "1.4.4d",
@@ -560,80 +562,29 @@ def full_changelog() -> list:
         by_version[e["version"]] = e
     return sorted(by_version.values(), key=lambda e: _version_tuple(e["version"]), reverse=True)
 
+
 # ---- Custom stickers ----
-# Uploaded stickers are copied into STICKERS_DIR and tracked in a small
-# manifest.json alongside them, so they persist across launches instead
-# of needing to be re-uploaded (a fresh file dialog) every session.
-STICKERS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "chat_gui_stickers")
-STICKERS_MANIFEST = os.path.join(STICKERS_DIR, "manifest.json")
+# Uploaded stickers are stored locally (as base64 JPEG bytes in a small
+# JSON file next to the script) so they persist across sessions instead
+# of needing to be re-uploaded every time. They're sent over the wire
+# exactly like the built-in stickers — as a regular JPEG file transfer.
+STICKERS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "chat_gui_stickers.json")
+MAX_CUSTOM_STICKERS = 24
 
-def load_custom_stickers() -> list:
+def _load_custom_stickers() -> dict:
     try:
-        with open(STICKERS_MANIFEST, "r", encoding="utf-8") as f:
-            entries = json.load(f)
+        with open(STICKERS_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            return data if isinstance(data, dict) else {}
     except (FileNotFoundError, json.JSONDecodeError, OSError):
-        return []
-    out = []
-    for e in entries if isinstance(entries, list) else []:
-        name, fname = e.get("name"), e.get("file")
-        if not name or not fname: continue
-        full = os.path.join(STICKERS_DIR, fname)
-        if os.path.isfile(full):
-            out.append({"name": name, "path": full})
-    return out
+        return {}
 
-def save_custom_sticker(name: str, src_path: str) -> bool:
+def _save_custom_stickers(stickers: dict):
     try:
-        os.makedirs(STICKERS_DIR, exist_ok=True)
-        ext = os.path.splitext(src_path)[1].lower() or ".png"
-        safe_name = re.sub(r"[^A-Za-z0-9_-]", "_", name)[:40] or "sticker"
-        fname = f"{safe_name}_{int(time.time())}{ext}"
-        shutil.copyfile(src_path, os.path.join(STICKERS_DIR, fname))
-
-        try:
-            with open(STICKERS_MANIFEST, "r", encoding="utf-8") as f:
-                entries = json.load(f)
-            if not isinstance(entries, list): entries = []
-        except (FileNotFoundError, json.JSONDecodeError, OSError):
-            entries = []
-        entries.append({"name": name, "file": fname})
-        with open(STICKERS_MANIFEST, "w", encoding="utf-8") as f:
-            json.dump(entries, f, indent=2)
-        return True
+        with open(STICKERS_FILE, "w", encoding="utf-8") as f:
+            json.dump(stickers, f)
     except OSError:
-        return False
-
-# ---- GIF search (via a third-party GIF provider) ----
-# Uses Giphy's public "beta" demo key, which works out of the box for
-# light/testing use without registering an account. It's rate-limited —
-# for regular use, get a free key at https://developers.giphy.com and
-# drop it in here.
-GIF_PROVIDER_API_KEY = "dc6zaTOxFJmzC"
-GIF_SEARCH_URL = "https://api.giphy.com/v1/gifs/search"
-
-def search_gifs(query: str, limit: int = 9) -> list:
-    """Returns [{"preview_url": ..., "gif_url": ..., "title": ...}, ...].
-    Network/parse failures return an empty list rather than raising, so a
-    flaky connection just shows 'no results' instead of crashing the UI."""
-    params = urllib.parse.urlencode({
-        "api_key": GIF_PROVIDER_API_KEY, "q": query, "limit": limit, "rating": "pg-13",
-    })
-    try:
-        raw = _https_get(f"{GIF_SEARCH_URL}?{params}", timeout=8.0)
-        data = json.loads(raw.decode("utf-8"))
-    except Exception:
-        return []
-    out = []
-    for item in data.get("data", []):
-        images = item.get("images", {})
-        preview = images.get("fixed_width_small") or images.get("preview_gif") or {}
-        full = images.get("fixed_width") or images.get("original") or {}
-        if preview.get("url") and full.get("url"):
-            out.append({"preview_url": preview["url"], "gif_url": full["url"], "title": item.get("title") or "GIF"})
-    return out
-
-def fetch_url_bytes(url: str, timeout: float = 8.0) -> bytes:
-    return _https_get(url, timeout=timeout)
+        pass
 
 class Hub:
     def __init__(self, fernet: Fernet, host_name: str, on_typing_change, on_admin_log):
@@ -915,12 +866,6 @@ def handle_guest_connection(sock, addr, hub: Hub, host_name: str, event_queue: q
     
     event_queue.put(("system", f"{guest_name} joined from {addr[0]}"))
     hub.broadcast(f"* {guest_name} joined the chat *", exclude_sock=sock)
-    # Sent only to the joining guest (excluded from the broadcast above),
-    # so their own chat log isn't just a blank box until someone else
-    # sends the first message. Deliberately worded without the "* ... *"
-    # wrapper the other join/leave lines use, so it doesn't get picked up
-    # by the "X joined the chat" name-detection regex on the receiving end.
-    hub.send_private(sock, "You joined the chat.")
     hub.send_private(sock, ROSTER_PREFIX + ",".join([host_name] + hub.names()))
     hub.send_private(sock, SLOWMODE_PREFIX + str(hub.slowmode_delay))
     hub.broadcast(COLORMAP_PREFIX + hub.colormap_string())
@@ -1643,12 +1588,14 @@ class ChatApp(tk.Tk):
         self.slowmode_delay = 0.0
         self._slowmode_cd_timer = None
         self._slowmode_cd_end = 0.0
+        self.user_msg_times = {}       # name.lower() -> recent message timestamps (spam ranking)
+        self.user_last_msg_time = {}   # name.lower() -> timestamp of their last message (idle ranking)
         
         self.suggest_popup = None
         self.current_suggestions = []
         self._emoji_popup = None
         self._sticker_popup = None
-        self.dnd_keybind = {"mac": False, "bind_str": "<Control-d>", "label": "Control+d"}
+        self.dnd_keybind = "<Control-d>"
         self._dnd_keybind_popup = None
         self._dnd_cd = 0.0
 
@@ -1668,27 +1615,18 @@ class ChatApp(tk.Tk):
         card.place(relx=0.5, rely=0.5, anchor="center")
 
         self._update_popup = None
-        # Stacked in a frame via pack (rather than two independently
-        # place()'d labels at fixed pixel y-offsets) so the gap between
-        # them is driven by each label's actual measured height. Fixed
-        # offsets looked fine on the font metrics they were tuned on but
-        # clipped slightly on other displays/font-rendering (e.g. a 13"
-        # MacBook) where the label is a couple pixels taller.
-        corner = tk.Frame(f, bg=BG_DARK)
-        corner.place(relx=1.0, rely=1.0, anchor="se", x=-10, y=-8)
-
         changelog_label = tk.Label(
-            corner, text="View Changelog", bg=BG_DARK, fg=FG_MUTED,
+            f, text="View Changelog", bg=BG_DARK, fg=FG_MUTED,
             font=(CHAT_FONT[0], 8, "underline"), cursor="hand2"
         )
-        changelog_label.pack(anchor="e", pady=(0, 3))
+        changelog_label.place(relx=1.0, rely=1.0, anchor="se", x=-10, y=-24)
         changelog_label.bind("<Button-1>", lambda e: self.on_show_changelog())
 
         version_label = tk.Label(
-            corner, text=f"v{VERSION} — Check for Updates", bg=BG_DARK, fg=FG_MUTED,
+            f, text=f"v{VERSION} — Check for Updates", bg=BG_DARK, fg=FG_MUTED,
             font=(CHAT_FONT[0], 8, "underline"), cursor="hand2"
         )
-        version_label.pack(anchor="e")
+        version_label.place(relx=1.0, rely=1.0, anchor="se", x=-10, y=-8)
         version_label.bind("<Button-1>", lambda e: self.on_check_updates())
 
         tk.Label(card, text="chat_gui", font=(CHAT_FONT[0], 20, "bold"), bg=BG_PANEL, fg=FG_TEXT).grid(
@@ -1714,7 +1652,6 @@ class ChatApp(tk.Tk):
                 readonlybackground=BG_INPUT,  # Tk uses a separate bg for state="readonly";
                                                # left unset it defaults to a near-white system
                                                # color, making light text unreadable on it.
-                highlightthickness=0, highlightbackground=BG_INPUT, highlightcolor=BG_INPUT,
                 **kwargs
             )
             entry.grid(row=row, column=1, sticky="ew", pady=(6, 0), padx=(10, 0))
@@ -1731,10 +1668,7 @@ class ChatApp(tk.Tk):
         self.host_ip_entry = field(4, "Host IP (only if Room Code fails)")
 
         tk.Label(card, text="Shared key", bg=BG_PANEL, fg=FG_MUTED, anchor="w", font=CHAT_FONT).grid(row=5, column=0, sticky="w", pady=(6, 0))
-        self.key_entry = tk.Entry(
-            card, bg=BG_INPUT, fg=FG_TEXT, insertbackground=FG_TEXT, relief="flat", width=28, show="*", font=CHAT_FONT,
-            highlightthickness=0, highlightbackground=BG_INPUT, highlightcolor=BG_INPUT,
-        )
+        self.key_entry = tk.Entry(card, bg=BG_INPUT, fg=FG_TEXT, insertbackground=FG_TEXT, relief="flat", width=28, show="*", font=CHAT_FONT)
         self.key_entry.grid(row=5, column=1, sticky="ew", pady=(6, 0), padx=(10, 0))
 
         self.status_label = tk.Label(card, text="", bg=BG_PANEL, fg=COLOR_PALETTE["red"], wraplength=280, justify="left", font=CHAT_FONT)
@@ -1792,11 +1726,7 @@ class ChatApp(tk.Tk):
         body = tk.Frame(self.chat_frame, bg=BG_DARK)
         body.pack(fill="both", expand=True)
 
-        self.log = scrolledtext.ScrolledText(
-            body, bg=BG_DARK, fg=FG_TEXT, insertbackground=FG_TEXT, relief="flat",
-            state="disabled", wrap="word", padx=10, pady=8, font=CHAT_FONT,
-            highlightthickness=0, highlightbackground=BG_DARK, highlightcolor=BG_DARK,
-        )
+        self.log = scrolledtext.ScrolledText(body, bg=BG_DARK, fg=FG_TEXT, insertbackground=FG_TEXT, relief="flat", state="disabled", wrap="word", padx=10, pady=8, font=CHAT_FONT)
         self.log.pack(side="left", fill="both", expand=True)
         self.log.tag_configure("system", foreground=FG_MUTED, font=(CHAT_FONT[0], 9, "italic"))
         self.log.tag_configure("private", foreground=COLOR_PALETTE["yellow"])
@@ -1825,16 +1755,10 @@ class ChatApp(tk.Tk):
         self.sticker_btn = make_button(self.bottom_bar, "🌠", self.on_sticker_picker, bg=BG_INPUT, hover_bg=BTN_NEUTRAL_HOVER, padx=10, pady=6)
         self.sticker_btn.pack(side="left", padx=(0, 6))
 
-        self.gif_btn = make_button(self.bottom_bar, "GIF", self.on_gif_picker, bg=BG_INPUT, hover_bg=BTN_NEUTRAL_HOVER, padx=10, pady=6)
-        self.gif_btn.pack(side="left", padx=(0, 6))
-
         self.emoji_btn = make_button(self.bottom_bar, "😀", self.on_emoji_picker, bg=BG_INPUT, hover_bg=BTN_NEUTRAL_HOVER, padx=10, pady=6)
         self.emoji_btn.pack(side="left", padx=(0, 6))
 
-        self.msg_entry = tk.Entry(
-            self.bottom_bar, bg=BG_INPUT, fg=FG_TEXT, insertbackground=FG_TEXT, relief="flat", font=CHAT_FONT,
-            highlightthickness=0, highlightbackground=BG_INPUT, highlightcolor=BG_INPUT,
-        )
+        self.msg_entry = tk.Entry(self.bottom_bar, bg=BG_INPUT, fg=FG_TEXT, insertbackground=FG_TEXT, relief="flat", font=CHAT_FONT)
         self.msg_entry.pack(side="left", fill="x", expand=True, ipady=6)
 
         self.msg_entry.bind("<Return>", self.on_send)
@@ -1857,7 +1781,7 @@ class ChatApp(tk.Tk):
 
     def _set_input_state(self, enabled: bool):
         self.msg_entry.configure(state="normal" if enabled else "disabled")
-        for btn in (self.send_btn, self.attach_btn, self.sticker_btn, self.gif_btn, self.emoji_btn):
+        for btn in (self.send_btn, self.attach_btn, self.sticker_btn, self.emoji_btn):
             self._set_button_enabled(btn, enabled)
 
     def _apply_mute_state(self, muted: bool, until: float = 0.0):
@@ -1886,30 +1810,33 @@ class ChatApp(tk.Tk):
         self._apply_mute_state(False)
         self.append_system_line("🔇 Your mute has expired — you can send messages again.")
 
-    def _record_activity(self, name: str):
-        key = name.lower()
-        if key == self.my_name.lower(): return
-        log = self.activity_log.setdefault(key, [])
-        log.append(time.time())
-        if len(log) > 20: del log[:-20]
-
-    def _spam_score(self, name: str) -> float:
-        """Higher = posting the most, the fastest, most recently — used to
-        surface likely spammers first for /mute, /kick, /ban suggestions."""
-        log = self.activity_log.get(name.lower())
-        if not log: return 0.0
+    def _record_user_message_time(self, sender_name: str):
+        key = sender_name.lower()
         now = time.time()
-        recent = [t for t in log if now - t <= 60]
-        if not recent: return 0.0
-        span = max(now - recent[0], 1.0)
-        return len(recent) / span
+        self.user_last_msg_time[key] = now
+        times = [t for t in self.user_msg_times.get(key, []) if now - t <= SPAM_SUGGESTION_WINDOW]
+        times.append(now)
+        self.user_msg_times[key] = times
 
-    def _quiet_score(self, name: str) -> float:
-        """Higher = hasn't posted in the longest time (or ever) — used to
-        surface the quietest people first for @ping suggestions."""
-        log = self.activity_log.get(name.lower())
-        if not log: return float("inf")
-        return time.time() - log[-1]
+    def _rank_by_recent_activity(self, names: list) -> list:
+        """Most messages within SPAM_SUGGESTION_WINDOW first — surfaces
+        whoever's currently sending the most messages in the shortest
+        time, as a shortcut for /mute /kick /ban."""
+        now = time.time()
+        def score(name):
+            times = self.user_msg_times.get(name.lower(), [])
+            return len([t for t in times if now - t <= SPAM_SUGGESTION_WINDOW])
+        return sorted(names, key=lambda n: (-score(n), n.lower()))
+
+    def _rank_by_idle_time(self, names: list) -> list:
+        """Longest since their last message first (never-sent = most
+        idle of all) — surfaces who's most likely away, as a shortcut
+        for @ pings."""
+        now = time.time()
+        def idle_for(name):
+            last = self.user_last_msg_time.get(name.lower())
+            return float("inf") if last is None else now - last
+        return sorted(names, key=lambda n: (-idle_for(n), n.lower()))
 
     def evaluate_live_suggestions(self):
         text, cursor_pos = self.msg_entry.get(), self.msg_entry.index("insert")
@@ -1926,28 +1853,26 @@ class ChatApp(tk.Tk):
                 self.current_suggestions = [c for c in all_cmds if c.startswith(base_cmd)]
             elif len(words) >= 2:
                 current_arg = words[-1].lower() if left_text[-1] != " " else ""
-                if base_cmd in {"/mute", "/kick", "/ban"} and len(words) == 2:
-                    # Sort so whoever's been posting fastest/most recently
-                    # (likely spamming) surfaces first.
-                    names = [n for n in self.current_roster if n.lower() != self.my_name.lower() and n.lower().startswith(current_arg)]
-                    names.sort(key=self._spam_score, reverse=True)
-                    self.current_suggestions = names
-                elif base_cmd in {"/unmute", "/whisper", "/admin", "/unadmin"} and len(words) == 2:
-                    self.current_suggestions = [n for n in self.current_roster if n.lower() != self.my_name.lower() and n.lower().startswith(current_arg)]
+                if base_cmd in {"/mute", "/unmute", "/kick", "/ban", "/whisper", "/admin", "/unadmin"} and len(words) == 2:
+                    matches = [n for n in self.current_roster if n.lower() != self.my_name.lower() and n.lower().startswith(current_arg)]
+                    # Punitive/moderation actions: surface whoever's been
+                    # most active recently first — usually who you're
+                    # actually about to target.
+                    if base_cmd in {"/mute", "/kick", "/ban"}:
+                        matches = self._rank_by_recent_activity(matches)
+                    self.current_suggestions = matches
                 elif base_cmd == "/color" and len(words) == 2:
                     self.current_suggestions = [col for col in COLOR_PALETTE if col.startswith(current_arg)]
 
         if words and words[-1].startswith("@") and len(words[-1]) >= 1:
             query = words[-1][1:].lower()
-            # Sort so whoever's been quietest the longest (or hasn't spoken
-            # at all) surfaces first — they're the ones a ping is most
-            # likely meant to nudge back into the conversation.
-            ping_names = [
+            ping_matches = self._rank_by_idle_time([
                 n for n in self.current_roster
-                if n.lower() != self.my_name.lower() and n.lower().startswith(query) and f"@{n}" not in self.current_suggestions
-            ]
-            ping_names.sort(key=self._quiet_score, reverse=True)
-            self.current_suggestions.extend(f"@{n}" for n in ping_names)
+                if n.lower() != self.my_name.lower() and n.lower().startswith(query)
+            ])
+            self.current_suggestions.extend(
+                f"@{n}" for n in ping_matches if f"@{n}" not in self.current_suggestions
+            )
 
         if self.current_suggestions: self.render_suggestion_popup()
         else: self.destroy_suggestions()
@@ -2101,21 +2026,15 @@ class ChatApp(tk.Tk):
     def _reset_session_state(self):
         self._close_emoji_popup()
         self._close_sticker_popup()
-        self._close_gif_popup()
         self._stop_typing_signal()
         self.photo_cache = []
-        for state in getattr(self, "_gif_anim_states", {}).values():
-            if state.get("job") is not None:
-                try: self.after_cancel(state["job"])
-                except Exception: pass
-        self._gif_anim_states = {}
         
         self.log.configure(state="normal")
         self.log.delete("1.0", "end")
         self.log.configure(state="disabled")
         
         self.known_colors, self.known_tags, self.current_roster, self.message_reactions, self.typing_last_seen = {}, set(), [], {}, {}
-        self.activity_log = {}  # name.lower() -> list of recent message timestamps, for smart mod/ping suggestions
+        self.user_msg_times, self.user_last_msg_time = {}, {}
         self.typing_var.set("")
         self.dnd_active, self._dnd_cd, self.dnd_btn.disabled, self.slowmode_delay = False, 0.0, False, 0.0
         self._set_dnd_button_style(False)
@@ -2138,6 +2057,8 @@ class ChatApp(tk.Tk):
         if mode == "host":
             local_ip = self._host_local_ip or get_local_ip()
             self.append_system_line(f"Hosting Room {room_code} on {local_ip}. Guests on your same network segment can join with just the Room Code. If that doesn't work, have them enter {local_ip}:{self.connection.tcp_port} in the 'Host IP' field. Type /help for commands.")
+        else:
+            self.append_system_line(f"You joined Room {room_code} as {name}. Type /help for commands.")
 
     def on_disconnect_clicked(self):
         self._teardown_connection()
@@ -2176,66 +2097,22 @@ class ChatApp(tk.Tk):
         self.dnd_btn.disabled = False
         self._set_dnd_button_style(self.dnd_active)
 
-    def _dnd_key_matches(self, e) -> bool:
-        kb = self.dnd_keybind
-        if not kb or not kb.get("mac"): return False
-        state_mods = set()
-        if e.state & 0x0004: state_mods.add("Control")
-        if e.state & 0x0001: state_mods.add("Shift")
-        # On macOS, Tk's Mod1 bit (0x0008) is Command and Mod2 (0x0010) is
-        # Option — see the note on MAC_KEYCODE_LABELS above.
-        if e.state & 0x0008: state_mods.add("Command")
-        if e.state & 0x0010: state_mods.add("Option")
-        return state_mods == kb["mods"] and e.keycode == kb["keycode"]
-
-    def _on_mac_dnd_keypress(self, e):
-        if self._dnd_key_matches(e):
-            self.on_dnd_toggle()
-            return "break"
-
     def _apply_dnd_keybind(self):
-        # Tear down whichever binding style was previously in effect.
-        if getattr(self, "_dnd_bind_str", None):
-            try: self.unbind_all(self._dnd_bind_str)
+        try: self.unbind_all(self.dnd_keybind)
+        except Exception: pass
+        if hasattr(self, "msg_entry"):
+            try: self.msg_entry.unbind(self.dnd_keybind)
             except Exception: pass
-            if hasattr(self, "msg_entry"):
-                try: self.msg_entry.unbind(self._dnd_bind_str)
-                except Exception: pass
-            self._dnd_bind_str = None
-        if getattr(self, "_dnd_mac_bound", False):
-            try: self.unbind_all("<KeyPress>")
-            except Exception: pass
-            if hasattr(self, "msg_entry"):
-                try: self.msg_entry.unbind("<KeyPress>")
-                except Exception: pass
-            self._dnd_mac_bound = False
-
-        kb = self.dnd_keybind
-        if not kb: return
-
-        if kb.get("mac"):
-            # Option-based binds can't be matched with Tk's declarative
-            # "<Mod-key>" bind strings on macOS, because holding Option
-            # changes the keysym Tk reports to whatever composed/dead-key
-            # symbol the OS produced — it's no longer the plain letter.
-            # Matching modifiers + the physical keycode by hand sidesteps
-            # that entirely.
-            self.bind_all("<KeyPress>", self._on_mac_dnd_keypress)
-            self._dnd_mac_bound = True
+        if self.dnd_keybind:
+            self.bind_all(self.dnd_keybind, lambda e: self._trigger_dnd_toggle())
             if hasattr(self, "msg_entry"):
                 # Bound directly on the entry too: instance-level bindings
                 # fire before the Entry widget's own class binding (which
                 # is what types the character in), so returning "break"
-                # here actually stops a bind from also typing into the
-                # chat box. bind_all alone can't do this — "all" bindings
-                # are checked last.
-                self.msg_entry.bind("<KeyPress>", self._on_mac_dnd_keypress)
-        else:
-            bind_str = kb["bind_str"]
-            self._dnd_bind_str = bind_str
-            self.bind_all(bind_str, lambda e: self._trigger_dnd_toggle())
-            if hasattr(self, "msg_entry"):
-                self.msg_entry.bind(bind_str, lambda e: self._trigger_dnd_toggle())
+                # here actually stops a letter-key DND bind from also
+                # typing that letter into the chat box. bind_all alone
+                # can't do this — "all" bindings are checked last.
+                self.msg_entry.bind(self.dnd_keybind, lambda e: self._trigger_dnd_toggle())
 
     def _trigger_dnd_toggle(self):
         self.on_dnd_toggle()
@@ -2251,28 +2128,38 @@ class ChatApp(tk.Tk):
         self._dnd_keybind_popup = popup
 
         tk.Label(popup, text="Press any key combination to bind Do Not Disturb...", bg=BG_PANEL, fg=FG_TEXT, font=BOLD_FONT).pack(anchor="w", pady=(0, 10))
-        tk.Label(popup, text=f"Current bind: {self.dnd_keybind['label']}", bg=BG_INPUT, fg=FG_TEXT, font=CHAT_FONT).pack(fill="x", pady=5)
+        tk.Label(popup, text=f"Current bind: {self.dnd_keybind}", bg=BG_INPUT, fg=FG_TEXT, font=CHAT_FONT).pack(fill="x", pady=5)
 
         def capture(e):
             if e.keysym.endswith("_L") or e.keysym.endswith("_R"): return
-
-            if IS_MAC:
-                mods, label_parts = set(), []
-                if e.state & 0x0004: mods.add("Control"); label_parts.append("Control")
-                if e.state & 0x0001: mods.add("Shift"); label_parts.append("Shift")
-                if e.state & 0x0008: mods.add("Command"); label_parts.append("Command")
-                if e.state & 0x0010: mods.add("Option"); label_parts.append("Option")
-                base_label = MAC_KEYCODE_LABELS.get(e.keycode, e.keysym)
-                label_parts.append(base_label)
-                self.dnd_keybind = {"mac": True, "mods": mods, "keycode": e.keycode, "label": "+".join(label_parts)}
+            is_mac = sys.platform == "darwin"
+            parts = []
+            if e.state & 4: parts.append("Control")
+            if e.state & 1: parts.append("Shift")
+            if is_mac:
+                # Tk's Aqua port reports Command under the same bit X11
+                # calls "Mod1" (historically mislabeled "Alt" below) —
+                # and Command/Option are Tk's own native modifier names
+                # on macOS, not "Alt". Binding "<Alt-x>" here would never
+                # actually fire on a real Command press, since Tk doesn't
+                # report Command presses under that name on this platform.
+                if e.state & 8: parts.append("Command")
+                if e.state & 16: parts.append("Option")
             else:
-                parts = []
-                if e.state & 4: parts.append("Control")
-                if e.state & 1: parts.append("Shift")
                 if e.state & 131072 or e.state & 8: parts.append("Alt")
-                parts.append(e.keysym)
-                self.dnd_keybind = {"mac": False, "bind_str": "<" + "-".join(parts) + ">", "label": "+".join(parts)}
 
+            keyname = e.keysym
+            if is_mac and (e.state & 16):
+                keyname = MAC_VIRTUAL_KEYCODE_TO_KEY.get(e.keycode, keyname)
+            parts.append(keyname)
+            
+            try: self.unbind_all(self.dnd_keybind)
+            except Exception: pass
+            if hasattr(self, "msg_entry"):
+                try: self.msg_entry.unbind(self.dnd_keybind)
+                except Exception: pass
+                
+            self.dnd_keybind = "<" + "-".join(parts) + ">"
             self._apply_dnd_keybind()
             self._dnd_keybind_popup = None
             popup.destroy()
@@ -2528,9 +2415,11 @@ class ChatApp(tk.Tk):
         except ValueError as e: messagebox.showerror("File too large", str(e))
         except OSError as e: messagebox.showerror("Couldn't read file", str(e))
 
+    BUILTIN_STICKERS = ["GG", "RIP", "HELLO", "WOW", "BRUH"]
+
     def on_sticker_picker(self):
         if Image is None or ImageDraw is None:
-            return messagebox.showerror("Error", "Pillow (PIL) is required to generate stickers.")
+            return messagebox.showerror("Error", "Pillow (PIL) is required to use stickers.")
 
         if getattr(self, "_sticker_popup", None) is not None:
             try: self._sticker_popup.destroy()
@@ -2542,7 +2431,7 @@ class ChatApp(tk.Tk):
         popup.overrideredirect(True)
         popup.configure(bg=BG_PANEL, padx=6, pady=6)
         self._sticker_popup = popup
-        self.sticker_photo_cache = []  # keep PhotoImage refs alive while the popup is open
+        self._sticker_thumb_cache = {}  # keeps PhotoImage refs alive — Tk GCs them otherwise
 
         x, y = self.winfo_rootx() + self.bottom_bar.winfo_x() + 40, self.winfo_rooty() + self.bottom_bar.winfo_y() - 4
         popup.geometry(f"+{x}+{y-140}")
@@ -2551,7 +2440,7 @@ class ChatApp(tk.Tk):
         grid.pack()
 
         col = 0
-        for i, s in enumerate(["GG", "RIP", "HELLO", "WOW", "BRUH"]):
+        for s in self.BUILTIN_STICKERS:
             btn = tk.Label(grid, text=s, font=BOLD_FONT, bg=BG_INPUT, fg=FG_TEXT, padx=10, pady=10, cursor="hand2", bd=1, relief="solid")
             btn.grid(row=0, column=col, padx=4, pady=4)
             btn.bind("<Button-1>", lambda e, name=s: self.send_sticker(name))
@@ -2559,28 +2448,35 @@ class ChatApp(tk.Tk):
             btn.bind("<Leave>", lambda e, w=btn: w.configure(bg=BG_INPUT))
             col += 1
 
-        # Custom stickers the user has uploaded — persisted to disk, so
-        # they show up here every session without re-uploading.
-        for entry in load_custom_stickers():
+        custom = _load_custom_stickers()
+        row, col = 1, 0
+        for name, b64data in custom.items():
             try:
-                thumb = Image.open(entry["path"])
-                thumb.thumbnail((56, 56))
+                img_bytes = base64.b64decode(b64data)
+                thumb = Image.open(io.BytesIO(img_bytes)).resize((64, 64), Image.LANCZOS)
                 photo = ImageTk.PhotoImage(thumb)
             except Exception:
                 continue
-            self.sticker_photo_cache.append(photo)
-            btn = tk.Label(grid, image=photo, bg=BG_INPUT, cursor="hand2", bd=1, relief="solid", padx=4, pady=4)
-            btn.grid(row=col // 8, column=col % 8, padx=4, pady=4)
-            btn.bind("<Button-1>", lambda e, path=entry["path"], name=entry["name"]: self.send_custom_sticker(path, name))
+            self._sticker_thumb_cache[name] = photo
+
+            btn = tk.Label(grid, image=photo, bg=BG_INPUT, cursor="hand2", bd=1, relief="solid")
+            btn.grid(row=row, column=col, padx=4, pady=4)
+            btn.bind("<Button-1>", lambda e, name=name: self.send_sticker(name))
+            btn.bind("<Button-3>", lambda e, name=name: self._delete_custom_sticker(name))
             btn.bind("<Enter>", lambda e, w=btn: w.configure(bg=BTN_NEUTRAL))
             btn.bind("<Leave>", lambda e, w=btn: w.configure(bg=BG_INPUT))
             col += 1
+            if col >= 5:
+                col, row = 0, row + 1
 
-        add_btn = tk.Label(grid, text="➕", font=BOLD_FONT, bg=BG_INPUT, fg=FG_TEXT, padx=14, pady=10, cursor="hand2", bd=1, relief="solid")
-        add_btn.grid(row=col // 8, column=col % 8, padx=4, pady=4)
-        add_btn.bind("<Button-1>", lambda e: self.on_upload_sticker())
-        add_btn.bind("<Enter>", lambda e, w=add_btn: w.configure(bg=BTN_NEUTRAL))
-        add_btn.bind("<Leave>", lambda e, w=add_btn: w.configure(bg=BG_INPUT))
+        upload_btn = tk.Label(grid, text="➕\nUpload", font=(CHAT_FONT[0], 9), bg=BG_INPUT, fg=FG_MUTED, padx=8, pady=8, cursor="hand2", bd=1, relief="solid")
+        upload_btn.grid(row=row, column=col, padx=4, pady=4)
+        upload_btn.bind("<Button-1>", lambda e: self.on_upload_sticker())
+        upload_btn.bind("<Enter>", lambda e: upload_btn.configure(bg=BTN_NEUTRAL))
+        upload_btn.bind("<Leave>", lambda e: upload_btn.configure(bg=BG_INPUT))
+
+        if custom:
+            tk.Label(popup, text="Right-click a custom sticker to delete it", bg=BG_PANEL, fg=FG_MUTED, font=(CHAT_FONT[0], 8)).pack(pady=(4, 0))
 
         popup.bind("<FocusOut>", lambda e: self._close_sticker_popup())
         popup.focus_set()
@@ -2594,136 +2490,67 @@ class ChatApp(tk.Tk):
     def on_upload_sticker(self):
         path = filedialog.askopenfilename(
             title="Choose a sticker image",
-            filetypes=[("Images", "*.png *.jpg *.jpeg *.gif *.webp *.bmp")],
+            filetypes=[("Images", "*.png *.jpg *.jpeg *.gif *.bmp *.webp"), ("All files", "*.*")]
         )
-        self._close_sticker_popup()
-        if not path: return
-        name = os.path.splitext(os.path.basename(path))[0][:40] or "sticker"
-        if save_custom_sticker(name, path):
-            self.on_sticker_picker()  # reopen so the new sticker is visible immediately
-        else:
-            messagebox.showerror("Error", "Couldn't save that sticker to disk.")
-
-    def send_custom_sticker(self, path, name):
-        self._close_sticker_popup()
-        if not self.connection: return
-        try:
-            with open(path, "rb") as f:
-                data = f.read()
-        except OSError:
+        if not path:
             return
-        ext = os.path.splitext(path)[1] or ".png"
-        self.connection.send_file_bytes(f"Sticker_{name}{ext}", data)
-        self._maybe_start_slowmode_cooldown()
+
+        custom = _load_custom_stickers()
+        if len(custom) >= MAX_CUSTOM_STICKERS:
+            self._close_sticker_popup()
+            return messagebox.showerror("Too many stickers", f"You can have at most {MAX_CUSTOM_STICKERS} custom stickers. Delete one first (right-click it).")
+
+        name = simpledialog.askstring("Name this sticker", "Short name (shown as the filename when sent):", parent=self)
+        if not name or not name.strip():
+            return
+        name = re.sub(r"[^A-Za-z0-9_\- ]", "", name.strip())[:20] or "sticker"
+
+        try:
+            img = Image.open(path).convert("RGB")
+        except Exception as e:
+            self._close_sticker_popup()
+            return messagebox.showerror("Couldn't load image", str(e))
+
+        img.thumbnail((240, 240), Image.LANCZOS)
+        square = Image.new("RGB", (240, 240), color=BG_PANEL)
+        square.paste(img, ((240 - img.width) // 2, (240 - img.height) // 2))
+        bio = io.BytesIO()
+        square.save(bio, format="JPEG", quality=88)
+
+        custom[name] = base64.b64encode(bio.getvalue()).decode("ascii")
+        _save_custom_stickers(custom)
+
+        self._close_sticker_popup()
+        self.on_sticker_picker()  # reopen, now showing the new sticker
+
+    def _delete_custom_sticker(self, name):
+        custom = _load_custom_stickers()
+        if name in custom:
+            del custom[name]
+            _save_custom_stickers(custom)
+        self._close_sticker_popup()
+        self.on_sticker_picker()
 
     def send_sticker(self, name):
         self._close_sticker_popup()
         if not self.connection: return
-        
-        img = Image.new('RGB', (120, 120), color=BG_PANEL)
-        d = ImageDraw.Draw(img)
-        d.rectangle([5, 5, 115, 115], fill={"GG": "#57F287", "RIP": "#ED4245", "HELLO": "#5B8CFF", "WOW": "#FEE75C", "BRUH": "#FFA347"}.get(name, "#FFFFFF"), outline="white", width=3)
-        d.text((10, 50), name, fill="black")
-        
-        bio = io.BytesIO()
-        img.resize((240, 240), Image.NEAREST).save(bio, format="JPEG")
-        self.connection.send_file_bytes(f"Sticker_{name}.jpg", bio.getvalue())
-        self._maybe_start_slowmode_cooldown()
 
-    def on_gif_picker(self):
-        if getattr(self, "_gif_popup", None) is not None:
-            return self._close_gif_popup()
+        if name in self.BUILTIN_STICKERS:
+            img = Image.new('RGB', (120, 120), color=BG_PANEL)
+            d = ImageDraw.Draw(img)
+            d.rectangle([5, 5, 115, 115], fill={"GG": "#57F287", "RIP": "#ED4245", "HELLO": "#5B8CFF", "WOW": "#FEE75C", "BRUH": "#FFA347"}.get(name, "#FFFFFF"), outline="white", width=3)
+            d.text((10, 50), name, fill="black")
+            bio = io.BytesIO()
+            img.resize((240, 240), Image.NEAREST).save(bio, format="JPEG")
+            img_bytes = bio.getvalue()
+        else:
+            custom = _load_custom_stickers()
+            b64data = custom.get(name)
+            if not b64data:
+                return
+            img_bytes = base64.b64decode(b64data)
 
-        popup = tk.Toplevel(self)
-        popup.title("Search GIFs")
-        popup.configure(bg=BG_PANEL, padx=10, pady=10)
-        popup.resizable(False, False)
-        popup.transient(self)
-        popup.protocol("WM_DELETE_WINDOW", self._close_gif_popup)
-        self._gif_popup = popup
-        self._gif_photo_cache = []
-        self._gif_results = []
-
-        search_row = tk.Frame(popup, bg=BG_PANEL)
-        search_row.pack(fill="x", pady=(0, 8))
-        gif_search_entry = tk.Entry(
-            search_row, bg=BG_INPUT, fg=FG_TEXT, insertbackground=FG_TEXT, relief="flat", font=CHAT_FONT,
-            highlightthickness=0, highlightbackground=BG_INPUT, highlightcolor=BG_INPUT,
-        )
-        gif_search_entry.pack(side="left", fill="x", expand=True, ipady=4)
-        gif_search_entry.focus_set()
-        self._gif_search_entry = gif_search_entry
-
-        def do_search(event=None):
-            query = gif_search_entry.get().strip()
-            if not query: return
-            self._gif_status_var.set(f"Searching for \"{query}\"...")
-            for w in self._gif_results_frame.winfo_children(): w.destroy()
-            threading.Thread(target=self._async_search_gifs, args=(query,), daemon=True).start()
-
-        gif_search_entry.bind("<Return>", do_search)
-        make_button(search_row, "Search", do_search, bg=COLOR_PALETTE["blue"], hover_bg=BTN_BLUE_HOVER, padx=10, pady=4, font=CHAT_FONT).pack(side="left", padx=(6, 0))
-
-        self._gif_status_var = tk.StringVar(value="Search for a GIF to send.")
-        tk.Label(popup, textvariable=self._gif_status_var, bg=BG_PANEL, fg=FG_MUTED, font=CHAT_FONT).pack(anchor="w")
-
-        self._gif_results_frame = tk.Frame(popup, bg=BG_PANEL)
-        self._gif_results_frame.pack(pady=(6, 0))
-
-    def _close_gif_popup(self):
-        if getattr(self, "_gif_popup", None):
-            try: self._gif_popup.destroy()
-            except Exception: pass
-            self._gif_popup = None
-
-    def _async_search_gifs(self, query):
-        results = search_gifs(query)
-        self.event_queue.put(("gif_search_result", {"query": query, "results": results}))
-
-    def _handle_gif_search_result(self, payload):
-        if getattr(self, "_gif_popup", None) is None: return
-        results = payload["results"]
-        self._gif_results = results
-        if not results:
-            self._gif_status_var.set(f"No results for \"{payload['query']}\".")
-            return
-        self._gif_status_var.set(f"Results for \"{payload['query']}\" — click one to send:")
-
-        for i, item in enumerate(results):
-            try:
-                raw = fetch_url_bytes(item["preview_url"])
-                thumb = Image.open(io.BytesIO(raw))
-                thumb = thumb.convert("RGB")
-                thumb.thumbnail((90, 90))
-                photo = ImageTk.PhotoImage(thumb)
-            except Exception:
-                continue
-            self._gif_photo_cache.append(photo)
-            btn = tk.Label(self._gif_results_frame, image=photo, bg=BG_INPUT, cursor="hand2", bd=1, relief="solid")
-            btn.grid(row=i // 3, column=i % 3, padx=4, pady=4)
-            btn.bind("<Button-1>", lambda e, it=item: self.send_gif(it))
-
-    def send_gif(self, item):
-        self._gif_status_var.set(f"Sending \"{item['title']}\"...")
-        threading.Thread(target=self._async_download_gif, args=(item,), daemon=True).start()
-
-    def _async_download_gif(self, item):
-        try:
-            data = fetch_url_bytes(item["gif_url"], timeout=15.0)
-        except Exception as e:
-            self.event_queue.put(("gif_send_result", {"ok": False, "error": str(e)}))
-            return
-        self.event_queue.put(("gif_send_result", {"ok": True, "data": data, "title": item["title"]}))
-
-    def _handle_gif_send_result(self, result):
-        if not result["ok"]:
-            if getattr(self, "_gif_popup", None) is not None:
-                self._gif_status_var.set(f"Couldn't download that GIF: {result['error']}")
-            return
-        self._close_gif_popup()
-        if not self.connection: return
-        safe_name = re.sub(r"[^A-Za-z0-9_-]", "_", result["title"])[:40] or "gif"
-        self.connection.send_file_bytes(f"{safe_name}.gif", result["data"])
+        self.connection.send_file_bytes(f"Sticker_{name}.jpg", img_bytes)
         self._maybe_start_slowmode_cooldown()
 
     def on_emoji_picker(self):
@@ -2805,8 +2632,6 @@ class ChatApp(tk.Tk):
                         self._apply_mute_state(True, until)
                 elif kind == "update_check_result": self._handle_update_check_result(payload)
                 elif kind == "update_apply_result": self._handle_update_apply_result(payload)
-                elif kind == "gif_search_result": self._handle_gif_search_result(payload)
-                elif kind == "gif_send_result": self._handle_gif_send_result(payload)
         except queue.Empty: pass
         self.after(50, self.poll_queue)
 
@@ -2826,7 +2651,7 @@ class ChatApp(tk.Tk):
         
         if ": " in raw_safe:
             prefix, rest = raw_safe.split(": ", 1)
-            self._record_activity(prefix)
+            self._record_user_message_time(prefix)
             self.log.insert("end", prefix, (self._color_tag(self.known_colors.get(prefix.lower(), FG_TEXT)),))
             self.log.insert("end", ": " + rest)
             
@@ -2901,7 +2726,6 @@ class ChatApp(tk.Tk):
         self.log.see("end")
 
     def render_incoming_file(self, sender: str, filename: str, data: bytes):
-        self._record_activity(sender)
         self.log.configure(state="normal")
         
         align_tag = "align_right" if sender.lower() == self.my_name.lower() else "align_left"
@@ -2916,20 +2740,9 @@ class ChatApp(tk.Tk):
 
         if Image is not None and filename.lower().endswith((".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp")):
             try:
-                src = Image.open(io.BytesIO(data))
-                is_gif = filename.lower().endswith(".gif")
-                frames = None
-                if is_gif and ImageSequence is not None:
-                    collected, durations = [], []
-                    for frame in ImageSequence.Iterator(src):
-                        collected.append(frame.convert("RGBA"))
-                        durations.append(max(frame.info.get("duration", 80), 20))
-                    if len(collected) > 1:
-                        frames, frame_durations = collected, durations
-
-                first = (frames[0] if frames else src).copy()
-                first.thumbnail((260, 260))
-                photo = ImageTk.PhotoImage(first)
+                img = Image.open(io.BytesIO(data))
+                img.thumbnail((260, 260))
+                photo = ImageTk.PhotoImage(img)
                 self.photo_cache.append(photo)
                 self.log.image_create("end", image=photo)
                 
@@ -2937,26 +2750,7 @@ class ChatApp(tk.Tk):
                 self.log.tag_add(img_tag, self.log.index("end-2c"), self.log.index("end-1c"))
                 for bind in ["<Button-2>", "<Button-3>"]:
                     self.log.tag_bind(img_tag, bind, lambda e, d=data, fn=filename: self._show_image_context_menu(e, d, fn))
-
-                if frames:
-                    # Only animate on hover — decoding/redrawing every frame
-                    # continuously for every GIF in the log would add up
-                    # fast, so it stays a still frame until you're actually
-                    # looking at it.
-                    resized_frames = [f.resize(first.size) for f in frames]
-                    if "gif_hint" not in self.known_tags:
-                        self.log.tag_configure("gif_hint", foreground=FG_MUTED, font=(CHAT_FONT[0], 8))
-                        self.known_tags.add("gif_hint")
-                    self.log.insert("end", "  (hover to watch)", ("gif_hint",))
-
-                    self._gif_anim_states = getattr(self, "_gif_anim_states", {})
-                    self._gif_anim_states[img_tag] = {
-                        "frames": resized_frames, "durations": frame_durations,
-                        "photo": photo, "job": None, "index": 0,
-                    }
-                    self.log.tag_bind(img_tag, "<Enter>", lambda e, tag=img_tag: self._start_gif_hover(tag))
-                    self.log.tag_bind(img_tag, "<Leave>", lambda e, tag=img_tag: self._stop_gif_hover(tag))
-
+                
                 self.log.insert("end", "\n\n")
                 self.log.tag_add(align_tag, start_index, self.log.index("end-1c"))
                 self.log.configure(state="disabled")
@@ -2975,31 +2769,6 @@ class ChatApp(tk.Tk):
         
         self.log.configure(state="disabled")
         self.log.see("end")
-
-    def _start_gif_hover(self, tag):
-        state = getattr(self, "_gif_anim_states", {}).get(tag)
-        if not state or state["job"] is not None: return
-        self._advance_gif_frame(tag)
-
-    def _advance_gif_frame(self, tag):
-        state = getattr(self, "_gif_anim_states", {}).get(tag)
-        if not state: return
-        state["index"] = (state["index"] + 1) % len(state["frames"])
-        try: state["photo"].paste(state["frames"][state["index"]])
-        except Exception: return
-        delay = state["durations"][state["index"]] if state["index"] < len(state["durations"]) else 80
-        state["job"] = self.after(delay, lambda: self._advance_gif_frame(tag))
-
-    def _stop_gif_hover(self, tag):
-        state = getattr(self, "_gif_anim_states", {}).get(tag)
-        if not state: return
-        if state["job"] is not None:
-            try: self.after_cancel(state["job"])
-            except Exception: pass
-            state["job"] = None
-        state["index"] = 0
-        try: state["photo"].paste(state["frames"][0])
-        except Exception: pass
 
     def _save_file_to_disk(self, data: bytes, filename: str):
         if path := filedialog.asksaveasfilename(initialfile=filename, title="Save file as"):
