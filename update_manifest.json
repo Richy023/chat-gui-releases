@@ -1,7 +1,7 @@
 {
-  "version": "1.4.5c",
+  "version": "1.4.6",
   "url": "https://raw.githubusercontent.com/Richy023/chat-gui-releases/main/chat_gui.py",
-  "sha256": "15adbc0dbb49b839d18399eb34ea5c94b97abf3fb044fe9a7babbec6ef0b64f5",
-  "signature": "j4FThgFUoyoHQB+WruSCwCp0v6WCzbS1qrQZoVVgon+wpE8Lj4ZjUpeFlMdFdNNkO08Lzh6hfCU3ZLhyyrlkCg==",
-  "notes": "minor bug fixes related mac users"
+  "sha256": "4a998f91ea78efb67b00c52c40ffb7adaa37ebeaaa304a9ea4905e84f8574779",
+  "signature": "hv185ImDlXds0Wa3zNYfsgJBEeOhYnsIBVdtgniE9tw7TgGMfq1C73a/j1znmQHB/xIU5SgR1u9uPTFRRFlrBA==",
+  "notes": "added rainbow gradient for certain users"
 }

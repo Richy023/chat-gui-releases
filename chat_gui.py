@@ -1,8 +1,15 @@
 #!/usr/bin/env python3
 """
-chat_gui.py — v1.4.5c — ENCRYPTED instant messenger with a desktop GUI.
+chat_gui.py — v1.4.6 — ENCRYPTED instant messenger with a desktop GUI.
 
 Fixes/features in this version:
+- Added a secret rainbow unlock: type :prism: into the "Host IP" field
+  when joining (instead of an address) and your name gets an animated
+  rainbow treatment — a static gradient in chat, and in the member list
+  it actually shifts/moves while you hover over it. Host color stays
+  plain white as always.
+
+Fixes in 1.4.5c:
 - Fixed "View Changelog" clipping into "Check for Updates" on the connect
   screen (Mac only) — the gap was a hardcoded pixel offset that didn't
   account for macOS rendering text taller at the same font size. Now
@@ -142,7 +149,7 @@ except ImportError:
 if sys.platform == "darwin":
     ensure_installed("pyobjus", required=False)
 
-VERSION = "1.4.5c"
+VERSION = "1.4.6"
 MSG_LEN_BYTES = 4
 MAX_GUESTS = 4
 MAX_FILE_BYTES = 500 * 1024 * 1024 # 500MB Limit
@@ -217,6 +224,18 @@ ADMIN_LOG_PREFIX = "__ADMIN_LOG__:"
 SLOWMODE_PREFIX = "__SLOWMODE__:"
 MSG_PREFIX = "__MSG__:"
 REACT_PREFIX = "__REACT__:"
+RAINBOW_UNLOCK_PREFIX = "__RAINBOW_UNLOCK__:"
+
+# ---- Secret rainbow unlock ----
+# Typed into the "Host IP" field on the join screen instead of an actual
+# address. Letters + symbols only (no digits) so it can never collide
+# with a real IP:port and misfire the discovery/parsing logic below.
+RAINBOW_SECRET_CODE = ":prism:"
+# Stored in place of a hex color for a rainbow-unlocked user — every
+# place that renders a name checks for this sentinel and draws a
+# gradient instead of a flat color.
+RAINBOW_SENTINEL = "RAINBOW"
+RAINBOW_PALETTE = ["#FF5555", "#FFA347", "#FFE066", "#57F287", "#00C8C8", "#5B8CFF", "#C77DFF"]
 
 EMOJI_PICKER_SET = [
     "😀", "😂", "😅", "😊", "😉", "😍", "😘", "😜", "🤔", "😎",
@@ -476,6 +495,18 @@ def apply_update(payload: bytes) -> str:
 # install time, so the in-app viewer stays complete going forward
 # without needing the whole history re-embedded on every release.
 EMBEDDED_CHANGELOG = [
+    {   "version": "1.4.6",
+        "date": "2026-08-21",
+        "notes": (
+            "Added a secret rainbow unlock: type :prism: into the 'Host IP' field "
+            "when joining (instead of an address) and your name gets an animated "
+            "rainbow treatment — a static color gradient in chat, and in the member "
+            "list it actually shifts/moves while you hover over it. Host color stays "
+            "plain white as always. Snake multiplayer minigame is scoped as a "
+            "separate follow-up — didn't want to rush a real-time networked game "
+            "engine into the same pass as everything else."
+        ),
+    },
     {   "version": "1.4.5c",
         "date": "2026-08-21",
         "notes": (
@@ -634,6 +665,11 @@ class Hub:
         self.color_changed_once = set()
         self.slowmode_delay = 0.0
         self.last_msg_time = {}
+        self.rainbow_users = set()
+
+    def set_rainbow(self, name: str):
+        with self.lock:
+            self.rainbow_users.add(name.lower())
 
     def log_admin_action(self, admin_name: str, text: str):
         log_text = f"🛡️ [Admin Log] {admin_name} {text}"
@@ -714,11 +750,11 @@ class Hub:
 
     def colormap_string(self):
         with self.lock:
-            return ",".join(f"{n}={c}" for n, c in self.colors.items())
+            return ",".join(f"{n}={RAINBOW_SENTINEL if n in self.rainbow_users else c}" for n, c in self.colors.items())
 
     def colormap_snapshot(self):
         with self.lock:
-            return dict(self.colors)
+            return {n: (RAINBOW_SENTINEL if n in self.rainbow_users else c) for n, c in self.colors.items()}
 
     def is_name_occupied(self, name):
         with self.lock:
@@ -929,6 +965,12 @@ def handle_guest_connection(sock, addr, hub: Hub, host_name: str, event_queue: q
                 verb = "turned on" if active else "turned off"
                 hub.broadcast(f"* {dname} {verb} Do Not Disturb *", exclude_sock=sock)
                 event_queue.put(("system", f"{dname} {verb} Do Not Disturb"))
+            continue
+
+        elif text.startswith(RAINBOW_UNLOCK_PREFIX):
+            hub.set_rainbow(guest_name)
+            hub.broadcast(COLORMAP_PREFIX + hub.colormap_string())
+            event_queue.put(("colormap", hub.colormap_snapshot()))
             continue
 
         elif text.startswith(CMD_PREFIX):
@@ -1486,6 +1528,10 @@ class GuestConnection:
             daemon=True,
         ).start()
 
+    def send_rainbow_unlock(self):
+        try: send_encrypted(self.sock, self.fernet, RAINBOW_UNLOCK_PREFIX + "1")
+        except OSError: pass
+
     def send_chat(self, text: str):
         stripped = text.strip()
         if stripped in ("/help", "/list", "/colors"):
@@ -2032,7 +2078,12 @@ class ChatApp(tk.Tk):
 
     def _async_guest_connect(self, name, room_code, fernet, manual_target=None):
         host_ip, port = None, None
-        
+        rainbow_pending = False
+
+        if manual_target and manual_target.strip().lower() == RAINBOW_SECRET_CODE.lower():
+            rainbow_pending = True
+            manual_target = None  # not a real address — proceed as if the field was empty
+
         if manual_target:
             if ":" in manual_target:
                 ip_str, _, port_str = manual_target.partition(":")
@@ -2054,7 +2105,10 @@ class ChatApp(tk.Tk):
         if not host_ip:
             return self.event_queue.put(("connect_fail", f"Could not find Room {room_code}. Ensure the host is running and you are on the same Wi-Fi/network."))
 
-        try: self.connection = GuestConnection(name, host_ip, port, fernet, self.event_queue)
+        try:
+            self.connection = GuestConnection(name, host_ip, port, fernet, self.event_queue)
+            if rainbow_pending:
+                self.connection.send_rainbow_unlock()
         except PermissionError as e: self.event_queue.put(("connect_fail", str(e)))
         except (OSError, ConnectionError) as e: self.event_queue.put(("connect_fail", f"Connection failed: {e}"))
 
@@ -2677,6 +2731,19 @@ class ChatApp(tk.Tk):
             self.known_tags.add(tag)
         return tag
 
+    def _insert_name(self, name: str, color_value: str):
+        """Insert a name into the chat log, using a static per-character
+        rainbow gradient instead of one flat color tag when the sender
+        is rainbow-unlocked. (The chat log is a scrolling history with
+        many repeated instances of the same name — animating all of them
+        live isn't practical, so this is the static counterpart to the
+        animated hover effect on the roster.)"""
+        if color_value == RAINBOW_SENTINEL:
+            for i, ch in enumerate(name):
+                self.log.insert("end", ch, (self._color_tag(RAINBOW_PALETTE[i % len(RAINBOW_PALETTE)]),))
+        else:
+            self.log.insert("end", name, (self._color_tag(color_value),))
+
     def append_chat_line(self, raw: str, msg_id: str = None):
         self.log.configure(state="normal")
         start_index = self.log.index("end-1c")
@@ -2687,7 +2754,7 @@ class ChatApp(tk.Tk):
         if ": " in raw_safe:
             prefix, rest = raw_safe.split(": ", 1)
             self._record_user_message_time(prefix)
-            self.log.insert("end", prefix, (self._color_tag(self.known_colors.get(prefix.lower(), FG_TEXT)),))
+            self._insert_name(prefix, self.known_colors.get(prefix.lower(), FG_TEXT))
             self.log.insert("end", ": " + rest)
             
             align_tag = "align_right" if prefix.lower() == self.my_name.lower() else "align_left"
@@ -2770,7 +2837,7 @@ class ChatApp(tk.Tk):
 
         start_index = self.log.index("end-1c")
         self.log.insert("end", f"[{time.strftime('%H:%M')}] ", ("timestamp",))
-        self.log.insert("end", sender, (self._color_tag(self.known_colors.get(sender.lower(), FG_TEXT)),))
+        self._insert_name(sender, self.known_colors.get(sender.lower(), FG_TEXT))
         self.log.insert("end", f" sent an attachment ({clean_non_bmp(filename)}):\n")
 
         if Image is not None and filename.lower().endswith((".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp")):
@@ -2823,7 +2890,51 @@ class ChatApp(tk.Tk):
         self.current_roster = [self.my_name] + sorted(n for n in names if n.lower() != self.my_name.lower())
         for child in self.member_list_frame.winfo_children(): child.destroy()
         for n in self.current_roster:
-            tk.Label(self.member_list_frame, text=clean_non_bmp(n), bg=BG_PANEL, fg=self.known_colors.get(n.lower(), FG_TEXT), anchor="w", font=CHAT_FONT).pack(fill="x", pady=2)
+            color = self.known_colors.get(n.lower(), FG_TEXT)
+            if color == RAINBOW_SENTINEL:
+                self._build_rainbow_name_widget(self.member_list_frame, clean_non_bmp(n)).pack(fill="x", pady=2, anchor="w")
+            else:
+                tk.Label(self.member_list_frame, text=clean_non_bmp(n), bg=BG_PANEL, fg=color, anchor="w", font=CHAT_FONT).pack(fill="x", pady=2)
+
+    def _build_rainbow_name_widget(self, parent, name: str):
+        """A name rendered as one Label per character, each individually
+        colored — static gradient by default, and the colors visibly
+        shift/rotate while the mouse hovers over it."""
+        frame = tk.Frame(parent, bg=BG_PANEL)
+        char_labels = [tk.Label(frame, text=ch, bg=BG_PANEL, fg=FG_TEXT, font=CHAT_FONT, padx=0) for ch in name]
+        for lbl in char_labels:
+            lbl.pack(side="left")
+
+        anim = {"offset": 0, "active": False}
+
+        def apply_colors(offset):
+            try:
+                for i, lbl in enumerate(char_labels):
+                    lbl.configure(fg=RAINBOW_PALETTE[(i + offset) % len(RAINBOW_PALETTE)])
+            except tk.TclError:
+                anim["active"] = False  # widget was destroyed (e.g. roster refreshed mid-animation)
+
+        def tick():
+            if not anim["active"]:
+                return
+            anim["offset"] = (anim["offset"] + 1) % len(RAINBOW_PALETTE)
+            apply_colors(anim["offset"])
+            if anim["active"]:
+                self.after(150, tick)
+
+        def on_enter(e):
+            if not anim["active"]:
+                anim["active"] = True
+                tick()
+
+        def on_leave(e):
+            anim["active"] = False
+            apply_colors(0)
+
+        apply_colors(0)
+        frame.bind("<Enter>", on_enter)
+        frame.bind("<Leave>", on_leave)
+        return frame
 
     def update_typing(self, names):
         now = time.time()
