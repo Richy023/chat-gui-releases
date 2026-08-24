@@ -1,9 +1,18 @@
 #!/usr/bin/env python3
 """
-chat_gui.py — v1.4.6 — ENCRYPTED instant messenger with a desktop GUI.
+chat_gui.py — v1.4.7 — ENCRYPTED instant messenger with a desktop GUI.
 
 Fixes/features in this version:
-- Added a secret rainbow unlock: type :prism: into the "Host IP" field
+- Rainbow name hover animation now works in the chat log too, not just
+  the sidebar — each message instance animates independently. Fixed the
+  sidebar rendering rainbow names with abnormally spaced-out letters.
+- Added Snake: press Ctrl+Shift+S to open it (single-player for now).
+  Host plays plain white, rainbow-unlocked plays a moving rainbow
+  snake, everyone else gets a random color. High scores save locally
+  and show as a small leaderboard in the game window.
+
+Fixes in 1.4.6:
+- Added a secret rainbow unlock: type secret code from host into the "Host IP" field
   when joining (instead of an address) and your name gets an animated
   rainbow treatment — a static gradient in chat, and in the member list
   it actually shifts/moves while you hover over it. Host color stays
@@ -149,7 +158,7 @@ except ImportError:
 if sys.platform == "darwin":
     ensure_installed("pyobjus", required=False)
 
-VERSION = "1.4.6"
+VERSION = "1.4.7"
 MSG_LEN_BYTES = 4
 MAX_GUESTS = 4
 MAX_FILE_BYTES = 500 * 1024 * 1024 # 500MB Limit
@@ -236,6 +245,204 @@ RAINBOW_SECRET_CODE = ":prism:"
 # gradient instead of a flat color.
 RAINBOW_SENTINEL = "RAINBOW"
 RAINBOW_PALETTE = ["#FF5555", "#FFA347", "#FFE066", "#57F287", "#00C8C8", "#5B8CFF", "#C77DFF"]
+
+# ---- Snake minigame (single-player for now) ----
+SNAKE_KEYBIND = "<Control-Shift-KeyPress-S>"
+SNAKE_COLS = 24
+SNAKE_ROWS = 18
+SNAKE_CELL_PX = 20
+SNAKE_TICK_MS = 130
+SNAKE_HIGHSCORES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "chat_gui_snake_highscores.json")
+
+def _load_snake_highscores() -> dict:
+    try:
+        with open(SNAKE_HIGHSCORES_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            return data if isinstance(data, dict) else {}
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return {}
+
+def _save_snake_highscore(name: str, score: int):
+    scores = _load_snake_highscores()
+    key = name.lower()
+    if score > scores.get(key, 0):
+        scores[key] = score
+        try:
+            with open(SNAKE_HIGHSCORES_FILE, "w", encoding="utf-8") as f:
+                json.dump(scores, f)
+        except OSError:
+            pass
+
+class SnakeGame:
+    """Pure game logic — no Tk, no I/O, fully deterministic given a
+    fixed random seed. head is body[0]."""
+
+    def __init__(self, cols=SNAKE_COLS, rows=SNAKE_ROWS, rng=None):
+        self.cols, self.rows = cols, rows
+        self.rng = rng or random
+        self.reset()
+
+    def reset(self):
+        cx, cy = self.cols // 2, self.rows // 2
+        self.body = [(cx, cy), (cx - 1, cy), (cx - 2, cy)]
+        self.direction = (1, 0)
+        self.pending_direction = (1, 0)
+        self.alive = True
+        self.score = 0
+        self.food = self._random_free_cell()
+
+    def _random_free_cell(self):
+        occupied = set(self.body)
+        free = [(x, y) for x in range(self.cols) for y in range(self.rows) if (x, y) not in occupied]
+        return self.rng.choice(free) if free else None
+
+    def set_direction(self, dx: int, dy: int):
+        cur_dx, cur_dy = self.direction
+        if (dx, dy) == (-cur_dx, -cur_dy):
+            return  # ignore instant 180-degree reversal
+        self.pending_direction = (dx, dy)
+
+    def tick(self):
+        if not self.alive:
+            return
+        self.direction = self.pending_direction
+        hx, hy = self.body[0]
+        dx, dy = self.direction
+        nx, ny = hx + dx, hy + dy
+
+        if not (0 <= nx < self.cols and 0 <= ny < self.rows):
+            self.alive = False
+            return
+
+        new_head = (nx, ny)
+        grew = new_head == self.food
+        # The tail cell vacates this tick unless we're growing, so it's a
+        # legal move even though it's currently occupied.
+        collision_zone = self.body if grew else self.body[:-1]
+        if new_head in collision_zone:
+            self.alive = False
+            return
+
+        self.body.insert(0, new_head)
+        if grew:
+            self.score += 1
+            self.food = self._random_free_cell()
+        else:
+            self.body.pop()
+
+
+class SnakeWindow(tk.Toplevel):
+    """Single-player Snake. Opened via the secret SNAKE_KEYBIND. Not
+    networked — each person plays their own local game — but everyone
+    who plays on this machine ends up on the same local high-score
+    list, so it still works like a shared leaderboard over time."""
+
+    ARROW_DIRECTIONS = {
+        "Up": (0, -1), "w": (0, -1), "W": (0, -1),
+        "Down": (0, 1), "s": (0, 1), "S": (0, 1),
+        "Left": (-1, 0), "a": (-1, 0), "A": (-1, 0),
+        "Right": (1, 0), "d": (1, 0), "D": (1, 0),
+    }
+
+    def __init__(self, app, player_name: str, color_value: str):
+        super().__init__(app)
+        self.app = app
+        self.player_name = player_name
+        self.color_value = color_value  # a hex color, or RAINBOW_SENTINEL
+
+        self.title("Snake")
+        self.configure(bg=BG_DARK, padx=12, pady=12)
+        self.resizable(False, False)
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+        self.game = SnakeGame()
+        self._tick_job = None
+        self._rainbow_offset = 0
+
+        canvas_w, canvas_h = SNAKE_COLS * SNAKE_CELL_PX, SNAKE_ROWS * SNAKE_CELL_PX
+        self.canvas = tk.Canvas(self, width=canvas_w, height=canvas_h, bg=BG_PANEL, highlightthickness=0)
+        self.canvas.pack()
+
+        self.status_var = tk.StringVar()
+        tk.Label(self, textvariable=self.status_var, bg=BG_DARK, fg=FG_TEXT, font=CHAT_FONT).pack(pady=(8, 0))
+        tk.Label(self, text="Arrows or WASD to move — Space to restart after a game over", bg=BG_DARK, fg=FG_MUTED, font=(CHAT_FONT[0], 9)).pack()
+
+        self.leaderboard_frame = tk.Frame(self, bg=BG_DARK)
+        self.leaderboard_frame.pack(fill="x", pady=(10, 0))
+        self._render_leaderboard()
+
+        for keysym, vec in self.ARROW_DIRECTIONS.items():
+            self.bind(f"<KeyPress-{keysym}>", lambda e, v=vec: self.game.set_direction(*v))
+        self.bind("<space>", lambda e: self._restart_if_dead())
+
+        self._set_status()
+        self.focus_set()
+        self._loop()
+
+    def _restart_if_dead(self):
+        if not self.game.alive:
+            self.game.reset()
+            self._rainbow_offset = 0
+            self._set_status()
+
+    def _set_status(self):
+        if self.game.alive:
+            self.status_var.set(f"Score: {self.game.score}")
+        else:
+            self.status_var.set(f"Game over — score {self.game.score}. Press Space to try again.")
+
+    def _loop(self):
+        was_alive = self.game.alive
+        if was_alive:
+            self.game.tick()
+            if was_alive and not self.game.alive:
+                _save_snake_highscore(self.player_name, self.game.score)
+                self._render_leaderboard()
+            self._set_status()
+        self._draw()
+        self._tick_job = self.after(SNAKE_TICK_MS, self._loop)
+
+    def _segment_color(self, index: int) -> str:
+        if self.color_value == RAINBOW_SENTINEL:
+            return RAINBOW_PALETTE[(index + self._rainbow_offset) % len(RAINBOW_PALETTE)]
+        return self.color_value
+
+    def _draw(self):
+        self.canvas.delete("all")
+        cs = SNAKE_CELL_PX
+
+        if self.game.food:
+            fx, fy = self.game.food
+            self.canvas.create_oval(fx * cs + 3, fy * cs + 3, fx * cs + cs - 3, fy * cs + cs - 3, fill=BTN_RED, outline="")
+
+        for i, (x, y) in enumerate(self.game.body):
+            self.canvas.create_rectangle(x * cs + 1, y * cs + 1, x * cs + cs - 1, y * cs + cs - 1, fill=self._segment_color(i), outline="")
+
+        if self.color_value == RAINBOW_SENTINEL and self.game.alive:
+            self._rainbow_offset = (self._rainbow_offset + 1) % len(RAINBOW_PALETTE)
+
+        if not self.game.alive:
+            self.canvas.create_rectangle(0, 0, self.canvas.winfo_reqwidth(), self.canvas.winfo_reqheight(), fill=BG_PANEL, stipple="gray50", outline="")
+
+    def _render_leaderboard(self):
+        for w in self.leaderboard_frame.winfo_children(): w.destroy()
+        tk.Label(self.leaderboard_frame, text="High Scores", bg=BG_DARK, fg=FG_MUTED, font=BOLD_FONT).pack(anchor="w")
+        scores = _load_snake_highscores()
+        ranked = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)[:5]
+        if not ranked:
+            tk.Label(self.leaderboard_frame, text="No scores yet — be the first!", bg=BG_DARK, fg=FG_MUTED, font=CHAT_FONT).pack(anchor="w")
+            return
+        for i, (name, score) in enumerate(ranked, 1):
+            tk.Label(self.leaderboard_frame, text=f"{i}. {name} — {score}", bg=BG_DARK, fg=FG_TEXT, font=CHAT_FONT).pack(anchor="w")
+
+    def _on_close(self):
+        if self._tick_job:
+            try: self.after_cancel(self._tick_job)
+            except Exception: pass
+            self._tick_job = None
+        if getattr(self.app, "_snake_win", None) is self:
+            self.app._snake_win = None
+        self.destroy()
 
 EMOJI_PICKER_SET = [
     "😀", "😂", "😅", "😊", "😉", "😍", "😘", "😜", "🤔", "😎",
@@ -495,10 +702,23 @@ def apply_update(payload: bytes) -> str:
 # install time, so the in-app viewer stays complete going forward
 # without needing the whole history re-embedded on every release.
 EMBEDDED_CHANGELOG = [
+    {   "version": "1.4.7",
+        "date": "2026-08-22",
+        "notes": (
+            "Rainbow name hover animation now works in the chat log too, not just "
+            "the sidebar (each message instance animates independently — hovering "
+            "one doesn't animate every other message from the same person). Fixed "
+            "the sidebar rendering rainbow names with abnormally spaced-out letters. "
+            "Added Snake: press Ctrl+Shift+S to open it (single-player for now). "
+            "Host plays a plain white snake, rainbow-unlocked plays a moving "
+            "rainbow snake, everyone else gets a random color. High scores are "
+            "saved locally and shown as a small leaderboard in the game window."
+        ),
+    },
     {   "version": "1.4.6",
         "date": "2026-08-21",
         "notes": (
-            "Added a secret rainbow unlock: type :prism: into the 'Host IP' field "
+            "Added a secret rainbow unlock: type secret code from host into the 'Host IP' field "
             "when joining (instead of an address) and your name gets an animated "
             "rainbow treatment — a static color gradient in chat, and in the member "
             "list it actually shifts/moves while you hover over it. Host color stays "
@@ -1676,10 +1896,12 @@ class ChatApp(tk.Tk):
         self.dnd_keybind = "<Control-d>"
         self._dnd_keybind_popup = None
         self._dnd_cd = 0.0
+        self._snake_win = None
 
         self._build_connect_frame()
         self._build_chat_frame()
         self.connect_frame.pack(fill="both", expand=True)
+        self.bind_all(SNAKE_KEYBIND, self.on_open_snake)
 
         self.protocol("WM_DELETE_WINDOW", self.on_close)
         self.after(50, self.poll_queue)
@@ -2132,6 +2354,10 @@ class ChatApp(tk.Tk):
             except Exception: pass
             self._slowmode_cd_timer = None
         self._apply_mute_state(False)
+        if self._snake_win is not None:
+            try: self._snake_win._on_close()
+            except Exception: pass
+            self._snake_win = None
         
         for child in self.member_list_frame.winfo_children(): child.destroy()
 
@@ -2289,6 +2515,26 @@ class ChatApp(tk.Tk):
         text.configure(state="disabled")
 
         make_button(popup, "Close", popup.destroy, bg=BTN_NEUTRAL, hover_bg=BTN_NEUTRAL_HOVER, padx=12, pady=5).pack(pady=(10, 0))
+
+    def on_open_snake(self, event=None):
+        if not self.connection:
+            return  # only makes sense once you're actually in a chat session
+        if self._snake_win is not None:
+            try:
+                self._snake_win.lift()
+                self._snake_win.focus_force()
+            except Exception:
+                pass
+            return "break"
+        self._snake_win = SnakeWindow(self, self.my_name, self._snake_color())
+        return "break"
+
+    def _snake_color(self) -> str:
+        if isinstance(self.connection, HostConnection):
+            return HOST_COLOR
+        if self.known_colors.get(self.my_name.lower()) == RAINBOW_SENTINEL:
+            return RAINBOW_SENTINEL
+        return random.choice(list(COLOR_PALETTE.values()))
 
     def on_check_updates(self):
         if not UPDATE_MANIFEST_URL:
@@ -2732,17 +2978,31 @@ class ChatApp(tk.Tk):
         return tag
 
     def _insert_name(self, name: str, color_value: str):
-        """Insert a name into the chat log, using a static per-character
-        rainbow gradient instead of one flat color tag when the sender
-        is rainbow-unlocked. (The chat log is a scrolling history with
-        many repeated instances of the same name — animating all of them
-        live isn't practical, so this is the static counterpart to the
-        animated hover effect on the roster.)"""
-        if color_value == RAINBOW_SENTINEL:
-            for i, ch in enumerate(name):
-                self.log.insert("end", ch, (self._color_tag(RAINBOW_PALETTE[i % len(RAINBOW_PALETTE)]),))
-        else:
+        """Insert a name into the chat log. A rainbow-unlocked sender's
+        name gets its own uniquely-tagged instance (so hovering over one
+        occurrence in the scroll history doesn't animate every other
+        occurrence of that name), with the same static-gradient/hover
+        animation the roster uses."""
+        if color_value != RAINBOW_SENTINEL:
             self.log.insert("end", name, (self._color_tag(color_value),))
+            return
+
+        self._rainbow_instance_seq = getattr(self, "_rainbow_instance_seq", 0) + 1
+        group_tag = f"rbname_{self._rainbow_instance_seq}"
+        char_tags = []
+        for i, ch in enumerate(name):
+            tag = f"{group_tag}_{i}"
+            self.log.tag_configure(tag, foreground=RAINBOW_PALETTE[i % len(RAINBOW_PALETTE)])
+            self.log.insert("end", ch, (tag, group_tag))
+            char_tags.append(tag)
+
+        def apply_colors(offset):
+            for i, tag in enumerate(char_tags):
+                self.log.tag_configure(tag, foreground=RAINBOW_PALETTE[(i + offset) % len(RAINBOW_PALETTE)])
+
+        on_enter, on_leave = self._wire_rainbow_hover(apply_colors)
+        self.log.tag_bind(group_tag, "<Enter>", on_enter)
+        self.log.tag_bind(group_tag, "<Leave>", on_leave)
 
     def append_chat_line(self, raw: str, msg_id: str = None):
         self.log.configure(state="normal")
@@ -2896,30 +3156,29 @@ class ChatApp(tk.Tk):
             else:
                 tk.Label(self.member_list_frame, text=clean_non_bmp(n), bg=BG_PANEL, fg=color, anchor="w", font=CHAT_FONT).pack(fill="x", pady=2)
 
-    def _build_rainbow_name_widget(self, parent, name: str):
-        """A name rendered as one Label per character, each individually
-        colored — static gradient by default, and the colors visibly
-        shift/rotate while the mouse hovers over it."""
-        frame = tk.Frame(parent, bg=BG_PANEL)
-        char_labels = [tk.Label(frame, text=ch, bg=BG_PANEL, fg=FG_TEXT, font=CHAT_FONT, padx=0) for ch in name]
-        for lbl in char_labels:
-            lbl.pack(side="left")
-
+    def _wire_rainbow_hover(self, apply_colors):
+        """Shared 'static gradient by default, colors shift while
+        hovering' animation driver. `apply_colors(offset)` should
+        recolor whatever's being animated for the given palette offset
+        (and may raise tk.TclError if the underlying widget/tag is
+        gone — that's treated as a normal stop condition, not an error,
+        since a roster refresh or scrolled-away chat tag can destroy the
+        target mid-animation). Returns (on_enter, on_leave) to bind."""
         anim = {"offset": 0, "active": False}
 
-        def apply_colors(offset):
+        def safe_apply(offset):
             try:
-                for i, lbl in enumerate(char_labels):
-                    lbl.configure(fg=RAINBOW_PALETTE[(i + offset) % len(RAINBOW_PALETTE)])
+                apply_colors(offset)
+                return True
             except tk.TclError:
-                anim["active"] = False  # widget was destroyed (e.g. roster refreshed mid-animation)
+                anim["active"] = False
+                return False
 
         def tick():
             if not anim["active"]:
                 return
             anim["offset"] = (anim["offset"] + 1) % len(RAINBOW_PALETTE)
-            apply_colors(anim["offset"])
-            if anim["active"]:
+            if safe_apply(anim["offset"]) and anim["active"]:
                 self.after(150, tick)
 
         def on_enter(e):
@@ -2929,12 +3188,40 @@ class ChatApp(tk.Tk):
 
         def on_leave(e):
             anim["active"] = False
-            apply_colors(0)
+            safe_apply(0)
 
-        apply_colors(0)
-        frame.bind("<Enter>", on_enter)
-        frame.bind("<Leave>", on_leave)
-        return frame
+        return on_enter, on_leave
+
+    def _build_rainbow_name_widget(self, parent, name: str):
+        """A name rendered in a small single-line Text widget with one
+        color tag per character — matches the chat log's own rendering
+        technique exactly (rather than separate Label widgets, which
+        each carry their own border/padding overhead that visibly
+        spaces the letters apart when packed side-by-side). Static
+        gradient by default; shifts while hovered, same as in chat."""
+        txt = tk.Text(
+            parent, height=1, width=max(len(name), 1), bg=BG_PANEL, fg=FG_TEXT,
+            bd=0, highlightthickness=0, font=CHAT_FONT, wrap="none",
+            cursor="arrow", padx=0, pady=0, takefocus=0,
+        )
+        txt.insert("1.0", name)
+        txt.configure(state="disabled")
+
+        char_tags = []
+        for i, ch in enumerate(name):
+            tag = f"c{i}"
+            txt.tag_add(tag, f"1.{i}", f"1.{i + 1}")
+            txt.tag_configure(tag, foreground=RAINBOW_PALETTE[i % len(RAINBOW_PALETTE)])
+            char_tags.append(tag)
+
+        def apply_colors(offset):
+            for i, tag in enumerate(char_tags):
+                txt.tag_configure(tag, foreground=RAINBOW_PALETTE[(i + offset) % len(RAINBOW_PALETTE)])
+
+        on_enter, on_leave = self._wire_rainbow_hover(apply_colors)
+        txt.bind("<Enter>", on_enter)
+        txt.bind("<Leave>", on_leave)
+        return txt
 
     def update_typing(self, names):
         now = time.time()
