@@ -1,8 +1,19 @@
 #!/usr/bin/env python3
 """
-chat_gui.py — v1.4.7 — ENCRYPTED instant messenger with a desktop GUI.
+chat_gui.py — v1.4.8 — ENCRYPTED instant messenger with a desktop GUI.
 
 Fixes/features in this version:
+- Snake leaderboard shows every player ranked, not just a top few.
+- Fixed a real bug where an unexpected error while handling a message
+  mid-session could silently skip cleanup, leaving a "ghost" user stuck
+  in the room until the app restarted (blocked that name from
+  reconnecting the whole time).
+- Added a second secret gradient unlock (blue-toned) alongside the
+  existing one — codes intentionally not written here, same as before.
+- Host can now IP-ban someone directly by address, even if they're not
+  currently connected, via a new host-only command.
+
+Fixes in 1.4.7:
 - Rainbow name hover animation now works in the chat log too, not just
   the sidebar — each message instance animates independently. Fixed the
   sidebar rendering rainbow names with abnormally spaced-out letters.
@@ -12,11 +23,11 @@ Fixes/features in this version:
   and show as a small leaderboard in the game window.
 
 Fixes in 1.4.6:
-- Added a secret rainbow unlock: type secret code from host into the "Host IP" field
-  when joining (instead of an address) and your name gets an animated
-  rainbow treatment — a static gradient in chat, and in the member list
-  it actually shifts/moves while you hover over it. Host color stays
-  plain white as always.
+- Added a secret rainbow unlock: entering a specific hidden phrase in
+  the "Host IP" field (instead of an address) gives your name an
+  animated rainbow treatment — a static gradient in chat, and in the
+  member list it actually shifts/moves while you hover over it. Host
+  color stays plain white as always.
 
 Fixes in 1.4.5c:
 - Fixed "View Changelog" clipping into "Check for Updates" on the connect
@@ -158,7 +169,7 @@ except ImportError:
 if sys.platform == "darwin":
     ensure_installed("pyobjus", required=False)
 
-VERSION = "1.4.7"
+VERSION = "1.4.8"
 MSG_LEN_BYTES = 4
 MAX_GUESTS = 4
 MAX_FILE_BYTES = 500 * 1024 * 1024 # 500MB Limit
@@ -234,17 +245,29 @@ SLOWMODE_PREFIX = "__SLOWMODE__:"
 MSG_PREFIX = "__MSG__:"
 REACT_PREFIX = "__REACT__:"
 RAINBOW_UNLOCK_PREFIX = "__RAINBOW_UNLOCK__:"
+BLUE_UNLOCK_PREFIX = "__BLUE_UNLOCK__:"
 
-# ---- Secret rainbow unlock ----
+# ---- Secret gradient unlocks ----
 # Typed into the "Host IP" field on the join screen instead of an actual
-# address. Letters + symbols only (no digits) so it can never collide
+# address. Letters + symbols only (no digits) so they can never collide
 # with a real IP:port and misfire the discovery/parsing logic below.
+# Deliberately kept out of the changelog text (see EMBEDDED_CHANGELOG) —
+# describe the feature there, never the literal codes.
 RAINBOW_SECRET_CODE = ":prism:"
-# Stored in place of a hex color for a rainbow-unlocked user — every
-# place that renders a name checks for this sentinel and draws a
-# gradient instead of a flat color.
+BLUE_SECRET_CODE = ":glacier:"
+# Stored in place of a hex color for an unlocked user — every place
+# that renders a name checks GRADIENT_PALETTES for its color_value and
+# draws the matching gradient instead of a flat color.
 RAINBOW_SENTINEL = "RAINBOW"
+BLUE_SENTINEL = "BLUE_GRADIENT"
 RAINBOW_PALETTE = ["#FF5555", "#FFA347", "#FFE066", "#57F287", "#00C8C8", "#5B8CFF", "#C77DFF"]
+BLUE_PALETTE = ["#0B2545", "#13315C", "#134074", "#1B5299", "#3E7CB1", "#6D9DC5", "#8FC0E9"]
+GRADIENT_PALETTES = {RAINBOW_SENTINEL: RAINBOW_PALETTE, BLUE_SENTINEL: BLUE_PALETTE}
+# code -> (sentinel, unlock prefix to send once connected)
+GRADIENT_UNLOCK_CODES = {
+    RAINBOW_SECRET_CODE: (RAINBOW_SENTINEL, RAINBOW_UNLOCK_PREFIX),
+    BLUE_SECRET_CODE: (BLUE_SENTINEL, BLUE_UNLOCK_PREFIX),
+}
 
 # ---- Snake minigame (single-player for now) ----
 SNAKE_KEYBIND = "<Control-Shift-KeyPress-S>"
@@ -403,8 +426,9 @@ class SnakeWindow(tk.Toplevel):
         self._tick_job = self.after(SNAKE_TICK_MS, self._loop)
 
     def _segment_color(self, index: int) -> str:
-        if self.color_value == RAINBOW_SENTINEL:
-            return RAINBOW_PALETTE[(index + self._rainbow_offset) % len(RAINBOW_PALETTE)]
+        palette = GRADIENT_PALETTES.get(self.color_value)
+        if palette:
+            return palette[(index + self._rainbow_offset) % len(palette)]
         return self.color_value
 
     def _draw(self):
@@ -418,8 +442,9 @@ class SnakeWindow(tk.Toplevel):
         for i, (x, y) in enumerate(self.game.body):
             self.canvas.create_rectangle(x * cs + 1, y * cs + 1, x * cs + cs - 1, y * cs + cs - 1, fill=self._segment_color(i), outline="")
 
-        if self.color_value == RAINBOW_SENTINEL and self.game.alive:
-            self._rainbow_offset = (self._rainbow_offset + 1) % len(RAINBOW_PALETTE)
+        palette = GRADIENT_PALETTES.get(self.color_value)
+        if palette and self.game.alive:
+            self._rainbow_offset = (self._rainbow_offset + 1) % len(palette)
 
         if not self.game.alive:
             self.canvas.create_rectangle(0, 0, self.canvas.winfo_reqwidth(), self.canvas.winfo_reqheight(), fill=BG_PANEL, stipple="gray50", outline="")
@@ -428,7 +453,7 @@ class SnakeWindow(tk.Toplevel):
         for w in self.leaderboard_frame.winfo_children(): w.destroy()
         tk.Label(self.leaderboard_frame, text="High Scores", bg=BG_DARK, fg=FG_MUTED, font=BOLD_FONT).pack(anchor="w")
         scores = _load_snake_highscores()
-        ranked = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)[:5]
+        ranked = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)
         if not ranked:
             tk.Label(self.leaderboard_frame, text="No scores yet — be the first!", bg=BG_DARK, fg=FG_MUTED, font=CHAT_FONT).pack(anchor="w")
             return
@@ -702,6 +727,21 @@ def apply_update(payload: bytes) -> str:
 # install time, so the in-app viewer stays complete going forward
 # without needing the whole history re-embedded on every release.
 EMBEDDED_CHANGELOG = [
+    {   "version": "1.4.8",
+        "date": "2026-08-22",
+        "notes": (
+            "Snake leaderboard shows every player ranked, not just a top few. "
+            "Fixed a real bug where an unexpected error while handling a message "
+            "mid-session could silently skip cleanup, leaving a 'ghost' user stuck "
+            "in the room — blocking that name from reconnecting and never actually "
+            "leaving the member list, until the app was restarted. Added a second "
+            "secret gradient unlock (blue-toned this time) alongside the existing "
+            "one — as always, the actual codes are intentionally not written here. "
+            "Host can now IP-ban someone directly by address (even if they're not "
+            "currently connected) with a new host-only command, instead of only "
+            "being able to ban someone already in the room."
+        ),
+    },
     {   "version": "1.4.7",
         "date": "2026-08-22",
         "notes": (
@@ -718,8 +758,8 @@ EMBEDDED_CHANGELOG = [
     {   "version": "1.4.6",
         "date": "2026-08-21",
         "notes": (
-            "Added a secret rainbow unlock: type secret code from host into the 'Host IP' field "
-            "when joining (instead of an address) and your name gets an animated "
+            "Added a secret rainbow unlock: entering a specific hidden phrase in "
+            "the 'Host IP' field (instead of an address) gives your name an animated "
             "rainbow treatment — a static color gradient in chat, and in the member "
             "list it actually shifts/moves while you hover over it. Host color stays "
             "plain white as always. Snake multiplayer minigame is scoped as a "
@@ -885,11 +925,11 @@ class Hub:
         self.color_changed_once = set()
         self.slowmode_delay = 0.0
         self.last_msg_time = {}
-        self.rainbow_users = set()
+        self.gradient_users = {}  # name.lower() -> sentinel (RAINBOW_SENTINEL, BLUE_SENTINEL, ...)
 
-    def set_rainbow(self, name: str):
+    def set_gradient(self, name: str, sentinel: str):
         with self.lock:
-            self.rainbow_users.add(name.lower())
+            self.gradient_users[name.lower()] = sentinel
 
     def log_admin_action(self, admin_name: str, text: str):
         log_text = f"🛡️ [Admin Log] {admin_name} {text}"
@@ -956,6 +996,13 @@ class Hub:
                     return s
         return None
 
+    def find_socket_by_ip(self, ip):
+        with self.lock:
+            for s, info in self.clients.items():
+                if info.get("ip") == ip:
+                    return s
+        return None
+
     def assign_color(self, name):
         with self.lock:
             used = set(self.colors.values())
@@ -970,11 +1017,11 @@ class Hub:
 
     def colormap_string(self):
         with self.lock:
-            return ",".join(f"{n}={RAINBOW_SENTINEL if n in self.rainbow_users else c}" for n, c in self.colors.items())
+            return ",".join(f"{n}={self.gradient_users.get(n, c)}" for n, c in self.colors.items())
 
     def colormap_snapshot(self):
         with self.lock:
-            return {n: (RAINBOW_SENTINEL if n in self.rainbow_users else c) for n, c in self.colors.items()}
+            return {n: self.gradient_users.get(n, c) for n, c in self.colors.items()}
 
     def is_name_occupied(self, name):
         with self.lock:
@@ -1158,137 +1205,148 @@ def handle_guest_connection(sock, addr, hub: Hub, host_name: str, event_queue: q
     event_queue.put(("colormap", hub.colormap_snapshot()))
     event_queue.put(("roster", hub.names()))
 
-    while True:
-        try: text = recv_message(sock, hub.fernet)
-        except InvalidToken: continue
-        except (OSError, ConnectionError): break
+    try:
+        while True:
+            try: text = recv_message(sock, hub.fernet)
+            except InvalidToken: continue
+            except (OSError, ConnectionError): break
 
-        is_admin = guest_name.lower() in hub.admins
+            is_admin = guest_name.lower() in hub.admins
 
-        if text.startswith(TYPING_START_PREFIX):
-            if hub.is_muted(sock): continue
-            hub.mark_typing(text[len(TYPING_START_PREFIX):])
-            hub.broadcast(text, exclude_sock=sock)
-            event_queue.put(("typing", hub.typing_names()))
-            continue
-            
-        elif text.startswith(TYPING_STOP_PREFIX):
-            hub.mark_stopped_typing(text[len(TYPING_STOP_PREFIX):])
-            hub.broadcast(text, exclude_sock=sock)
-            event_queue.put(("typing", hub.typing_names()))
-            continue
+            if text.startswith(TYPING_START_PREFIX):
+                if hub.is_muted(sock): continue
+                hub.mark_typing(text[len(TYPING_START_PREFIX):])
+                hub.broadcast(text, exclude_sock=sock)
+                event_queue.put(("typing", hub.typing_names()))
+                continue
 
-        elif text.startswith(DND_PREFIX):
-            dname, _, state = text[len(DND_PREFIX):].partition("|")
-            active = state == "on"
-            if hub.set_dnd(dname, active):
-                verb = "turned on" if active else "turned off"
-                hub.broadcast(f"* {dname} {verb} Do Not Disturb *", exclude_sock=sock)
-                event_queue.put(("system", f"{dname} {verb} Do Not Disturb"))
-            continue
+            elif text.startswith(TYPING_STOP_PREFIX):
+                hub.mark_stopped_typing(text[len(TYPING_STOP_PREFIX):])
+                hub.broadcast(text, exclude_sock=sock)
+                event_queue.put(("typing", hub.typing_names()))
+                continue
 
-        elif text.startswith(RAINBOW_UNLOCK_PREFIX):
-            hub.set_rainbow(guest_name)
+            elif text.startswith(DND_PREFIX):
+                dname, _, state = text[len(DND_PREFIX):].partition("|")
+                active = state == "on"
+                if hub.set_dnd(dname, active):
+                    verb = "turned on" if active else "turned off"
+                    hub.broadcast(f"* {dname} {verb} Do Not Disturb *", exclude_sock=sock)
+                    event_queue.put(("system", f"{dname} {verb} Do Not Disturb"))
+                continue
+
+            elif text.startswith(RAINBOW_UNLOCK_PREFIX):
+                hub.set_gradient(guest_name, RAINBOW_SENTINEL)
+                hub.broadcast(COLORMAP_PREFIX + hub.colormap_string())
+                event_queue.put(("colormap", hub.colormap_snapshot()))
+                continue
+
+            elif text.startswith(BLUE_UNLOCK_PREFIX):
+                hub.set_gradient(guest_name, BLUE_SENTINEL)
+                hub.broadcast(COLORMAP_PREFIX + hub.colormap_string())
+                event_queue.put(("colormap", hub.colormap_snapshot()))
+                continue
+
+            elif text.startswith(CMD_PREFIX):
+                cmd_name, _, arg = text[len(CMD_PREFIX):].partition("|")
+                if cmd_name == "color":
+                    if guest_name.lower() in hub.color_changed_once:
+                        hub.send_private(sock, NOTICE_PREFIX + "You can only change you color once during a chat session.")
+                    elif arg.lower() in COLOR_PALETTE:
+                        hub.colors[guest_name.lower()] = COLOR_PALETTE[arg.lower()]
+                        hub.color_changed_once.add(guest_name.lower())
+                        hub.send_private(sock, NOTICE_PREFIX + f"Color changed successfully to {arg.lower()}.")
+                        hub.broadcast(COLORMAP_PREFIX + hub.colormap_string())
+                        event_queue.put(("colormap", hub.colormap_snapshot()))
+                        event_queue.put(("chat", {"raw": f"* {guest_name} changed their color to {arg.lower()} *", "colors": hub.colormap_snapshot()}))
+                    else:
+                        hub.send_private(sock, NOTICE_PREFIX + f"Invalid color. Available: {', '.join(COLOR_PALETTE.keys())}")
+                elif cmd_name == "whisper":
+                    target_name, _, msg = arg.partition("|")
+                    if target_name.lower() == host_name.lower():
+                        event_queue.put(("private", f"[Whisper from {guest_name}]: {msg}"))
+                        hub.send_private(sock, NOTICE_PREFIX + f"[Whisper to {host_name}]: {msg}")
+                    else:
+                        target_sock = hub.find_socket_by_name(target_name)
+                        if target_sock:
+                            hub.send_private(target_sock, NOTICE_PREFIX + f"[Whisper from {guest_name}]: {msg}")
+                            hub.send_private(sock, NOTICE_PREFIX + f"[Whisper to {target_name}]: {msg}")
+                        else:
+                            hub.send_private(sock, NOTICE_PREFIX + f"No one named '{target_name}' is connected.")
+                elif cmd_name == "mod":
+                    if is_admin:
+                        run_mod_command(arg, hub, guest_name, lambda t: hub.send_private(sock, NOTICE_PREFIX + t))
+                    else:
+                        hub.send_private(sock, NOTICE_PREFIX + "You do not have permission to use moderation commands.")
+                continue
+
+            if hub.is_muted(sock):
+                info = hub.get_info(sock)
+                hub.send_private(sock, MUTE_NOTICE_PREFIX + f"You are muted by {info['muted_by']} until {format_time(info['muted_until'])}. Reason: {info['mute_reason']}")
+                continue
+
+            if text.startswith(FILE_PREFIX):
+                if hub.slowmode_delay > 0 and not is_admin:
+                    now = time.time()
+                    last_t = hub.last_msg_time.get(guest_name.lower(), 0.0)
+                    if now - last_t < hub.slowmode_delay:
+                        rem = hub.slowmode_delay - (now - last_t)
+                        hub.send_private(sock, NOTICE_PREFIX + f"Slowmode is active! Please wait {rem:.1f} seconds.")
+                        continue
+                    hub.last_msg_time[guest_name.lower()] = now
+
+                handle_incoming_file(text, event_queue)
+                hub.broadcast(text, exclude_sock=sock)
+                continue
+
+            elif text.startswith(REACT_PREFIX):
+                hub.broadcast(text, exclude_sock=sock)
+                msg_id, _, rest = text[len(REACT_PREFIX):].partition("|")
+                emoji, _, sender = rest.partition("|")
+                event_queue.put(("react", {"msg_id": msg_id, "emoji": emoji, "sender": sender or guest_name}))
+                continue
+
+            elif text.startswith(MSG_PREFIX):
+                if hub.slowmode_delay > 0 and not is_admin:
+                    now = time.time()
+                    last_t = hub.last_msg_time.get(guest_name.lower(), 0.0)
+                    if now - last_t < hub.slowmode_delay:
+                        rem = hub.slowmode_delay - (now - last_t)
+                        hub.send_private(sock, NOTICE_PREFIX + f"Slowmode is active! Please wait {rem:.1f} seconds.")
+                        continue
+                    hub.last_msg_time[guest_name.lower()] = now
+
+                msg_id, _, raw_text = text[len(MSG_PREFIX):].partition("|")
+
+                target_name, raw_mention = extract_ping_target(raw_text, hub.names() + [host_name])
+                if target_name:
+                    if target_name.lower() == host_name.lower():
+                        if hub.is_dnd(host_name): hub.send_private(sock, NOTICE_PREFIX + f"{host_name} is on Do Not Disturb — they won't be notified.")
+                        else: event_queue.put(("ping", guest_name))
+                    else:
+                        target_sock = hub.find_socket_by_name(target_name)
+                        if target_sock:
+                            if hub.is_dnd(target_name): hub.send_private(sock, NOTICE_PREFIX + f"{target_name} is on Do Not Disturb — they won't be notified.")
+                            else: hub.send_private(target_sock, PING_PREFIX + guest_name)
+                elif raw_mention:
+                    hub.send_private(sock, NOTICE_PREFIX + f"No one named '{raw_mention}' is here to ping.")
+
+                event_queue.put(("chat", {"raw": raw_text, "colors": hub.colormap_snapshot(), "msg_id": msg_id}))
+                hub.broadcast(text, exclude_sock=sock)
+
+    finally:
+        info = hub.remove_client(sock)
+        hub.free_color(guest_name)
+        try: sock.close()
+        except OSError: pass
+        name = info["name"] if info else guest_name
+        if not (info and info.get("kicked")):
+            event_queue.put(("system", f"{name} disconnected"))
+            hub.broadcast(f"* {name} left the chat *", exclude_sock=sock)
             hub.broadcast(COLORMAP_PREFIX + hub.colormap_string())
             event_queue.put(("colormap", hub.colormap_snapshot()))
-            continue
+        event_queue.put(("roster", hub.names()))
 
-        elif text.startswith(CMD_PREFIX):
-            cmd_name, _, arg = text[len(CMD_PREFIX):].partition("|")
-            if cmd_name == "color":
-                if guest_name.lower() in hub.color_changed_once:
-                    hub.send_private(sock, NOTICE_PREFIX + "You can only change you color once during a chat session.")
-                elif arg.lower() in COLOR_PALETTE:
-                    hub.colors[guest_name.lower()] = COLOR_PALETTE[arg.lower()]
-                    hub.color_changed_once.add(guest_name.lower())
-                    hub.send_private(sock, NOTICE_PREFIX + f"Color changed successfully to {arg.lower()}.")
-                    hub.broadcast(COLORMAP_PREFIX + hub.colormap_string())
-                    event_queue.put(("colormap", hub.colormap_snapshot()))
-                    event_queue.put(("chat", {"raw": f"* {guest_name} changed their color to {arg.lower()} *", "colors": hub.colormap_snapshot()}))
-                else:
-                    hub.send_private(sock, NOTICE_PREFIX + f"Invalid color. Available: {', '.join(COLOR_PALETTE.keys())}")
-            elif cmd_name == "whisper":
-                target_name, _, msg = arg.partition("|")
-                if target_name.lower() == host_name.lower():
-                    event_queue.put(("private", f"[Whisper from {guest_name}]: {msg}"))
-                    hub.send_private(sock, NOTICE_PREFIX + f"[Whisper to {host_name}]: {msg}")
-                else:
-                    target_sock = hub.find_socket_by_name(target_name)
-                    if target_sock:
-                        hub.send_private(target_sock, NOTICE_PREFIX + f"[Whisper from {guest_name}]: {msg}")
-                        hub.send_private(sock, NOTICE_PREFIX + f"[Whisper to {target_name}]: {msg}")
-                    else:
-                        hub.send_private(sock, NOTICE_PREFIX + f"No one named '{target_name}' is connected.")
-            elif cmd_name == "mod":
-                if is_admin:
-                    run_mod_command(arg, hub, guest_name, lambda t: hub.send_private(sock, NOTICE_PREFIX + t))
-                else:
-                    hub.send_private(sock, NOTICE_PREFIX + "You do not have permission to use moderation commands.")
-            continue
-
-        if hub.is_muted(sock):
-            info = hub.get_info(sock)
-            hub.send_private(sock, MUTE_NOTICE_PREFIX + f"You are muted by {info['muted_by']} until {format_time(info['muted_until'])}. Reason: {info['mute_reason']}")
-            continue
-
-        if text.startswith(FILE_PREFIX):
-            if hub.slowmode_delay > 0 and not is_admin:
-                now = time.time()
-                last_t = hub.last_msg_time.get(guest_name.lower(), 0.0)
-                if now - last_t < hub.slowmode_delay:
-                    rem = hub.slowmode_delay - (now - last_t)
-                    hub.send_private(sock, NOTICE_PREFIX + f"Slowmode is active! Please wait {rem:.1f} seconds.")
-                    continue
-                hub.last_msg_time[guest_name.lower()] = now
-
-            handle_incoming_file(text, event_queue)
-            hub.broadcast(text, exclude_sock=sock)
-            continue
-            
-        elif text.startswith(REACT_PREFIX):
-            hub.broadcast(text, exclude_sock=sock)
-            msg_id, _, emoji = text[len(REACT_PREFIX):].partition("|")
-            event_queue.put(("react", {"msg_id": msg_id, "emoji": emoji}))
-            continue
-
-        elif text.startswith(MSG_PREFIX):
-            if hub.slowmode_delay > 0 and not is_admin:
-                now = time.time()
-                last_t = hub.last_msg_time.get(guest_name.lower(), 0.0)
-                if now - last_t < hub.slowmode_delay:
-                    rem = hub.slowmode_delay - (now - last_t)
-                    hub.send_private(sock, NOTICE_PREFIX + f"Slowmode is active! Please wait {rem:.1f} seconds.")
-                    continue
-                hub.last_msg_time[guest_name.lower()] = now
-                
-            msg_id, _, raw_text = text[len(MSG_PREFIX):].partition("|")
-
-            target_name, raw_mention = extract_ping_target(raw_text, hub.names() + [host_name])
-            if target_name:
-                if target_name.lower() == host_name.lower():
-                    if hub.is_dnd(host_name): hub.send_private(sock, NOTICE_PREFIX + f"{host_name} is on Do Not Disturb — they won't be notified.")
-                    else: event_queue.put(("ping", guest_name))
-                else:
-                    target_sock = hub.find_socket_by_name(target_name)
-                    if target_sock:
-                        if hub.is_dnd(target_name): hub.send_private(sock, NOTICE_PREFIX + f"{target_name} is on Do Not Disturb — they won't be notified.")
-                        else: hub.send_private(target_sock, PING_PREFIX + guest_name)
-            elif raw_mention:
-                hub.send_private(sock, NOTICE_PREFIX + f"No one named '{raw_mention}' is here to ping.")
-
-            event_queue.put(("chat", {"raw": raw_text, "colors": hub.colormap_snapshot(), "msg_id": msg_id}))
-            hub.broadcast(text, exclude_sock=sock)
-
-    info = hub.remove_client(sock)
-    hub.free_color(guest_name)
-    sock.close()
-    name = info["name"] if info else guest_name
-    if not (info and info.get("kicked")):
-        event_queue.put(("system", f"{name} disconnected"))
-        hub.broadcast(f"* {name} left the chat *", exclude_sock=sock)
-        hub.broadcast(COLORMAP_PREFIX + hub.colormap_string())
-        event_queue.put(("colormap", hub.colormap_snapshot()))
-    event_queue.put(("roster", hub.names()))
 
 
 def host_accept_loop(server: socket.socket, hub: Hub, host_name: str, event_queue: queue.Queue):
@@ -1438,6 +1496,45 @@ def run_mod_command(msg: str, hub: Hub, my_name: str, reply_func) -> bool:
         
         hub.log_admin_action(my_name, f"banned {name} ({ip}) until {until_str}. Reason: {reason}")
         reply_func(f"Banned {name} ({ip}) until {until_str}. Reason: {reason}")
+        return True
+
+    if stripped.startswith("/ipban "):
+        if my_name.lower() != hub.host_name.lower():
+            reply_func("Only the host can use /ipban.")
+            return True
+        parts = stripped[len("/ipban "):].split(maxsplit=2)
+        if not parts:
+            reply_func("Usage: /ipban <ip> [minutes|perm] [reason]")
+            return True
+        ip = parts[0].strip()
+        dur_str = parts[1].lower() if len(parts) > 1 else "perm"
+        reason = parts[2] if len(parts) > 2 else "no reason given"
+
+        if dur_str in ("perm", "indefinite", "0", "infinite"): until = float('inf')
+        else:
+            try: until = time.time() + float(dur_str) * 60
+            except ValueError:
+                until = float('inf')
+                reason = f"{dur_str} {reason}".strip()
+
+        hub.ban_ip(ip, until, my_name, reason)
+        until_str = format_time(until)
+
+        # If someone happens to be connected from that IP right now
+        # (even under a different name than any live /ban target),
+        # kick them too — otherwise this only takes effect on their
+        # next connection attempt.
+        target_sock = hub.find_socket_by_ip(ip)
+        if target_sock:
+            target_info = hub.get_info(target_sock)
+            target_name = target_info.get("name", "someone") if target_info else "someone"
+            hub.send_private(target_sock, BAN_NOTICE_PREFIX + f"{until_str}|{reason}")
+            hub.mark_kicked(target_sock)
+            hub.broadcast(f"* {target_name} has been IP banned *", exclude_sock=target_sock)
+            hub.disconnect(target_sock)
+
+        hub.log_admin_action(my_name, f"IP-banned {ip} directly until {until_str}. Reason: {reason}")
+        reply_func(f"IP {ip} banned until {until_str}. Reason: {reason}")
         return True
 
     if stripped.startswith("/unban "):
@@ -1594,8 +1691,9 @@ def guest_recv_loop(sock: socket.socket, fernet: Fernet, event_queue: queue.Queu
             handle_incoming_file(text, event_queue)
             continue
         elif text.startswith(REACT_PREFIX):
-            msg_id, _, emoji = text[len(REACT_PREFIX):].partition("|")
-            event_queue.put(("react", {"msg_id": msg_id, "emoji": emoji}))
+            msg_id, _, rest = text[len(REACT_PREFIX):].partition("|")
+            emoji, _, sender = rest.partition("|")
+            event_queue.put(("react", {"msg_id": msg_id, "emoji": emoji, "sender": sender}))
             continue
 
         if text.startswith(MSG_PREFIX):
@@ -1684,8 +1782,8 @@ class HostConnection:
         self.hub.broadcast((TYPING_START_PREFIX if started else TYPING_STOP_PREFIX) + self.name)
 
     def send_react(self, msg_id: str, emoji: str):
-        self.hub.broadcast(f"{REACT_PREFIX}{msg_id}|{emoji}")
-        self.event_queue.put(("react", {"msg_id": msg_id, "emoji": emoji}))
+        self.hub.broadcast(f"{REACT_PREFIX}{msg_id}|{emoji}|{self.name}")
+        self.event_queue.put(("react", {"msg_id": msg_id, "emoji": emoji, "sender": self.name}))
 
     def send_file(self, filepath: str):
         msg = build_file_message(self.name, filepath)
@@ -1751,6 +1849,19 @@ class GuestConnection:
     def send_rainbow_unlock(self):
         try: send_encrypted(self.sock, self.fernet, RAINBOW_UNLOCK_PREFIX + "1")
         except OSError: pass
+
+    def send_blue_unlock(self):
+        try: send_encrypted(self.sock, self.fernet, BLUE_UNLOCK_PREFIX + "1")
+        except OSError: pass
+
+    def send_react(self, msg_id: str, emoji: str):
+        try: send_encrypted(self.sock, self.fernet, f"{REACT_PREFIX}{msg_id}|{emoji}|{self.name}")
+        except OSError: pass
+        # Optimistic local update — the host's broadcast excludes the
+        # original sender (standard practice, avoids an unnecessary
+        # echo), so without this the reacting guest would never see
+        # their own reaction applied at all.
+        self.event_queue.put(("react", {"msg_id": msg_id, "emoji": emoji, "sender": self.name}))
 
     def send_chat(self, text: str):
         stripped = text.strip()
@@ -2153,6 +2264,8 @@ class ChatApp(tk.Tk):
                 all_cmds = ["/color", "/colors", "/list", "/clear", "/whisper", "/help"]
                 if self.mode_var.get() == "host" or getattr(self, 'is_admin', False):
                     all_cmds.extend(["/mute", "/unmute", "/kick", "/ban", "/unban", "/slowmode", "/admin", "/unadmin"])
+                if self.mode_var.get() == "host":
+                    all_cmds.append("/ipban")
                 self.current_suggestions = [c for c in all_cmds if c.startswith(base_cmd)]
             elif len(words) >= 2:
                 current_arg = words[-1].lower() if left_text[-1] != " " else ""
@@ -2300,11 +2413,13 @@ class ChatApp(tk.Tk):
 
     def _async_guest_connect(self, name, room_code, fernet, manual_target=None):
         host_ip, port = None, None
-        rainbow_pending = False
+        pending_unlock_prefix = None
 
-        if manual_target and manual_target.strip().lower() == RAINBOW_SECRET_CODE.lower():
-            rainbow_pending = True
-            manual_target = None  # not a real address — proceed as if the field was empty
+        if manual_target:
+            match = GRADIENT_UNLOCK_CODES.get(manual_target.strip().lower())
+            if match:
+                _, pending_unlock_prefix = match
+                manual_target = None  # not a real address — proceed as if the field was empty
 
         if manual_target:
             if ":" in manual_target:
@@ -2329,8 +2444,10 @@ class ChatApp(tk.Tk):
 
         try:
             self.connection = GuestConnection(name, host_ip, port, fernet, self.event_queue)
-            if rainbow_pending:
+            if pending_unlock_prefix == RAINBOW_UNLOCK_PREFIX:
                 self.connection.send_rainbow_unlock()
+            elif pending_unlock_prefix == BLUE_UNLOCK_PREFIX:
+                self.connection.send_blue_unlock()
         except PermissionError as e: self.event_queue.put(("connect_fail", str(e)))
         except (OSError, ConnectionError) as e: self.event_queue.put(("connect_fail", f"Connection failed: {e}"))
 
@@ -2532,8 +2649,9 @@ class ChatApp(tk.Tk):
     def _snake_color(self) -> str:
         if isinstance(self.connection, HostConnection):
             return HOST_COLOR
-        if self.known_colors.get(self.my_name.lower()) == RAINBOW_SENTINEL:
-            return RAINBOW_SENTINEL
+        my_color = self.known_colors.get(self.my_name.lower())
+        if my_color in GRADIENT_PALETTES:
+            return my_color
         return random.choice(list(COLOR_PALETTE.values()))
 
     def on_check_updates(self):
@@ -2941,7 +3059,7 @@ class ChatApp(tk.Tk):
                     self.known_colors.update(payload.get("colors") or {})
                     self.append_chat_line(payload["raw"], payload.get("msg_id"))
                 elif kind == "react":
-                    self.add_reaction(payload["msg_id"], payload["emoji"])
+                    self.add_reaction(payload["msg_id"], payload["emoji"], payload.get("sender", ""))
                 elif kind == "system": self.append_system_line(payload)
                 elif kind == "private": self.append_private_line(payload)
                 elif kind == "roster": self.update_roster(payload)
@@ -2978,12 +3096,13 @@ class ChatApp(tk.Tk):
         return tag
 
     def _insert_name(self, name: str, color_value: str):
-        """Insert a name into the chat log. A rainbow-unlocked sender's
+        """Insert a name into the chat log. A gradient-unlocked sender's
         name gets its own uniquely-tagged instance (so hovering over one
         occurrence in the scroll history doesn't animate every other
         occurrence of that name), with the same static-gradient/hover
         animation the roster uses."""
-        if color_value != RAINBOW_SENTINEL:
+        palette = GRADIENT_PALETTES.get(color_value)
+        if palette is None:
             self.log.insert("end", name, (self._color_tag(color_value),))
             return
 
@@ -2992,15 +3111,15 @@ class ChatApp(tk.Tk):
         char_tags = []
         for i, ch in enumerate(name):
             tag = f"{group_tag}_{i}"
-            self.log.tag_configure(tag, foreground=RAINBOW_PALETTE[i % len(RAINBOW_PALETTE)])
+            self.log.tag_configure(tag, foreground=palette[i % len(palette)])
             self.log.insert("end", ch, (tag, group_tag))
             char_tags.append(tag)
 
         def apply_colors(offset):
             for i, tag in enumerate(char_tags):
-                self.log.tag_configure(tag, foreground=RAINBOW_PALETTE[(i + offset) % len(RAINBOW_PALETTE)])
+                self.log.tag_configure(tag, foreground=palette[(i + offset) % len(palette)])
 
-        on_enter, on_leave = self._wire_rainbow_hover(apply_colors)
+        on_enter, on_leave = self._wire_rainbow_hover(apply_colors, len(palette))
         self.log.tag_bind(group_tag, "<Enter>", on_enter)
         self.log.tag_bind(group_tag, "<Leave>", on_leave)
 
@@ -3049,14 +3168,21 @@ class ChatApp(tk.Tk):
 
     def send_reaction(self, msg_id, emoji):
         if not self.connection: return
-        if hasattr(self.connection, "send_react"): self.connection.send_react(msg_id, emoji)
-        else:
-            try: send_encrypted(self.connection.sock, self.connection.fernet, f"{REACT_PREFIX}{msg_id}|{emoji}")
-            except OSError: pass
+        self.connection.send_react(msg_id, emoji)
 
-    def add_reaction(self, msg_id, emoji):
-        counts = self.message_reactions.setdefault(msg_id, {})
-        counts[emoji] = counts.get(emoji, 0) + 1
+    def add_reaction(self, msg_id, emoji, sender_name):
+        if not sender_name:
+            return
+        reactors = self.message_reactions.setdefault(msg_id, {}).setdefault(emoji, set())
+        key = sender_name.lower()
+        if key in reactors:
+            reactors.discard(key)  # toggle off — clicking your own reaction again removes it
+            if not reactors:
+                del self.message_reactions[msg_id][emoji]
+                if not self.message_reactions[msg_id]:
+                    del self.message_reactions[msg_id]
+        else:
+            reactors.add(key)  # a set, so this is naturally idempotent even if a stray duplicate ever arrived
         self.render_reactions(msg_id)
 
     def render_reactions(self, msg_id):
@@ -3070,8 +3196,8 @@ class ChatApp(tk.Tk):
         ranges = self.log.tag_ranges(react_tag)
         if ranges: self.log.delete(ranges[0], ranges[1])
         
-        if counts := self.message_reactions[msg_id]:
-            self.log.insert(mark_name, "  [" + " ".join(f"{e} {c}" for e, c in counts.items()) + "]", (react_tag, "reaction_style"))
+        if reactions := self.message_reactions.get(msg_id):
+            self.log.insert(mark_name, "  [" + " ".join(f"{e} {len(reactors)}" for e, reactors in reactions.items()) + "]", (react_tag, "reaction_style"))
         
         self.log.configure(state="disabled")
 
@@ -3151,12 +3277,13 @@ class ChatApp(tk.Tk):
         for child in self.member_list_frame.winfo_children(): child.destroy()
         for n in self.current_roster:
             color = self.known_colors.get(n.lower(), FG_TEXT)
-            if color == RAINBOW_SENTINEL:
-                self._build_rainbow_name_widget(self.member_list_frame, clean_non_bmp(n)).pack(fill="x", pady=2, anchor="w")
+            palette = GRADIENT_PALETTES.get(color)
+            if palette:
+                self._build_rainbow_name_widget(self.member_list_frame, clean_non_bmp(n), palette).pack(fill="x", pady=2, anchor="w")
             else:
                 tk.Label(self.member_list_frame, text=clean_non_bmp(n), bg=BG_PANEL, fg=color, anchor="w", font=CHAT_FONT).pack(fill="x", pady=2)
 
-    def _wire_rainbow_hover(self, apply_colors):
+    def _wire_rainbow_hover(self, apply_colors, palette_len: int = None):
         """Shared 'static gradient by default, colors shift while
         hovering' animation driver. `apply_colors(offset)` should
         recolor whatever's being animated for the given palette offset
@@ -3164,6 +3291,7 @@ class ChatApp(tk.Tk):
         gone — that's treated as a normal stop condition, not an error,
         since a roster refresh or scrolled-away chat tag can destroy the
         target mid-animation). Returns (on_enter, on_leave) to bind."""
+        palette_len = palette_len or len(RAINBOW_PALETTE)
         anim = {"offset": 0, "active": False}
 
         def safe_apply(offset):
@@ -3177,7 +3305,7 @@ class ChatApp(tk.Tk):
         def tick():
             if not anim["active"]:
                 return
-            anim["offset"] = (anim["offset"] + 1) % len(RAINBOW_PALETTE)
+            anim["offset"] = (anim["offset"] + 1) % palette_len
             if safe_apply(anim["offset"]) and anim["active"]:
                 self.after(150, tick)
 
@@ -3192,13 +3320,14 @@ class ChatApp(tk.Tk):
 
         return on_enter, on_leave
 
-    def _build_rainbow_name_widget(self, parent, name: str):
+    def _build_rainbow_name_widget(self, parent, name: str, palette: list = None):
         """A name rendered in a small single-line Text widget with one
         color tag per character — matches the chat log's own rendering
         technique exactly (rather than separate Label widgets, which
         each carry their own border/padding overhead that visibly
         spaces the letters apart when packed side-by-side). Static
         gradient by default; shifts while hovered, same as in chat."""
+        palette = palette or RAINBOW_PALETTE
         txt = tk.Text(
             parent, height=1, width=max(len(name), 1), bg=BG_PANEL, fg=FG_TEXT,
             bd=0, highlightthickness=0, font=CHAT_FONT, wrap="none",
@@ -3211,14 +3340,14 @@ class ChatApp(tk.Tk):
         for i, ch in enumerate(name):
             tag = f"c{i}"
             txt.tag_add(tag, f"1.{i}", f"1.{i + 1}")
-            txt.tag_configure(tag, foreground=RAINBOW_PALETTE[i % len(RAINBOW_PALETTE)])
+            txt.tag_configure(tag, foreground=palette[i % len(palette)])
             char_tags.append(tag)
 
         def apply_colors(offset):
             for i, tag in enumerate(char_tags):
-                txt.tag_configure(tag, foreground=RAINBOW_PALETTE[(i + offset) % len(RAINBOW_PALETTE)])
+                txt.tag_configure(tag, foreground=palette[(i + offset) % len(palette)])
 
-        on_enter, on_leave = self._wire_rainbow_hover(apply_colors)
+        on_enter, on_leave = self._wire_rainbow_hover(apply_colors, len(palette))
         txt.bind("<Enter>", on_enter)
         txt.bind("<Leave>", on_leave)
         return txt
