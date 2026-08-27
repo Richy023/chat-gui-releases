@@ -1,8 +1,18 @@
 #!/usr/bin/env python3
 """
-chat_gui.py — v1.4.8 — ENCRYPTED instant messenger with a desktop GUI.
+chat_gui.py — v1.4.9 — ENCRYPTED instant messenger with a desktop GUI.
 
 Fixes/features in this version:
+- Added a device-level global ban system, separate from the in-room
+  /ipban: a device fingerprint (shown to hosts on connect, alongside
+  their IP) can go on a signed ban list every client checks before
+  hosting/joining. Gated by possession of a private key that's never
+  distributed with the app (not a password — nothing in public source
+  can stay secret). Like any client-side check, a technical user could
+  still bypass it — a real deterrent, not an unbreakable lock. Inert
+  (zero network calls) unless explicitly configured.
+
+Fixes in 1.4.8:
 - Snake leaderboard shows every player ranked, not just a top few.
 - Fixed a real bug where an unexpected error while handling a message
   mid-session could silently skip cleanup, leaving a "ghost" user stuck
@@ -115,6 +125,8 @@ import importlib
 import subprocess
 import json
 import shutil
+import platform
+import uuid
 import urllib.request
 import urllib.error
 import tkinter as tk
@@ -149,7 +161,7 @@ def ensure_installed(import_name, pip_name=None, required=True):
 
 ensure_installed("cryptography")
 from cryptography.fernet import Fernet, InvalidToken
-from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey, Ed25519PrivateKey
 from cryptography.exceptions import InvalidSignature
 
 ensure_installed("plyer", required=False)
@@ -169,7 +181,7 @@ except ImportError:
 if sys.platform == "darwin":
     ensure_installed("pyobjus", required=False)
 
-VERSION = "1.4.8"
+VERSION = "1.4.9"
 MSG_LEN_BYTES = 4
 MAX_GUESTS = 4
 MAX_FILE_BYTES = 500 * 1024 * 1024 # 500MB Limit
@@ -246,6 +258,7 @@ MSG_PREFIX = "__MSG__:"
 REACT_PREFIX = "__REACT__:"
 RAINBOW_UNLOCK_PREFIX = "__RAINBOW_UNLOCK__:"
 BLUE_UNLOCK_PREFIX = "__BLUE_UNLOCK__:"
+FINGERPRINT_PREFIX = "__FINGERPRINT__:"
 
 # ---- Secret gradient unlocks ----
 # Typed into the "Host IP" field on the join screen instead of an actual
@@ -719,6 +732,133 @@ def apply_update(payload: bytes) -> str:
     return backup_path
 
 
+# ---- Global machine ban list ----
+# A separate mechanism from the in-room /ipban above: that one only
+# affects a single host's session, keyed by IP, and lives only in that
+# host's runtime memory. This one is meant to follow a machine
+# everywhere, forever, enforced by every copy of the app.
+#
+# Important limitation, stated plainly rather than oversold: this is a
+# CLIENT-SIDE check. Anyone with the technical skill to read Python
+# source can bypass it — delete the check, edit the file, spoof the
+# fingerprint. It cannot be a true unbypassable lock, the same way no
+# purely client-side mechanism can be. What it realistically provides:
+# a real deterrent against casual reconnection, backed by a list that
+# every client trusts because it's signed with the same private key
+# used for OTA releases — nobody else can add or remove an entry from
+# the version every client actually honors.
+#
+# Left empty, this feature is completely inert — no network call, no
+# possibility of a false ban — until GLOBAL_BANLIST_URL is set.
+GLOBAL_BANLIST_URL = ""
+GLOBAL_BANLIST_SIGNING_KEY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "update_signing_key.b64")
+
+def get_machine_fingerprint() -> str:
+    """A best-effort, stable-ish per-machine identifier — not the IP
+    (which changes), and not anything personally identifying beyond
+    'this is probably the same computer as last time'. Shown to hosts
+    when someone connects (same as their IP already is) so a
+    fingerprint can actually be captured before it's ever needed."""
+    raw = f"{uuid.getnode()}|{platform.node()}|{platform.system()}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+
+def fetch_global_banlist() -> dict:
+    raw = _https_get(GLOBAL_BANLIST_URL, timeout=8.0)
+    data = json.loads(raw.decode("utf-8"))
+    if "entries" not in data or "signature" not in data:
+        raise ValueError("Ban list is missing required fields.")
+    return data
+
+def verify_global_banlist(data: dict) -> list:
+    """Returns the verified entry list, or raises ValueError. The
+    signature covers the exact JSON-serialized entries list, so a
+    tampered or appended entry fails verification rather than being
+    silently trusted."""
+    if not UPDATE_PUBLIC_KEY_B64:
+        raise ValueError("No signing key configured — refusing to trust an unverifiable ban list.")
+    entries = data["entries"]
+    payload = json.dumps(entries, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    try:
+        pubkey = Ed25519PublicKey.from_public_bytes(base64.b64decode(UPDATE_PUBLIC_KEY_B64))
+        pubkey.verify(base64.b64decode(data["signature"]), payload)
+    except InvalidSignature:
+        raise ValueError("Ban list signature is INVALID — ignoring it.")
+    except Exception as e:
+        raise ValueError(f"Could not verify the ban list: {e}")
+    return entries
+
+def check_global_ban() -> dict:
+    """Returns a matching ban entry {fingerprint, reason, date} if this
+    machine is banned, or None. Fails OPEN: any network/parse/
+    verification problem is treated as 'not banned' rather than
+    locking out an innocent person over a network hiccup — this was
+    never meant to be a hard security gate, just a real deterrent."""
+    if not GLOBAL_BANLIST_URL:
+        return None
+    try:
+        entries = verify_global_banlist(fetch_global_banlist())
+    except Exception:
+        return None
+    my_fp = get_machine_fingerprint()
+    for entry in entries:
+        if entry.get("fingerprint") == my_fp:
+            return entry
+    return None
+
+def _load_local_signing_key():
+    """Loads the Ed25519 PRIVATE key from a local file that is never
+    distributed with the app (see sign_release.py's own warnings about
+    this same file). Returns None if it isn't present — which is the
+    normal, expected case for literally everyone except the person who
+    holds it, and is exactly what makes /globalban only usable by them."""
+    try:
+        with open(GLOBAL_BANLIST_SIGNING_KEY_FILE) as f:
+            key_bytes = base64.b64decode(f.read().strip())
+        return Ed25519PrivateKey.from_private_bytes(key_bytes)
+    except Exception:
+        return None
+
+def sign_global_banlist(entries: list, privkey: Ed25519PrivateKey) -> dict:
+    payload = json.dumps(entries, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    signature = base64.b64encode(privkey.sign(payload)).decode("ascii")
+    return {"entries": entries, "signature": signature}
+
+def perform_globalban(fingerprint: str, reason: str) -> str:
+    """Composes and signs an updated global ban list, gated purely by
+    local possession of the private signing key. MUST be invoked
+    directly by the local UI layer (never routed over the network to
+    run on someone else's machine) — the key check is only meaningful
+    against the filesystem of whoever actually typed the command, and
+    a guest's mod commands normally execute on the HOST's machine, not
+    their own, which would silently check the wrong computer."""
+    privkey = _load_local_signing_key()
+    if privkey is None:
+        return "This command requires the signing key file, which only the app's publisher has."
+
+    if not fingerprint:
+        return "Usage: /globalban <fingerprint> [reason]"
+
+    entries = []
+    if GLOBAL_BANLIST_URL:
+        try:
+            entries = verify_global_banlist(fetch_global_banlist())
+        except Exception as e:
+            return f"Could not fetch/verify the current ban list — aborting rather than risk silently dropping existing entries. ({e})"
+
+    entries = [e for e in entries if e.get("fingerprint") != fingerprint]
+    entries.append({"fingerprint": fingerprint, "reason": reason, "date": time.strftime("%Y-%m-%d")})
+
+    signed = sign_global_banlist(entries, privkey)
+    out_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "global_banlist_signed.json")
+    try:
+        with open(out_path, "w", encoding="utf-8") as f:
+            json.dump(signed, f, indent=2)
+    except OSError as e:
+        return f"Signed the ban list but couldn't write it to disk: {e}"
+
+    return f"Signed a global ban for fingerprint {fingerprint}. Upload {os.path.basename(out_path)} to wherever GLOBAL_BANLIST_URL points to make it live ({len(entries)} total entries)."
+
+
 # ---- Changelog ----
 # EMBEDDED_CHANGELOG is the static release history baked into this
 # build — add one entry per release when you bump VERSION. Anything
@@ -727,6 +867,22 @@ def apply_update(payload: bytes) -> str:
 # install time, so the in-app viewer stays complete going forward
 # without needing the whole history re-embedded on every release.
 EMBEDDED_CHANGELOG = [
+    {   "version": "1.4.9",
+        "date": "2026-08-23",
+        "notes": (
+            "Added a device-level global ban system, separate from the existing "
+            "in-room /ipban: a device fingerprint (shown to hosts when someone "
+            "connects, same as their IP already is) can be added to a signed ban "
+            "list that every copy of the app checks before hosting or joining. "
+            "Adding to that list is gated by possession of a private key that's "
+            "never distributed with the app — not a password, since anything "
+            "baked into the public source can't actually stay secret. Worth "
+            "knowing honestly: like any client-side check, a technical user could "
+            "still bypass it by editing their own copy — this is a real deterrent, "
+            "not an unbreakable lock. Inert by default (zero network calls) unless "
+            "explicitly configured."
+        ),
+    },
     {   "version": "1.4.8",
         "date": "2026-08-22",
         "notes": (
@@ -989,6 +1145,11 @@ class Hub:
         with self.lock:
             return dict(self.clients.get(sock, {}))
 
+    def set_fingerprint(self, sock, fingerprint: str):
+        with self.lock:
+            if sock in self.clients:
+                self.clients[sock]["fingerprint"] = fingerprint
+
     def find_socket_by_name(self, name):
         with self.lock:
             for s, info in self.clients.items():
@@ -1245,6 +1406,12 @@ def handle_guest_connection(sock, addr, hub: Hub, host_name: str, event_queue: q
                 hub.set_gradient(guest_name, BLUE_SENTINEL)
                 hub.broadcast(COLORMAP_PREFIX + hub.colormap_string())
                 event_queue.put(("colormap", hub.colormap_snapshot()))
+                continue
+
+            elif text.startswith(FINGERPRINT_PREFIX):
+                fp = text[len(FINGERPRINT_PREFIX):].strip()
+                hub.set_fingerprint(sock, fp)
+                event_queue.put(("system", f"{guest_name}'s device fingerprint: {fp}"))
                 continue
 
             elif text.startswith(CMD_PREFIX):
@@ -1846,6 +2013,9 @@ class GuestConnection:
             daemon=True,
         ).start()
 
+        try: send_encrypted(self.sock, fernet, FINGERPRINT_PREFIX + get_machine_fingerprint())
+        except OSError: pass
+
     def send_rainbow_unlock(self):
         try: send_encrypted(self.sock, self.fernet, RAINBOW_UNLOCK_PREFIX + "1")
         except OSError: pass
@@ -2394,6 +2564,13 @@ class ChatApp(tk.Tk):
             return self.status_label.configure(text="Room Code must be 6 digits (from the host's screen).", fg=COLOR_PALETTE["red"])
         if not key: return self.status_label.configure(text="Enter the shared key password.", fg=COLOR_PALETTE["red"])
 
+        ban = check_global_ban()
+        if ban:
+            return self.status_label.configure(
+                text=f"This device isn't able to use chat_gui. ({ban.get('reason', 'no reason given')})",
+                fg=COLOR_PALETTE["red"],
+            )
+
         self.status_label.configure(text="Connecting, please wait...", fg=COLOR_PALETTE["yellow"])
         self.update_idletasks()
 
@@ -2832,6 +3009,15 @@ class ChatApp(tk.Tk):
             
             self.msg_entry.delete(0, "end")
             self.destroy_suggestions()
+            return
+
+        if text.startswith("/globalban "):
+            parts = text[len("/globalban "):].strip().split(maxsplit=1)
+            fingerprint = parts[0] if parts else ""
+            reason = parts[1] if len(parts) > 1 else "no reason given"
+            self.msg_entry.delete(0, "end")
+            self.destroy_suggestions()
+            self.append_system_line(perform_globalban(fingerprint, reason))
             return
 
         self.msg_entry.delete(0, "end")
