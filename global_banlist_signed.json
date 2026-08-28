@@ -4,7 +4,12 @@
       "fingerprint": "0000000000000000",
       "reason": "placeholder",
       "date": "2026-08-28"
+    },
+    {
+      "fingerprint": "a3f4eeeaa4c476b8",
+      "reason": "not cool",
+      "date": "2026-08-28"
     }
   ],
-  "signature": "maAEbtIHPHwqorjAn38j7qB9yaYNfc+wPppvQ9G7OsreDnFky8/W1GLKrZPKjuLridiSXVgdLVMYTMJlrKyjCw=="
+  "signature": "vHVYYp3bRj55nWb/jGx81eeJzWl+3pD5+jXWMt1QNAUU6WKs7e8l/XHDOYdmYKXV75BCnbhJmoDuVOEZCFdGBA=="
 }
