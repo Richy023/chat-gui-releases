@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-chat_gui.py — v1.4.8a — ENCRYPTED instant messenger with a desktop GUI.
+chat_gui.py — v1.4.8b — ENCRYPTED instant messenger with a desktop GUI.
 
 Fixes/features in this version:
 - Added a device-level global ban system, separate from the in-room
@@ -181,7 +181,7 @@ except ImportError:
 if sys.platform == "darwin":
     ensure_installed("pyobjus", required=False)
 
-VERSION = "1.4.8a"
+VERSION = "1.4.8b"
 MSG_LEN_BYTES = 4
 MAX_GUESTS = 4
 MAX_FILE_BYTES = 500 * 1024 * 1024 # 500MB Limit
@@ -750,7 +750,7 @@ def apply_update(payload: bytes) -> str:
 #
 # Left empty, this feature is completely inert — no network call, no
 # possibility of a false ban — until GLOBAL_BANLIST_URL is set.
-GLOBAL_BANLIST_URL = ""
+GLOBAL_BANLIST_URL = "https://raw.githubusercontent.com/Richy023/chat-gui-releases/main/global_banlist_signed.json"
 GLOBAL_BANLIST_SIGNING_KEY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "update_signing_key.b64")
 
 def get_machine_fingerprint() -> str:
@@ -867,6 +867,12 @@ def perform_globalban(fingerprint: str, reason: str) -> str:
 # install time, so the in-app viewer stays complete going forward
 # without needing the whole history re-embedded on every release.
 EMBEDDED_CHANGELOG = [
+    {   "version": "1.4.8b",
+        "date": "2026-08-28",
+        "notes": (
+            "Added global banlist."
+        ),
+    },
     {   "version": "1.4.8a",
         "date": "2026-08-23",
         "notes": (
