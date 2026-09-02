@@ -1,7 +1,7 @@
 {
-  "version": "1.4.8b",
+  "version": "1.4.8c",
   "url": "https://raw.githubusercontent.com/Richy023/chat-gui-releases/main/chat_gui.py",
-  "sha256": "6f9ddd0cd018a81b9232ba00f47c29a3df11adc77e43ef6afb91242dedaeec1c",
-  "signature": "Y6kIPGx5059XWBtIXoxtJGyu1M0RBUdOgu4tpp9aoE8iK6UDKNY1wRq52UWU0MCAbVDniR7WpgqSA4YA6qUTAA==",
-  "notes": "added global banlist"
+  "sha256": "6215f06ff9750b9bda83e27ba63d0b0472e673d2df107478470b829107882f56",
+  "signature": "wANJMq1RGfqh3js7h/i28CNd9uqeZZlcrySoo6HgU5zGoCTNFg1tZzDL3rRcRXpR51YxH2wKzg4+CSZ3VNOcBg==",
+  "notes": "added discovery list instead of room code"
 }

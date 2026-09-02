@@ -181,7 +181,7 @@ except ImportError:
 if sys.platform == "darwin":
     ensure_installed("pyobjus", required=False)
 
-VERSION = "1.4.8b"
+VERSION = "1.4.8c"
 MSG_LEN_BYTES = 4
 MAX_GUESTS = 4
 MAX_FILE_BYTES = 500 * 1024 * 1024 # 500MB Limit
@@ -521,18 +521,6 @@ def derive_key(passphrase: str) -> bytes:
     digest = hashlib.sha256(passphrase.encode("utf-8")).digest()
     return base64.urlsafe_b64encode(digest)
 
-def generate_room_code(local_ip: str = None) -> str:
-    ip = local_ip or get_local_ip()
-    parts = ip.split(".")
-    try:
-        octet3, octet4 = int(parts[2]), int(parts[3])
-        if 0 <= octet3 <= 255 and 0 <= octet4 <= 255:
-            return f"{octet3:03d}{octet4:03d}"
-    except (ValueError, IndexError):
-        pass
-    rng = random.SystemRandom()
-    return f"{rng.randint(0, 255):03d}{rng.randint(1, 254):03d}"
-
 def send_encrypted(sock: socket.socket, fernet: Fernet, plaintext: str):
     token = fernet.encrypt(plaintext.encode("utf-8", errors="surrogatepass"))
     length = len(token).to_bytes(MSG_LEN_BYTES, "big")
@@ -616,32 +604,44 @@ def _local_subnet_hosts(local_ip: str) -> list:
     except ValueError: return []
     return [".".join(str(o) for o in network) + f".{h}" for h in range(1, 255)]
 
-def discover_host(room_code: str, target_ip: str = None, timeout: float = 4.0) -> tuple[str, int]:
+def discover_hosts_list(target_ip: str = None, timeout: float = 2.5) -> list:
+    """Broadcast (or, with target_ip, unicast) a LISTQUERY and collect every
+    OFFERINFO reply that comes back within timeout. Returns a de-duplicated
+    list of dicts: {"host_ip", "port", "host_name", "room_name"}.
+    With no target_ip this is how the 'available chats' list is populated;
+    with a target_ip it's a single-host probe used by manual/advanced connect
+    on networks where broadcasts don't reach (see discover_host's old
+    target_ip behavior, which this replaces)."""
     udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     udp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-    udp_sock.settimeout(0.5)
+    udp_sock.settimeout(0.3)
 
-    msg = f"DISCOVER:{room_code}".encode('utf-8')
+    msg = b"LISTQUERY"
     targets = {target_ip} if target_ip else (_guess_broadcast_addresses() | set(_local_subnet_hosts(get_local_ip())))
     deadline = time.time() + timeout
-    
+    found = {}
+
     try:
         while time.time() < deadline:
             for addr in targets:
                 try: udp_sock.sendto(msg, (addr, DISCOVERY_PORT))
                 except OSError: pass
             try:
-                data, addr = udp_sock.recvfrom(1024)
-                resp = data.decode('utf-8')
-                if resp.startswith("OFFER:"):
-                    return addr[0], int(resp.split(":")[1])
+                while True:
+                    data, addr = udp_sock.recvfrom(1024)
+                    resp = data.decode('utf-8', errors='ignore')
+                    if resp.startswith("OFFERINFO:"):
+                        try:
+                            port_str, host_name, room_name = resp[len("OFFERINFO:"):].split("|", 2)
+                            key = (addr[0], int(port_str))
+                            found[key] = {"host_ip": addr[0], "port": int(port_str), "host_name": host_name, "room_name": room_name}
+                        except ValueError:
+                            continue
             except (socket.timeout, OSError):
                 continue
-    except ValueError:
-        pass
     finally:
         udp_sock.close()
-    return None, None
+    return list(found.values())
 
 
 # ---- OTA update helpers ----
@@ -867,6 +867,20 @@ def perform_globalban(fingerprint: str, reason: str) -> str:
 # install time, so the in-app viewer stays complete going forward
 # without needing the whole history re-embedded on every release.
 EMBEDDED_CHANGELOG = [
+    {   "version": "1.4.8c",
+        "date": "2026-09-02",
+        "notes": (
+            "Joining no longer means typing a Room Code. Switch to 'Join a chat' "
+            "and every host currently broadcasting on your network shows up in a "
+            "list automatically (named '<host>'s Room' by default, or whatever "
+            "the host renamed it to), or 'No one is hosting right now.' if nobody "
+            "is. Click a chat to be asked for its password. Hosts set a Room name "
+            "and the same shared-key password as before on their own screen. For "
+            "networks where broadcast discovery doesn't reach (e.g. larger routed "
+            "networks), 'Connect by IP instead' still works the same way the old "
+            "'Host IP' field did."
+        ),
+    },
     {   "version": "1.4.8b",
         "date": "2026-08-28",
         "notes": (
@@ -1888,8 +1902,9 @@ def guest_recv_loop(sock: socket.socket, fernet: Fernet, event_queue: queue.Queu
 
 
 class HostConnection:
-    def __init__(self, name, room_code, fernet, event_queue):
+    def __init__(self, name, room_name, fernet, event_queue):
         self.name = name
+        self.room_name = room_name
         self.fernet = fernet
         self.event_queue = event_queue
         
@@ -1907,10 +1922,14 @@ class HostConnection:
         
         self.stop_event = threading.Event()
 
-        threading.Thread(target=self._udp_discovery_loop, args=(room_code,), daemon=True).start()
+        threading.Thread(target=self._udp_discovery_loop, args=(room_name,), daemon=True).start()
         threading.Thread(target=host_accept_loop, args=(self.server, self.hub, self.name, self.event_queue), daemon=True).start()
 
-    def _udp_discovery_loop(self, room_code):
+    def _udp_discovery_loop(self, room_name):
+        # Answers two kinds of queries: a broadcast LISTQUERY (populates
+        # every guest's "available chats" list) and the same query sent
+        # unicast at this host's specific IP (the "Connect by IP" manual
+        # fallback for networks where broadcasts don't reach everyone).
         udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         udp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         udp_sock.bind(("", DISCOVERY_PORT))
@@ -1919,8 +1938,9 @@ class HostConnection:
         while not self.stop_event.is_set():
             try:
                 data, addr = udp_sock.recvfrom(1024)
-                if data.decode('utf-8') == f"DISCOVER:{room_code}":
-                    udp_sock.sendto(f"OFFER:{self.tcp_port}".encode('utf-8'), addr)
+                if data.decode('utf-8', errors='ignore') == "LISTQUERY":
+                    offer = f"OFFERINFO:{self.tcp_port}|{self.name}|{room_name}"
+                    udp_sock.sendto(offer.encode('utf-8'), addr)
             except (socket.timeout, OSError):
                 if self.stop_event.is_set(): break
         udp_sock.close()
@@ -2232,12 +2252,13 @@ class ChatApp(tk.Tk):
                 selectcolor=BG_INPUT, activebackground=BG_PANEL, activeforeground=FG_TEXT, font=CHAT_FONT
             ).pack(side="left", padx=8)
 
-        def field(row, label, validate_cmd=None, entry_width=28):
-            label_widget = tk.Label(card, text=label, bg=BG_PANEL, fg=FG_MUTED, anchor="w", font=CHAT_FONT)
+        def field(row, label, validate_cmd=None, entry_width=28, parent=None):
+            parent = card if parent is None else parent
+            label_widget = tk.Label(parent, text=label, bg=BG_PANEL, fg=FG_MUTED, anchor="w", font=CHAT_FONT)
             label_widget.grid(row=row, column=0, sticky="w", pady=(6, 0))
             kwargs = {"validate": "key", "validatecommand": validate_cmd} if validate_cmd else {}
             entry = tk.Entry(
-                card, bg=BG_INPUT, fg=FG_TEXT, insertbackground=FG_TEXT, relief="flat",
+                parent, bg=BG_INPUT, fg=FG_TEXT, insertbackground=FG_TEXT, relief="flat",
                 width=entry_width, font=CHAT_FONT,
                 readonlybackground=BG_INPUT,  # Tk uses a separate bg for state="readonly";
                                                # left unset it defaults to a near-white system
@@ -2250,49 +2271,238 @@ class ChatApp(tk.Tk):
 
         card.grid_columnconfigure(1, weight=1)
 
-        self.name_entry = field(2, "Display name", validate_cmd=(self.register(lambda p: " " not in p and len(p) <= 30), "%P"))
-        self.room_entry = field(3, "Room Code", entry_width=20)
-        self.regen_room_btn = make_button(card, "Refresh", self._regenerate_room_code, bg=BTN_NEUTRAL, hover_bg=BTN_NEUTRAL_HOVER, padx=8, pady=4, font=CHAT_FONT)
-        self.regen_room_btn.grid(row=3, column=2, sticky="w", padx=(8, 0), pady=(6, 0))
+        self.name_entry = field(2, "Display name", validate_cmd=(self.register(lambda p: " " not in p and "|" not in p and len(p) <= 30), "%P"))
+        self.name_entry.bind("<KeyRelease>", lambda e: self._on_display_name_changed())
 
-        self.host_ip_entry = field(4, "Host IP (only if Room Code fails)")
+        # ---- Host-only fields: room name + the shared-key password ----
+        self.host_fields_frame = tk.Frame(card, bg=BG_PANEL)
+        self.host_fields_frame.grid(row=3, column=0, columnspan=3, sticky="ew")
+        self.host_fields_frame.grid_columnconfigure(1, weight=1)
 
-        tk.Label(card, text="Shared key", bg=BG_PANEL, fg=FG_MUTED, anchor="w", font=CHAT_FONT).grid(row=5, column=0, sticky="w", pady=(6, 0))
-        self.key_entry = tk.Entry(card, bg=BG_INPUT, fg=FG_TEXT, insertbackground=FG_TEXT, relief="flat", width=28, show="*", font=CHAT_FONT)
-        self.key_entry.grid(row=5, column=1, sticky="ew", pady=(6, 0), padx=(10, 0))
+        self.room_name_entry = field(
+            0, "Room name",
+            validate_cmd=(self.register(lambda p: "|" not in p and len(p) <= 40), "%P"),
+            parent=self.host_fields_frame,
+        )
+        self.room_name_entry.bind("<KeyRelease>", lambda e: setattr(self, "_room_name_manual", True))
+
+        tk.Label(self.host_fields_frame, text="Shared key", bg=BG_PANEL, fg=FG_MUTED, anchor="w", font=CHAT_FONT).grid(row=1, column=0, sticky="w", pady=(6, 0))
+        self.key_entry = tk.Entry(self.host_fields_frame, bg=BG_INPUT, fg=FG_TEXT, insertbackground=FG_TEXT, relief="flat", width=28, show="*", font=CHAT_FONT)
+        self.key_entry.grid(row=1, column=1, sticky="ew", pady=(6, 0), padx=(10, 0))
+
+        # ---- Join-only fields: the discovered-chats list + manual fallback ----
+        self.join_fields_frame = tk.Frame(card, bg=BG_PANEL)
+        self.join_fields_frame.grid(row=3, column=0, columnspan=3, sticky="ew")
+
+        list_header = tk.Frame(self.join_fields_frame, bg=BG_PANEL)
+        list_header.pack(fill="x", pady=(6, 4))
+        tk.Label(list_header, text="Chats on your network", bg=BG_PANEL, fg=FG_MUTED, font=CHAT_FONT).pack(side="left")
+        make_button(list_header, "Refresh", self.on_refresh_chats_clicked, bg=BTN_NEUTRAL, hover_bg=BTN_NEUTRAL_HOVER, padx=8, pady=3, font=CHAT_FONT).pack(side="right")
+
+        self.chats_list_frame = tk.Frame(self.join_fields_frame, bg=BG_PANEL)
+        self.chats_list_frame.pack(fill="x", pady=(0, 8))
+
+        self._manual_toggle_label = tk.Label(
+            self.join_fields_frame, text="Connect by IP instead", bg=BG_PANEL, fg=FG_MUTED,
+            font=(CHAT_FONT[0], 9, "underline"), cursor="hand2",
+        )
+        self._manual_toggle_label.pack(anchor="w")
+        self._manual_toggle_label.bind("<Button-1>", lambda e: self._toggle_manual_connect())
+
+        self.manual_frame = tk.Frame(self.join_fields_frame, bg=BG_PANEL)
+
+        def manual_field(label, show=None):
+            tk.Label(self.manual_frame, text=label, bg=BG_PANEL, fg=FG_MUTED, anchor="w", font=CHAT_FONT).pack(fill="x", pady=(6, 0))
+            kwargs = {"show": show} if show else {}
+            e = tk.Entry(self.manual_frame, bg=BG_INPUT, fg=FG_TEXT, insertbackground=FG_TEXT, relief="flat", font=CHAT_FONT, **kwargs)
+            e.pack(fill="x")
+            return e
+
+        self.manual_ip_entry = manual_field("Host IP (or IP:port)")
+        self.manual_key_entry = manual_field("Shared key", show="*")
+        make_button(self.manual_frame, "Connect", self._on_manual_connect_clicked, bg=BTN_GREEN, hover_bg=BTN_GREEN_HOVER, padx=12, pady=5).pack(anchor="w", pady=(10, 0))
 
         self.status_label = tk.Label(card, text="", bg=BG_PANEL, fg=COLOR_PALETTE["red"], wraplength=280, justify="left", font=CHAT_FONT)
-        self.status_label.grid(row=6, column=0, columnspan=2, sticky="w", pady=(10, 0))
+        self.status_label.grid(row=4, column=0, columnspan=3, sticky="w", pady=(10, 0))
 
-        self.connect_btn = make_button(card, "Connect", self.on_connect_clicked, bg=BTN_GREEN, hover_bg=BTN_GREEN_HOVER)
-        self.connect_btn.grid(row=7, column=0, columnspan=2, pady=(16, 0), sticky="ew")
+        self.connect_btn = make_button(card, "Host", self.on_connect_clicked, bg=BTN_GREEN, hover_bg=BTN_GREEN_HOVER)
+        self.connect_btn.grid(row=5, column=0, columnspan=3, pady=(16, 0), sticky="ew")
 
         self._host_local_ip = None
+        self._room_name_manual = False
+        self._manual_visible = False
+        self.discovered_hosts = []
+        self._discovery_lock = threading.Lock()
+        self._discovery_after_id = None
+        self._discovery_seq = 0
+        self._password_dialog = None
+        self._join_room_label = None
         self.mode_var.trace_add("write", lambda *_args: self._on_mode_change())
         self._on_mode_change()
 
     def _on_mode_change(self):
         if self.mode_var.get() == "host":
-            self.room_entry.label.configure(text="Room Code (= last 2 numbers of your IP)")
-            self.regen_room_btn.grid()
-            self._regenerate_room_code()
-            self.host_ip_entry.grid_remove()
-            self.host_ip_entry.label.grid_remove()
+            self._stop_discovery_polling()
+            self.join_fields_frame.grid_remove()
+            self.host_fields_frame.grid()
+            self.connect_btn.label.configure(text="Host")
+            self.connect_btn.grid()
+            self.status_label.configure(text="")
+            self._host_local_ip = get_local_ip()
+            if not self._room_name_manual:
+                self._set_default_room_name()
         else:
-            self.room_entry.label.configure(text="Room Code (from host)")
-            self.regen_room_btn.grid_remove()
-            self.room_entry.configure(state="normal")
-            self.room_entry.delete(0, "end")
-            self.host_ip_entry.grid()
-            self.host_ip_entry.label.grid()
+            self.host_fields_frame.grid_remove()
+            self.join_fields_frame.grid()
+            self.connect_btn.grid_remove()
+            self.status_label.configure(text="")
+            self._start_discovery_polling()
 
-    def _regenerate_room_code(self):
-        if self.mode_var.get() != "host": return
-        self._host_local_ip = get_local_ip()
-        self.room_entry.configure(state="normal")
-        self.room_entry.delete(0, "end")
-        self.room_entry.insert(0, generate_room_code(self._host_local_ip))
-        self.room_entry.configure(state="readonly")
+    def _set_default_room_name(self):
+        name = self.name_entry.get().strip() or "Someone"
+        self.room_name_entry.delete(0, "end")
+        self.room_name_entry.insert(0, f"{name}'s Room")
+
+    def _on_display_name_changed(self):
+        if self.mode_var.get() == "host" and not self._room_name_manual:
+            self._set_default_room_name()
+
+    def _toggle_manual_connect(self):
+        self._manual_visible = not self._manual_visible
+        if self._manual_visible:
+            self.manual_frame.pack(fill="x", pady=(8, 0))
+            self._manual_toggle_label.configure(text="Hide manual connect")
+        else:
+            self.manual_frame.pack_forget()
+            self._manual_toggle_label.configure(text="Connect by IP instead")
+
+    # ---- "Available chats" discovery (Join mode) ----
+
+    def _start_discovery_polling(self):
+        self._discovery_seq += 1
+        self._render_chat_list_loading()
+        self._schedule_discovery_scan(delay=0)
+
+    def _stop_discovery_polling(self):
+        self._discovery_seq += 1  # invalidates any scan already in flight
+        if self._discovery_after_id is not None:
+            try: self.after_cancel(self._discovery_after_id)
+            except Exception: pass
+            self._discovery_after_id = None
+
+    def _schedule_discovery_scan(self, delay=0):
+        def fire():
+            self._discovery_after_id = None
+            if self.mode_var.get() != "join" or not self.connect_frame.winfo_ismapped():
+                return
+            seq = self._discovery_seq
+            threading.Thread(target=self._discovery_scan_worker, args=(seq,), daemon=True).start()
+        self._discovery_after_id = self.after(delay, fire)
+
+    def _discovery_scan_worker(self, seq):
+        try: offers = discover_hosts_list(timeout=2.5)
+        except Exception: offers = []
+        self.event_queue.put(("hosts_found", {"seq": seq, "offers": offers}))
+
+    def on_refresh_chats_clicked(self):
+        if self._discovery_after_id is not None:
+            try: self.after_cancel(self._discovery_after_id)
+            except Exception: pass
+            self._discovery_after_id = None
+        self._render_chat_list_loading()
+        self._schedule_discovery_scan(delay=0)
+
+    def _render_chat_list_loading(self):
+        for child in self.chats_list_frame.winfo_children(): child.destroy()
+        tk.Label(self.chats_list_frame, text="Looking for chats on your network...", bg=BG_PANEL, fg=FG_MUTED, font=CHAT_FONT).pack(anchor="w")
+
+    def _render_chat_list(self, offers):
+        for child in self.chats_list_frame.winfo_children(): child.destroy()
+        if not offers:
+            tk.Label(
+                self.chats_list_frame, text="No one is hosting right now.", bg=BG_PANEL, fg=FG_MUTED,
+                font=CHAT_FONT, wraplength=280, justify="left",
+            ).pack(anchor="w", pady=(4, 0))
+            return
+        for info in sorted(offers, key=lambda o: o["room_name"].lower()):
+            self._build_chat_row(self.chats_list_frame, info).pack(fill="x", pady=(0, 6))
+
+    def _build_chat_row(self, parent, info):
+        row = tk.Frame(parent, bg=BG_INPUT, cursor="hand2")
+        row.base_bg = BG_INPUT
+        title = tk.Label(row, text=clean_non_bmp(info["room_name"]), bg=BG_INPUT, fg=FG_TEXT, font=BOLD_FONT, anchor="w")
+        title.pack(fill="x", padx=10, pady=(6, 0))
+        subtitle = tk.Label(row, text=f"Hosted by {clean_non_bmp(info['host_name'])}", bg=BG_INPUT, fg=FG_MUTED, font=CHAT_FONT, anchor="w")
+        subtitle.pack(fill="x", padx=10, pady=(0, 6))
+
+        def on_click(event=None): self._on_chat_row_clicked(info)
+        def on_enter(event=None):
+            for w in (row, title, subtitle): w.configure(bg=BTN_NEUTRAL_HOVER)
+        def on_leave(event=None):
+            for w in (row, title, subtitle): w.configure(bg=row.base_bg)
+
+        for w in (row, title, subtitle):
+            w.bind("<Button-1>", on_click)
+            w.bind("<Enter>", on_enter)
+            w.bind("<Leave>", on_leave)
+        return row
+
+    def _on_chat_row_clicked(self, info):
+        name = self.name_entry.get().strip()
+        if not name: return self.status_label.configure(text="Enter a display name first.", fg=COLOR_PALETTE["red"])
+        if " " in name: return self.status_label.configure(text="Display name cannot contain spaces.", fg=COLOR_PALETTE["red"])
+        self._show_password_dialog(info, name)
+
+    def _show_password_dialog(self, info, name):
+        if self._password_dialog is not None:
+            try: self._password_dialog.destroy()
+            except Exception: pass
+
+        dlg = tk.Toplevel(self, bg=BG_PANEL)
+        self._password_dialog = dlg
+        dlg.title(clean_non_bmp(info["room_name"]))
+        dlg.transient(self)
+        dlg.resizable(False, False)
+        dlg.configure(padx=24, pady=20)
+
+        tk.Label(dlg, text=clean_non_bmp(info["room_name"]), bg=BG_PANEL, fg=FG_TEXT, font=(CHAT_FONT[0], 13, "bold")).pack(anchor="w")
+        tk.Label(dlg, text=f"Hosted by {clean_non_bmp(info['host_name'])}", bg=BG_PANEL, fg=FG_MUTED, font=CHAT_FONT).pack(anchor="w", pady=(0, 12))
+
+        tk.Label(dlg, text="Password", bg=BG_PANEL, fg=FG_MUTED, anchor="w", font=CHAT_FONT).pack(fill="x")
+        pw_entry = tk.Entry(dlg, bg=BG_INPUT, fg=FG_TEXT, insertbackground=FG_TEXT, relief="flat", width=26, show="*", font=CHAT_FONT)
+        pw_entry.pack(fill="x", pady=(4, 8))
+        pw_entry.focus_set()
+
+        err_label = tk.Label(dlg, text="", bg=BG_PANEL, fg=COLOR_PALETTE["red"], wraplength=240, justify="left", font=CHAT_FONT)
+        err_label.pack(fill="x")
+
+        btn_row = tk.Frame(dlg, bg=BG_PANEL)
+        btn_row.pack(fill="x", pady=(12, 0))
+
+        def submit(event=None):
+            key = pw_entry.get()
+            if not key:
+                err_label.configure(text="Enter the password.")
+                return
+            dlg.destroy()
+            self._password_dialog = None
+            self.status_label.configure(text="Connecting, please wait...", fg=COLOR_PALETTE["yellow"])
+            self.update_idletasks()
+            self.my_name = name
+            self._join_room_label = info["room_name"]
+            fernet = Fernet(derive_key(key))
+            threading.Thread(target=self._async_guest_connect_direct, args=(name, info["host_ip"], info["port"], fernet), daemon=True).start()
+
+        def cancel():
+            self._password_dialog = None
+            dlg.destroy()
+
+        make_button(btn_row, "Connect", submit, bg=BTN_GREEN, hover_bg=BTN_GREEN_HOVER, padx=12, pady=5).pack(side="left")
+        make_button(btn_row, "Cancel", cancel, bg=BTN_NEUTRAL, hover_bg=BTN_NEUTRAL_HOVER, padx=12, pady=5).pack(side="left", padx=(8, 0))
+
+        dlg.bind("<Return>", submit)
+        dlg.protocol("WM_DELETE_WINDOW", cancel)
+        dlg.grab_set()
 
     def _build_chat_frame(self):
         self.chat_frame = tk.Frame(self, bg=BG_DARK)
@@ -2563,11 +2773,52 @@ class ChatApp(tk.Tk):
         return "break"
 
     def on_connect_clicked(self):
-        name, key, room_code, mode = self.name_entry.get().strip(), self.key_entry.get(), self.room_entry.get().strip(), self.mode_var.get()
+        # Host mode only — joining now happens by clicking a discovered chat
+        # (see _on_chat_row_clicked) or via the manual "Connect by IP" form
+        # (see _on_manual_connect_clicked).
+        name = self.name_entry.get().strip()
         if not name: return self.status_label.configure(text="Enter a display name.", fg=COLOR_PALETTE["red"])
         if " " in name: return self.status_label.configure(text="Display name cannot contain spaces.", fg=COLOR_PALETTE["red"])
-        if not (len(room_code) == 6 and room_code.isdigit() and 0 <= int(room_code[:3]) <= 255 and 0 <= int(room_code[3:]) <= 255):
-            return self.status_label.configure(text="Room Code must be 6 digits (from the host's screen).", fg=COLOR_PALETTE["red"])
+        room_name = self.room_name_entry.get().strip() or f"{name}'s Room"
+        key = self.key_entry.get()
+        if not key: return self.status_label.configure(text="Enter the shared key password.", fg=COLOR_PALETTE["red"])
+
+        ban = check_global_ban()
+        if ban:
+            return self.status_label.configure(
+                text=f"This device isn't able to use chat_gui. ({ban.get('reason', 'no reason given')})",
+                fg=COLOR_PALETTE["red"],
+            )
+
+        self.status_label.configure(text="Starting, please wait...", fg=COLOR_PALETTE["yellow"])
+        self.update_idletasks()
+
+        fernet, self.my_name = Fernet(derive_key(key)), name
+
+        try:
+            self.connection = HostConnection(name, room_name, fernet, self.event_queue)
+            self.is_admin = True
+            self.title_label.configure(text=f"Hosting as {name} — {room_name}")
+            self._transition_to_chat("host", name, room_name)
+        except OSError as e:
+            self.status_label.configure(text=f"Couldn't start: {e}", fg=COLOR_PALETTE["red"])
+
+    def _async_guest_connect_direct(self, name, host_ip, port, fernet):
+        # Used for the common case: the user clicked a chat from the
+        # discovered list, so host_ip/port are already known — no
+        # discovery round-trip needed.
+        try:
+            self.connection = GuestConnection(name, host_ip, port, fernet, self.event_queue)
+        except PermissionError as e: self.event_queue.put(("connect_fail", str(e)))
+        except (OSError, ConnectionError) as e: self.event_queue.put(("connect_fail", f"Connection failed: {e}"))
+
+    def _on_manual_connect_clicked(self):
+        name = self.name_entry.get().strip()
+        if not name: return self.status_label.configure(text="Enter a display name.", fg=COLOR_PALETTE["red"])
+        if " " in name: return self.status_label.configure(text="Display name cannot contain spaces.", fg=COLOR_PALETTE["red"])
+        target = self.manual_ip_entry.get().strip()
+        key = self.manual_key_entry.get()
+        if not target: return self.status_label.configure(text="Enter a host IP.", fg=COLOR_PALETTE["red"])
         if not key: return self.status_label.configure(text="Enter the shared key password.", fg=COLOR_PALETTE["red"])
 
         ban = check_global_ban()
@@ -2579,52 +2830,47 @@ class ChatApp(tk.Tk):
 
         self.status_label.configure(text="Connecting, please wait...", fg=COLOR_PALETTE["yellow"])
         self.update_idletasks()
+        self.my_name = name
+        threading.Thread(target=self._async_guest_connect_manual, args=(name, key, target), daemon=True).start()
 
-        fernet, self.my_name = Fernet(derive_key(key)), name
-        
-        if mode == "host":
-            try:
-                self.connection = HostConnection(name, room_code, fernet, self.event_queue)
-                self.is_admin = True
-                self.title_label.configure(text=f"Hosting as {name} — Room {room_code}")
-                self._transition_to_chat(mode, name, room_code)
-            except OSError as e:
-                self.status_label.configure(text=f"Couldn't start: {e}", fg=COLOR_PALETTE["red"])
-        else:
-            self.is_admin = False
-            threading.Thread(target=self._async_guest_connect, args=(name, room_code, fernet, self.host_ip_entry.get().strip() or None), daemon=True).start()
-
-    def _async_guest_connect(self, name, room_code, fernet, manual_target=None):
-        host_ip, port = None, None
+    def _async_guest_connect_manual(self, name, key, manual_target):
+        # Mirrors the old room-code manual-target flow: an IP, an IP:port,
+        # or (still, as a hidden easter egg) one of the secret gradient
+        # unlock phrases typed here instead of a real address.
+        fernet = Fernet(derive_key(key))
         pending_unlock_prefix = None
 
-        if manual_target:
-            match = GRADIENT_UNLOCK_CODES.get(manual_target.strip().lower())
-            if match:
-                _, pending_unlock_prefix = match
-                manual_target = None  # not a real address — proceed as if the field was empty
+        match = GRADIENT_UNLOCK_CODES.get(manual_target.strip().lower())
+        if match:
+            _, pending_unlock_prefix = match
+            manual_target = ""  # not a real address — fall back to whatever's discovered
 
-        if manual_target:
-            if ":" in manual_target:
-                ip_str, _, port_str = manual_target.partition(":")
-                try: host_ip, port = ip_str.strip(), int(port_str.strip())
-                except ValueError:
-                    return self.event_queue.put(("connect_fail", f"'{manual_target}' isn't a valid address. Use an IP like 192.168.1.42, or IP:port if you have both."))
-            else: host_ip = manual_target
+        host_ip, port, room_label = None, None, None
 
         if not ENABLE_WAN_RELAY:
-            if host_ip and port: pass 
-            elif host_ip: host_ip, port = discover_host(room_code, target_ip=host_ip)
+            if manual_target:
+                if ":" in manual_target:
+                    ip_str, _, port_str = manual_target.partition(":")
+                    try: host_ip, port = ip_str.strip(), int(port_str.strip())
+                    except ValueError:
+                        return self.event_queue.put(("connect_fail", f"'{manual_target}' isn't a valid address. Use an IP like 192.168.1.42, or IP:port if you have both."))
+                    room_label = host_ip
+                else:
+                    offers = discover_hosts_list(target_ip=manual_target.strip(), timeout=2.0)
+                    if offers:
+                        host_ip, port, room_label = offers[0]["host_ip"], offers[0]["port"], offers[0]["room_name"]
+                    else:
+                        return self.event_queue.put(("connect_fail", f"Couldn't reach a host at {manual_target}. Double-check the IP, or ask the host for their IP:port."))
             else:
-                if len(room_code) == 6 and room_code.isdigit():
-                    prefix = ".".join(get_local_ip().split(".")[:2])
-                    if prefix and not prefix.startswith("127."):
-                        host_ip, port = discover_host(room_code, target_ip=f"{prefix}.{int(room_code[:3])}.{int(room_code[3:])}", timeout=1.5)
-                if not host_ip: host_ip, port = discover_host(room_code)
+                with self._discovery_lock:
+                    offers = list(self.discovered_hosts)
+                if offers:
+                    host_ip, port, room_label = offers[0]["host_ip"], offers[0]["port"], offers[0]["room_name"]
 
         if not host_ip:
-            return self.event_queue.put(("connect_fail", f"Could not find Room {room_code}. Ensure the host is running and you are on the same Wi-Fi/network."))
+            return self.event_queue.put(("connect_fail", "No one is hosting right now."))
 
+        self._join_room_label = room_label
         try:
             self.connection = GuestConnection(name, host_ip, port, fernet, self.event_queue)
             if pending_unlock_prefix == RAINBOW_UNLOCK_PREFIX:
@@ -2661,7 +2907,8 @@ class ChatApp(tk.Tk):
         
         for child in self.member_list_frame.winfo_children(): child.destroy()
 
-    def _transition_to_chat(self, mode, name, room_code):
+    def _transition_to_chat(self, mode, name, room_label):
+        self._stop_discovery_polling()
         self._reset_session_state()
         self.known_colors = {name.lower(): HOST_COLOR if mode == "host" else FG_TEXT}
         self.update_roster([name])
@@ -2671,23 +2918,23 @@ class ChatApp(tk.Tk):
         
         if mode == "host":
             local_ip = self._host_local_ip or get_local_ip()
-            self.append_system_line(f"Hosting Room {room_code} on {local_ip}. Guests on your same network segment can join with just the Room Code. If that doesn't work, have them enter {local_ip}:{self.connection.tcp_port} in the 'Host IP' field. Type /help for commands.")
+            self.append_system_line(f"Hosting \"{room_label}\" as {name} on {local_ip}. Anyone else on your network will see it appear in their chat list. If that doesn't work for someone (different network segment), have them enter {local_ip}:{self.connection.tcp_port} under 'Connect by IP'. Type /help for commands.")
         else:
-            self.append_system_line(f"You joined Room {room_code} as {name}. Type /help for commands.")
+            self.append_system_line(f"You joined \"{room_label}\" as {name}. Type /help for commands.")
 
     def on_disconnect_clicked(self):
         self._teardown_connection()
         self.chat_frame.pack_forget()
         self.connect_frame.pack(fill="both", expand=True)
+        self._on_mode_change()
         self.status_label.configure(text="Disconnected.", fg=COLOR_PALETTE["green"])
-        self._regenerate_room_code()
 
     def _handle_disconnected(self, reason: str):
         self._teardown_connection()
         self.chat_frame.pack_forget()
         self.connect_frame.pack(fill="both", expand=True)
+        self._on_mode_change()
         self.status_label.configure(text=reason, fg=COLOR_PALETTE["red"])
-        self._regenerate_room_code()
 
     def _teardown_connection(self):
         self.destroy_suggestions()
@@ -2952,6 +3199,7 @@ class ChatApp(tk.Tk):
         os.execv(sys.executable, [sys.executable] + sys.argv)
 
     def on_close(self):
+        self._stop_discovery_polling()
         self._teardown_connection()
         self.destroy()
 
@@ -3242,8 +3490,15 @@ class ChatApp(tk.Tk):
             while True:
                 kind, payload = self.event_queue.get_nowait()
                 if kind == "connect_success":
-                    self.title_label.configure(text=f"Connected as {payload['name']} — Room {self.room_entry.get().strip()}")
-                    self._transition_to_chat("join", payload['name'], self.room_entry.get().strip())
+                    room_label = self._join_room_label or payload['name']
+                    self.title_label.configure(text=f"Connected as {payload['name']} — {room_label}")
+                    self._transition_to_chat("join", payload['name'], room_label)
+                elif kind == "hosts_found":
+                    if payload["seq"] == self._discovery_seq and self.mode_var.get() == "join":
+                        with self._discovery_lock:
+                            self.discovered_hosts = payload["offers"]
+                        self._render_chat_list(payload["offers"])
+                        self._schedule_discovery_scan(delay=4000)
                 elif kind == "connect_fail":
                     self.status_label.configure(text=payload, fg=COLOR_PALETTE["red"])
                     self._teardown_connection()
