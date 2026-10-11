@@ -1,8 +1,25 @@
 #!/usr/bin/env python3
 """
-chat_gui.py — v1.4.8d — ENCRYPTED instant messenger with a desktop GUI.
+chat_gui.py — v1.4.9 — ENCRYPTED instant messenger with a desktop GUI.
 
-Fixes/features in this version:
+Changes in 1.4.9 (tidy-up + UI/UX efficiency pass — no protocol changes,
+so 1.4.9 interoperates with 1.4.8x):
+- Connecting no longer freezes the window (ban-list check moved off the UI
+  thread); Connect shows a "Connecting..." state; Enter connects from any
+  field; display name + DND keybind are remembered between launches.
+- Chat log only auto-scrolls when you're already at the bottom (with a
+  "New messages" jump button otherwise); trimmed past MAX_LOG_LINES.
+- Up/Down recall sent messages, Esc closes pop-ups, unread count in the
+  window title, member list only redraws when something changed, typing
+  notices only sent when the text actually changes, image thumbnails are
+  prepared off the UI thread, pickers anchor to their buttons.
+- Robustness: a bad event can't stop the UI event loop; stale events from
+  a closed session can't leak into the next one; bare "/ban" etc. show
+  usage instead of being posted as chat; host /color refreshes instantly.
+- Code: shared JSON helpers (atomic saves), table-driven moderation
+  commands and event dispatch, de-duplicated slowmode/file/unlock code.
+
+Fixes/features in 1.4.8d (and the earlier 1.4.8 patches):
 - Added a device-level global ban system, separate from the in-room
   /ipban: a device fingerprint (shown to hosts on connect, alongside
   their IP) can go on a signed ban list every client checks before
@@ -129,8 +146,10 @@ import platform
 import uuid
 import urllib.request
 import urllib.error
+import traceback
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox, scrolledtext, simpledialog
+from contextlib import contextmanager
+from tkinter import filedialog, messagebox, scrolledtext, simpledialog
 
 # FEATURE TOGGLE: WAN (Wide Area Network) / Global Room Support
 ENABLE_WAN_RELAY = False
@@ -172,16 +191,41 @@ except ImportError:
 
 ensure_installed("PIL", pip_name="Pillow", required=False)
 try:
-    from PIL import Image, ImageTk, ImageDraw
+    from PIL import Image, ImageTk, ImageDraw, ImageFont
 except ImportError:
-    Image = None
-    ImageTk = None
-    ImageDraw = None
+    Image = ImageTk = ImageDraw = ImageFont = None
 
 if sys.platform == "darwin":
     ensure_installed("pyobjus", required=False)
 
-VERSION = "1.4.8d"
+VERSION = "1.4.9"
+
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+
+def app_path(filename: str) -> str:
+    return os.path.join(APP_DIR, filename)
+
+def load_json(path: str, expected_type: type):
+    """Reads a small JSON file; returns an empty `expected_type()` if it's
+    missing, unreadable, or holds the wrong kind of value."""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):  # JSONDecodeError/UnicodeDecodeError are ValueErrors
+        return expected_type()
+    return data if isinstance(data, expected_type) else expected_type()
+
+def save_json(path: str, data, **dump_kwargs) -> bool:
+    """Writes via a temp file + atomic replace so a crash mid-write can't
+    leave a half-written (and so unreadable) file behind."""
+    tmp = path + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, **dump_kwargs)
+        os.replace(tmp, path)
+        return True
+    except OSError:
+        return False
 MSG_LEN_BYTES = 4
 MAX_GUESTS = 4
 MAX_FILE_BYTES = 500 * 1024 * 1024 # 500MB Limit
@@ -288,26 +332,18 @@ SNAKE_COLS = 24
 SNAKE_ROWS = 18
 SNAKE_CELL_PX = 20
 SNAKE_TICK_MS = 130
-SNAKE_HIGHSCORES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "chat_gui_snake_highscores.json")
+SNAKE_HIGHSCORES_FILE = app_path("chat_gui_snake_highscores.json")
+SETTINGS_FILE = app_path("chat_gui_settings.json")
 
 def _load_snake_highscores() -> dict:
-    try:
-        with open(SNAKE_HIGHSCORES_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-            return data if isinstance(data, dict) else {}
-    except (FileNotFoundError, json.JSONDecodeError, OSError):
-        return {}
+    return load_json(SNAKE_HIGHSCORES_FILE, dict)
 
 def _save_snake_highscore(name: str, score: int):
     scores = _load_snake_highscores()
     key = name.lower()
     if score > scores.get(key, 0):
         scores[key] = score
-        try:
-            with open(SNAKE_HIGHSCORES_FILE, "w", encoding="utf-8") as f:
-                json.dump(scores, f)
-        except OSError:
-            pass
+        save_json(SNAKE_HIGHSCORES_FILE, scores)
 
 class SnakeGame:
     """Pure game logic — no Tk, no I/O, fully deterministic given a
@@ -410,6 +446,7 @@ class SnakeWindow(tk.Toplevel):
         for keysym, vec in self.ARROW_DIRECTIONS.items():
             self.bind(f"<KeyPress-{keysym}>", lambda e, v=vec: self.game.set_direction(*v))
         self.bind("<space>", lambda e: self._restart_if_dead())
+        self.bind("<Escape>", lambda e: self._on_close())
 
         self._set_status()
         self.focus_set()
@@ -428,10 +465,9 @@ class SnakeWindow(tk.Toplevel):
             self.status_var.set(f"Game over — score {self.game.score}. Press Space to try again.")
 
     def _loop(self):
-        was_alive = self.game.alive
-        if was_alive:
+        if self.game.alive:
             self.game.tick()
-            if was_alive and not self.game.alive:
+            if not self.game.alive:
                 _save_snake_highscore(self.player_name, self.game.score)
                 self._render_leaderboard()
             self._set_status()
@@ -513,9 +549,6 @@ BTN_RED = "#DA373C"
 BTN_RED_HOVER = "#A12D2F"
 BTN_NEUTRAL = "#4E5058"
 BTN_NEUTRAL_HOVER = "#6D6F78"
-
-def clean_non_bmp(s: str) -> str:
-    return s
 
 def derive_key(passphrase: str) -> bytes:
     digest = hashlib.sha256(passphrase.encode("utf-8")).digest()
@@ -647,17 +680,12 @@ def discover_host(room_code: str, target_ip: str = None, timeout: float = 4.0) -
 # to a chat is a click instead of retyping the Room Code / Host IP. Entries
 # older than a day are dropped on load, since a host's IP (and so its Room
 # Code) typically changes by the next day anyway. ----
-RECENT_HOSTS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "chat_gui_recent_hosts.json")
+RECENT_HOSTS_FILE = app_path("chat_gui_recent_hosts.json")
 RECENT_HOSTS_MAX_AGE = 24 * 60 * 60
 RECENT_HOSTS_MAX_ENTRIES = 6
 
 def load_recent_hosts() -> list:
-    try:
-        with open(RECENT_HOSTS_FILE, "r", encoding="utf-8") as f:
-            entries = json.load(f)
-    except (OSError, json.JSONDecodeError):
-        return []
-    if not isinstance(entries, list): return []
+    entries = load_json(RECENT_HOSTS_FILE, list)
     cutoff = time.time() - RECENT_HOSTS_MAX_AGE
     fresh = [e for e in entries if isinstance(e, dict) and e.get("last_connected", 0) >= cutoff]
     if len(fresh) != len(entries):
@@ -665,11 +693,7 @@ def load_recent_hosts() -> list:
     return fresh
 
 def save_recent_hosts(entries: list):
-    try:
-        with open(RECENT_HOSTS_FILE, "w", encoding="utf-8") as f:
-            json.dump(entries[:RECENT_HOSTS_MAX_ENTRIES], f)
-    except OSError:
-        pass
+    save_json(RECENT_HOSTS_FILE, entries[:RECENT_HOSTS_MAX_ENTRIES])
 
 def remember_recent_host(room_code: str, host_ip: str, port: int):
     entries = [e for e in load_recent_hosts() if not (e.get("room_code") == room_code and e.get("host_ip") == host_ip and e.get("port") == port)]
@@ -790,7 +814,7 @@ def apply_update(payload: bytes) -> str:
 # Left empty, this feature is completely inert — no network call, no
 # possibility of a false ban — until GLOBAL_BANLIST_URL is set.
 GLOBAL_BANLIST_URL = "https://raw.githubusercontent.com/Richy023/chat-gui-releases/main/global_banlist_signed.json"
-GLOBAL_BANLIST_SIGNING_KEY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "update_signing_key.b64")
+GLOBAL_BANLIST_SIGNING_KEY_FILE = app_path("update_signing_key.b64")
 
 def get_machine_fingerprint() -> str:
     """A best-effort, stable-ish per-machine identifier — not the IP
@@ -888,12 +912,9 @@ def perform_globalban(fingerprint: str, reason: str) -> str:
     entries.append({"fingerprint": fingerprint, "reason": reason, "date": time.strftime("%Y-%m-%d")})
 
     signed = sign_global_banlist(entries, privkey)
-    out_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "global_banlist_signed.json")
-    try:
-        with open(out_path, "w", encoding="utf-8") as f:
-            json.dump(signed, f, indent=2)
-    except OSError as e:
-        return f"Signed the ban list but couldn't write it to disk: {e}"
+    out_path = app_path("global_banlist_signed.json")
+    if not save_json(out_path, signed, indent=2):
+        return "Signed the ban list but couldn't write it to disk."
 
     return f"Signed a global ban for fingerprint {fingerprint}. Upload {os.path.basename(out_path)} to wherever GLOBAL_BANLIST_URL points to make it live ({len(entries)} total entries)."
 
@@ -906,6 +927,35 @@ def perform_globalban(fingerprint: str, reason: str) -> str:
 # install time, so the in-app viewer stays complete going forward
 # without needing the whole history re-embedded on every release.
 EMBEDDED_CHANGELOG = [
+    {   "version": "1.4.9",
+        "date": "2026-10-09",
+        "notes": (
+            "Tidy-up and efficiency pass, mostly UI/UX. Connecting no longer "
+            "freezes the window (the ban-list check now runs in the background), "
+            "Connect shows a 'Connecting...' state and can't be double-clicked, "
+            "pressing Enter on any connect-screen field connects, and your display "
+            "name and DND keybind are remembered between launches. In chat: the "
+            "log only auto-scrolls when you're already at the bottom (a 'New "
+            "messages' button appears if you've scrolled up, and your own messages "
+            "always jump to the bottom); very old lines are trimmed so long "
+            "sessions stay fast; Up/Down recall your previous messages; Esc closes "
+            "suggestion/emoji/sticker pop-ups; the window title shows an unread "
+            "count while the app is in the background; the online list only "
+            "redraws when something changed; typing notices are only sent when "
+            "the text really changes; image thumbnails are prepared off the UI "
+            "thread so big pictures don't stall the chat; emoji/sticker pickers "
+            "open right above their buttons and stickers have larger, centered "
+            "labels; the changelog window is resizable. Fixes: one bad event can "
+            "no longer stop the whole UI event loop; leaving a chat yourself no "
+            "longer shows a bogus 'Disconnected from host' error; late events "
+            "from a closed session can't leak into the next one; host /color "
+            "now refreshes your own view immediately; bare /ban, /mute, etc. show "
+            "usage instead of being posted as a chat message. Under the hood: "
+            "shared JSON helpers with atomic saves, table-driven moderation "
+            "commands and event handling, and de-duplicated slowmode, file-send "
+            "and unlock code. No protocol changes, so 1.4.9 works alongside 1.4.8x."
+        ),
+    },
     {   "version": "1.4.8d",
         "date": "2026-09-07",
         "notes": (
@@ -1067,22 +1117,13 @@ EMBEDDED_CHANGELOG = [
     },
 ]
 
-CHANGELOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "chat_gui_changelog.json")
+CHANGELOG_FILE = app_path("chat_gui_changelog.json")
 
 def _load_local_changelog() -> list:
-    try:
-        with open(CHANGELOG_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-            return data if isinstance(data, list) else []
-    except (FileNotFoundError, json.JSONDecodeError, OSError):
-        return []
+    return load_json(CHANGELOG_FILE, list)
 
 def _save_local_changelog(entries: list):
-    try:
-        with open(CHANGELOG_FILE, "w", encoding="utf-8") as f:
-            json.dump(entries, f, indent=2)
-    except OSError:
-        pass
+    save_json(CHANGELOG_FILE, entries, indent=2)
 
 def record_changelog_entry(version: str, notes: str):
     """Called after an OTA update is successfully applied, so the
@@ -1105,23 +1146,15 @@ def full_changelog() -> list:
 # JSON file next to the script) so they persist across sessions instead
 # of needing to be re-uploaded every time. They're sent over the wire
 # exactly like the built-in stickers — as a regular JPEG file transfer.
-STICKERS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "chat_gui_stickers.json")
+STICKERS_FILE = app_path("chat_gui_stickers.json")
 MAX_CUSTOM_STICKERS = 24
 
 def _load_custom_stickers() -> dict:
-    try:
-        with open(STICKERS_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-            return data if isinstance(data, dict) else {}
-    except (FileNotFoundError, json.JSONDecodeError, OSError):
-        return {}
+    return load_json(STICKERS_FILE, dict)
 
 def _save_custom_stickers(stickers: dict):
-    try:
-        with open(STICKERS_FILE, "w", encoding="utf-8") as f:
-            json.dump(stickers, f)
-    except OSError:
-        pass
+    save_json(STICKERS_FILE, stickers)
+
 
 class Hub:
     def __init__(self, fernet: Fernet, host_name: str, on_typing_change, on_admin_log):
@@ -1130,6 +1163,7 @@ class Hub:
         self.on_typing_change = on_typing_change
         self.on_admin_log = on_admin_log
         self.lock = threading.Lock()
+        self.closed = False  # set when the host shuts the room down; handler threads then stay quiet
         self.clients = {}
         self.admins = set()
         self.ghost_mutes = {}
@@ -1137,47 +1171,86 @@ class Hub:
         self.colors = {host_name.lower(): HOST_COLOR}
         self.typing = {}
         self.dnd = set()
-        self.last_dnd_announce = {} 
+        self.last_dnd_announce = {}
         self.color_changed_once = set()
         self.slowmode_delay = 0.0
         self.last_msg_time = {}
         self.gradient_users = {}  # name.lower() -> sentinel (RAINBOW_SENTINEL, BLUE_SENTINEL, ...)
 
+    # ---- identity helpers ----
+
+    def is_host(self, name: str) -> bool:
+        return name.lower() == self.host_name.lower()
+
     def set_gradient(self, name: str, sentinel: str):
         with self.lock:
             self.gradient_users[name.lower()] = sentinel
 
+    def set_color(self, name: str, color_hex: str, once: bool = False):
+        with self.lock:
+            self.colors[name.lower()] = color_hex
+            if once:
+                self.color_changed_once.add(name.lower())
+
+    def assign_color(self, name):
+        with self.lock:
+            used = set(self.colors.values())
+            available = [c for c in COLOR_PALETTE.values() if c not in used]
+            color = random.choice(available or list(COLOR_PALETTE.values()))
+            self.colors[name.lower()] = color
+            return color
+
+    def free_color(self, name):
+        with self.lock:
+            self.colors.pop(name.lower(), None)
+
+    def colormap_snapshot(self):
+        with self.lock:
+            return {n: self.gradient_users.get(n, c) for n, c in self.colors.items()}
+
+    def colormap_string(self):
+        return ",".join(f"{n}={c}" for n, c in self.colormap_snapshot().items())
+
+    def broadcast_colormap(self):
+        self.broadcast(COLORMAP_PREFIX + self.colormap_string())
+
+    # ---- admin log ----
+
     def log_admin_action(self, admin_name: str, text: str):
         log_text = f"🛡️ [Admin Log] {admin_name} {text}"
-        
-        if admin_name.lower() != self.host_name.lower():
+
+        if not self.is_host(admin_name):
             self.on_admin_log(log_text)
-            
+
         msg_proto = ADMIN_LOG_PREFIX + log_text
         with self.lock:
             targets = [
-                s for s, info in self.clients.items() 
-                if info["name"].lower() in self.admins 
+                s for s, info in self.clients.items()
+                if info["name"].lower() in self.admins
                 and info["name"].lower() != admin_name.lower()
             ]
         for s in targets:
-            try: send_encrypted(s, self.fernet, msg_proto)
-            except OSError: pass
+            self.send_private(s, msg_proto)
+
+    # ---- do-not-disturb ----
 
     def set_dnd(self, name, active):
+        """Returns True if the change should be announced (rate-limited)."""
         now = time.time()
+        key = name.lower()
         with self.lock:
-            if active: self.dnd.add(name.lower())
-            else: self.dnd.discard(name.lower())
-            last = self.last_dnd_announce.get(name.lower(), 0)
-            if (now - last) < DND_ANNOUNCE_COOLDOWN:
+            if active: self.dnd.add(key)
+            else: self.dnd.discard(key)
+            if (now - self.last_dnd_announce.get(key, 0)) < DND_ANNOUNCE_COOLDOWN:
                 return False
-            self.last_dnd_announce[name.lower()] = now
+            self.last_dnd_announce[key] = now
             return True
 
     def is_dnd(self, name):
         with self.lock:
             return name.lower() in self.dnd
+
+    # ---- client table ----
 
     def add_client(self, sock, name, ip):
         with self.lock:
@@ -1210,70 +1283,61 @@ class Hub:
             if sock in self.clients:
                 self.clients[sock]["fingerprint"] = fingerprint
 
-    def find_socket_by_name(self, name):
+    def _find_socket(self, predicate):
         with self.lock:
-            for s, info in self.clients.items():
-                if info["name"].lower() == name.lower():
-                    return s
-        return None
+            return next((s for s, info in self.clients.items() if predicate(info)), None)
+
+    def find_socket_by_name(self, name):
+        lowered = name.lower()
+        return self._find_socket(lambda info: info["name"].lower() == lowered)
 
     def find_socket_by_ip(self, ip):
-        with self.lock:
-            for s, info in self.clients.items():
-                if info.get("ip") == ip:
-                    return s
-        return None
-
-    def assign_color(self, name):
-        with self.lock:
-            used = set(self.colors.values())
-            available = [c for c in COLOR_PALETTE.values() if c not in used]
-            color = random.choice(available) if available else random.choice(list(COLOR_PALETTE.values()))
-            self.colors[name.lower()] = color
-            return color
-
-    def free_color(self, name):
-        with self.lock:
-            self.colors.pop(name.lower(), None)
-
-    def colormap_string(self):
-        with self.lock:
-            return ",".join(f"{n}={self.gradient_users.get(n, c)}" for n, c in self.colors.items())
-
-    def colormap_snapshot(self):
-        with self.lock:
-            return {n: self.gradient_users.get(n, c) for n, c in self.colors.items()}
+        return self._find_socket(lambda info: info.get("ip") == ip)
 
     def is_name_occupied(self, name):
+        lowered = name.lower()
         with self.lock:
-            self._purge_expired_ghosts()
-            if any(info["name"].lower() == name.lower() for info in self.clients.values()):
+            self._purge_expired()
+            if any(info["name"].lower() == lowered for info in self.clients.values()):
                 return True
-            return name.lower() in self.ghost_mutes
+            return lowered in self.ghost_mutes
 
-    def _purge_expired_ghosts(self):
+    def _purge_expired(self):
+        """Caller must hold self.lock."""
         now = time.time()
-        expired_mutes = [k for k, v in self.ghost_mutes.items() if now >= v["muted_until"]]
-        expired_bans = [ip for ip, info in self.banned_ips.items() if now >= info["until"]]
-        for k in expired_mutes: del self.ghost_mutes[k]
-        for ip in expired_bans: del self.banned_ips[ip]
+        for k in [k for k, v in self.ghost_mutes.items() if now >= v["muted_until"]]:
+            del self.ghost_mutes[k]
+        for ip in [ip for ip, info in self.banned_ips.items() if now >= info["until"]]:
+            del self.banned_ips[ip]
+
+    # ---- bans ----
 
     def is_ip_banned(self, ip):
-        with self.lock:
-            self._purge_expired_ghosts()
-            return ip in self.banned_ips and time.time() < self.banned_ips[ip]["until"]
+        return self.get_ban_info(ip) is not None
 
     def get_ban_info(self, ip):
         with self.lock:
-            self._purge_expired_ghosts()
+            self._purge_expired()
             info = self.banned_ips.get(ip)
             return dict(info) if info else None
 
-    def apply_ghost_ip_mute(self, sock, ip):
+    def ban_ip(self, ip, until, by, reason):
         with self.lock:
-            self._purge_expired_ghosts()
+            self.banned_ips[ip] = {"until": until, "banned_by": by, "reason": reason}
+
+    def unban_ip(self, ip):
+        with self.lock:
+            return self.banned_ips.pop(ip, None) is not None
+
+    # ---- mutes / slowmode ----
+
+    def apply_ghost_ip_mute(self, sock, ip):
+        """Re-applies a still-running mute if the same IP reconnects under a new name."""
+        with self.lock:
+            self._purge_expired()
+            now = time.time()
             for g_info in self.ghost_mutes.values():
-                if g_info.get("ip") == ip and time.time() < g_info["muted_until"]:
+                if g_info.get("ip") == ip and now < g_info["muted_until"]:
                     if sock in self.clients:
                         self.clients[sock].update(
                             muted_until=g_info["muted_until"],
@@ -1292,6 +1356,7 @@ class Hub:
         sock = self.find_socket_by_name(name)
         if not sock: return False
         with self.lock:
+            if sock not in self.clients: return False
             self.clients[sock].update(muted_until=until, muted_by=by, mute_reason=reason)
         self.mark_stopped_typing(name)
         return True
@@ -1303,27 +1368,25 @@ class Hub:
             if sock and sock in self.clients:
                 self.clients[sock].update(muted_until=0.0, muted_by=None, mute_reason=None)
                 found = True
-            self._purge_expired_ghosts()
-            if name.lower() in self.ghost_mutes:
-                del self.ghost_mutes[name.lower()]
+            self._purge_expired()
+            if self.ghost_mutes.pop(name.lower(), None) is not None:
                 found = True
         return found
 
-    def ban_ip(self, ip, until, by, reason):
+    def check_slowmode(self, name, is_admin) -> float:
+        """Seconds the sender still has to wait (0.0 = free to send, and the
+        send is stamped). Admins and slowmode-off always return 0.0."""
+        if self.slowmode_delay <= 0 or is_admin:
+            return 0.0
+        now, key = time.time(), name.lower()
         with self.lock:
-            self.banned_ips[ip] = {"until": until, "banned_by": by, "reason": reason}
+            remaining = self.slowmode_delay - (now - self.last_msg_time.get(key, 0.0))
+            if remaining > 0:
+                return remaining
+            self.last_msg_time[key] = now
+        return 0.0
 
-    def unban_ip(self, ip):
-        with self.lock:
-            if ip in self.banned_ips:
-                del self.banned_ips[ip]
-                return True
-            return False
-
-    def mark_kicked(self, sock):
-        with self.lock:
-            if sock in self.clients:
-                self.clients[sock]["kicked"] = True
+    # ---- typing ----
 
     def mark_typing(self, name):
         with self.lock: self.typing[name] = time.time()
@@ -1338,29 +1401,68 @@ class Hub:
         with self.lock:
             return [n for n, t in self.typing.items() if now - t <= TYPING_IDLE_TIMEOUT]
 
+    # ---- sending / removing ----
+
+    def mark_kicked(self, sock):
+        with self.lock:
+            if sock in self.clients:
+                self.clients[sock]["kicked"] = True
+
     def broadcast(self, text, exclude_sock=None):
         with self.lock: targets = [s for s in self.clients if s is not exclude_sock]
         for s in targets:
-            try: send_encrypted(s, self.fernet, text)
-            except OSError: pass
+            self.send_private(s, text)
 
     def send_private(self, sock, text):
         try: send_encrypted(sock, self.fernet, text)
         except OSError: pass
 
     def disconnect(self, sock):
+        # shutdown() first: closing a socket from another thread does not wake a
+        # thread blocked in recv() on it, which would leave a ghost session behind.
+        try: sock.shutdown(socket.SHUT_RDWR)
+        except OSError: pass
         try: sock.close()
         except OSError: pass
 
-def build_file_message(sender: str, filepath: str):
+    def eject(self, sock, notice: str, announcement: str):
+        """Tell `sock` why it's leaving, flag it so its handler skips the usual
+        'disconnected' chatter, announce to everyone else, then close it."""
+        self.send_private(sock, notice)
+        self.mark_kicked(sock)
+        self.broadcast(announcement, exclude_sock=sock)
+        self.disconnect(sock)
+
+
+# ---- Files ----
+
+IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp")
+THUMB_SIZE = (260, 260)
+
+def encode_file_message(sender: str, filename: str, data: bytes) -> str:
+    safe_name = filename.replace("|", "_")
+    return FILE_PREFIX + sender + "|" + safe_name + "|" + base64.b64encode(data).decode("ascii")
+
+def build_file_message(sender: str, filepath: str) -> str:
     size = os.path.getsize(filepath)
     if size > MAX_FILE_BYTES:
         raise ValueError(f"File is {size / 1024 / 1024:.1f} MB — the limit is {MAX_FILE_BYTES // 1024 // 1024} MB.")
     with open(filepath, "rb") as f:
-        raw = f.read()
-    filename = os.path.basename(filepath).replace("|", "_")
-    b64data = base64.b64encode(raw).decode("ascii")
-    return FILE_PREFIX + sender + "|" + filename + "|" + b64data
+        data = f.read()
+    return encode_file_message(sender, os.path.basename(filepath), data)
+
+def make_thumbnail(filename: str, data: bytes):
+    """Decodes + shrinks an image in whatever thread calls this (the network
+    thread, normally) so the UI thread only has to wrap the small result."""
+    if Image is None or not filename.lower().endswith(IMAGE_EXTENSIONS):
+        return None
+    try:
+        img = Image.open(io.BytesIO(data))
+        img.thumbnail(THUMB_SIZE)
+        img.load()
+        return img
+    except Exception:
+        return None
 
 def handle_incoming_file(text: str, event_queue: queue.Queue):
     try:
@@ -1370,15 +1472,146 @@ def handle_incoming_file(text: str, event_queue: queue.Queue):
         event_queue.put(("system", "[received a corrupted file, ignored]"))
         return
     safe_name = os.path.basename(filename) or "unnamed_file"
-    event_queue.put(("file", {"sender": sender, "filename": safe_name, "data": raw}))
+    event_queue.put(("file", {"sender": sender, "filename": safe_name, "data": raw, "thumb": make_thumbnail(safe_name, raw)}))
+
+
+# ---- Guest handling (runs on the host, one thread per guest) ----
+
+UNLOCK_PREFIX_TO_SENTINEL = {prefix: sentinel for sentinel, prefix in GRADIENT_UNLOCK_CODES.values()}
+
+def _guest_notice(hub: Hub, sock, text: str):
+    hub.send_private(sock, NOTICE_PREFIX + text)
+
+def _handle_guest_command(text, sock, guest_name, is_admin, hub: Hub, host_name, event_queue):
+    cmd_name, _, arg = text[len(CMD_PREFIX):].partition("|")
+
+    if cmd_name == "color":
+        color = arg.lower()
+        if guest_name.lower() in hub.color_changed_once:
+            _guest_notice(hub, sock, "You can only change your color once during a chat session.")
+        elif color in COLOR_PALETTE:
+            hub.set_color(guest_name, COLOR_PALETTE[color], once=True)
+            _guest_notice(hub, sock, f"Color changed successfully to {color}.")
+            hub.broadcast_colormap()
+            snapshot = hub.colormap_snapshot()
+            event_queue.put(("colormap", snapshot))
+            event_queue.put(("chat", {"raw": f"* {guest_name} changed their color to {color} *", "colors": snapshot}))
+        else:
+            _guest_notice(hub, sock, f"Invalid color. Available: {', '.join(COLOR_PALETTE)}")
+
+    elif cmd_name == "whisper":
+        target_name, _, msg = arg.partition("|")
+        if target_name.lower() == host_name.lower():
+            event_queue.put(("private", f"[Whisper from {guest_name}]: {msg}"))
+            _guest_notice(hub, sock, f"[Whisper to {host_name}]: {msg}")
+            return
+        target_sock = hub.find_socket_by_name(target_name)
+        if target_sock:
+            _guest_notice(hub, target_sock, f"[Whisper from {guest_name}]: {msg}")
+            _guest_notice(hub, sock, f"[Whisper to {target_name}]: {msg}")
+        else:
+            _guest_notice(hub, sock, f"No one named '{target_name}' is connected.")
+
+    elif cmd_name == "mod":
+        if is_admin:
+            run_mod_command(arg, hub, guest_name, lambda t: _guest_notice(hub, sock, t))
+        else:
+            _guest_notice(hub, sock, "You do not have permission to use moderation commands.")
+
+def _ping_from_guest(hub: Hub, sock, guest_name, host_name, raw_text, event_queue):
+    target_name, raw_mention = extract_ping_target(raw_text, hub.names() + [host_name])
+    if not target_name:
+        if raw_mention:
+            _guest_notice(hub, sock, f"No one named '{raw_mention}' is here to ping.")
+        return
+
+    if hub.is_dnd(target_name):
+        _guest_notice(hub, sock, f"{target_name} is on Do Not Disturb — they won't be notified.")
+    elif target_name.lower() == host_name.lower():
+        event_queue.put(("ping", guest_name))
+    else:
+        target_sock = hub.find_socket_by_name(target_name)
+        if target_sock:
+            hub.send_private(target_sock, PING_PREFIX + guest_name)
+
+def _process_guest_message(text, sock, guest_name, hub: Hub, host_name, event_queue):
+    is_admin = guest_name.lower() in hub.admins
+
+    if text.startswith(TYPING_START_PREFIX):
+        if not hub.is_muted(sock):
+            hub.mark_typing(text[len(TYPING_START_PREFIX):])
+            hub.broadcast(text, exclude_sock=sock)
+            event_queue.put(("typing", hub.typing_names()))
+        return
+
+    if text.startswith(TYPING_STOP_PREFIX):
+        hub.mark_stopped_typing(text[len(TYPING_STOP_PREFIX):])
+        hub.broadcast(text, exclude_sock=sock)
+        event_queue.put(("typing", hub.typing_names()))
+        return
+
+    if text.startswith(DND_PREFIX):
+        dname, _, state = text[len(DND_PREFIX):].partition("|")
+        active = state == "on"
+        if hub.set_dnd(dname, active):
+            verb = "turned on" if active else "turned off"
+            hub.broadcast(f"* {dname} {verb} Do Not Disturb *", exclude_sock=sock)
+            event_queue.put(("system", f"{dname} {verb} Do Not Disturb"))
+        return
+
+    for prefix, sentinel in UNLOCK_PREFIX_TO_SENTINEL.items():
+        if text.startswith(prefix):
+            hub.set_gradient(guest_name, sentinel)
+            hub.broadcast_colormap()
+            event_queue.put(("colormap", hub.colormap_snapshot()))
+            return
+
+    if text.startswith(FINGERPRINT_PREFIX):
+        fp = text[len(FINGERPRINT_PREFIX):].strip()
+        hub.set_fingerprint(sock, fp)
+        event_queue.put(("system", f"{guest_name}'s device fingerprint: {fp}"))
+        return
+
+    if text.startswith(CMD_PREFIX):
+        _handle_guest_command(text, sock, guest_name, is_admin, hub, host_name, event_queue)
+        return
+
+    if hub.is_muted(sock):
+        info = hub.get_info(sock)
+        hub.send_private(sock, MUTE_NOTICE_PREFIX + f"You are muted by {info['muted_by']} until {format_time(info['muted_until'])}. Reason: {info['mute_reason']}")
+        return
+
+    if text.startswith(REACT_PREFIX):
+        hub.broadcast(text, exclude_sock=sock)
+        msg_id, _, rest = text[len(REACT_PREFIX):].partition("|")
+        emoji, _, sender = rest.partition("|")
+        event_queue.put(("react", {"msg_id": msg_id, "emoji": emoji, "sender": sender or guest_name}))
+        return
+
+    is_file = text.startswith(FILE_PREFIX)
+    if not (is_file or text.startswith(MSG_PREFIX)):
+        return  # e.g. the "[name left the chat]" courtesy line — nothing to relay
+
+    wait = hub.check_slowmode(guest_name, is_admin)
+    if wait > 0:
+        _guest_notice(hub, sock, f"Slowmode is active! Please wait {wait:.1f} seconds.")
+        return
+
+    if is_file:
+        handle_incoming_file(text, event_queue)
+        hub.broadcast(text, exclude_sock=sock)
+        return
+
+    msg_id, _, raw_text = text[len(MSG_PREFIX):].partition("|")
+    _ping_from_guest(hub, sock, guest_name, host_name, raw_text, event_queue)
+    event_queue.put(("chat", {"raw": raw_text, "colors": hub.colormap_snapshot(), "msg_id": msg_id}))
+    hub.broadcast(text, exclude_sock=sock)
 
 def handle_guest_connection(sock, addr, hub: Hub, host_name: str, event_queue: queue.Queue):
     ban_info = hub.get_ban_info(addr[0])
     if ban_info:
-        until_str = format_time(ban_info["until"])
         reason = ban_info.get("reason") or "no reason given"
-        try: send_encrypted(sock, hub.fernet, BAN_NOTICE_PREFIX + f"{until_str}|{reason}")
-        except Exception: pass
+        hub.send_private(sock, BAN_NOTICE_PREFIX + f"{format_time(ban_info['until'])}|{reason}")
         sock.close()
         return
 
@@ -1392,188 +1625,67 @@ def handle_guest_connection(sock, addr, hub: Hub, host_name: str, event_queue: q
     except (OSError, ConnectionError):
         sock.close()
         return
-        
+
     if not first.startswith(HELLO_PREFIX):
         sock.close()
         return
-    
+
     guest_name = first[len(HELLO_PREFIX):].strip()[:30] or f"Guest@{addr[0]}"
 
-    if hub.is_name_occupied(guest_name) or guest_name.lower() == host_name.lower():
+    if hub.is_name_occupied(guest_name) or hub.is_host(guest_name):
         hub.send_private(sock, NOTICE_PREFIX + "Nickname already in use.")
         sock.close()
         return
 
     with hub.lock:
-        if len(hub.clients) >= MAX_GUESTS:
-            hub.send_private(sock, NOTICE_PREFIX + "[room is full — try again later]")
-            sock.close()
-            return
+        room_full = len(hub.clients) >= MAX_GUESTS
+    if room_full:
+        hub.send_private(sock, NOTICE_PREFIX + "[room is full — try again later]")
+        sock.close()
+        return
 
     hub.add_client(sock, guest_name, addr[0])
-    hub.apply_ghost_ip_mute(sock, addr[0])
-    hub.assign_color(guest_name)
-    
-    if hub.is_muted(sock):
-        info = hub.get_info(sock)
-        hub.send_private(sock, MUTE_STATUS_PREFIX + f"1:{info['muted_until']}")
-    
-    event_queue.put(("system", f"{guest_name} joined from {addr[0]}"))
-    hub.broadcast(f"* {guest_name} joined the chat *", exclude_sock=sock)
-    hub.send_private(sock, ROSTER_PREFIX + ",".join([host_name] + hub.names()))
-    hub.send_private(sock, SLOWMODE_PREFIX + str(hub.slowmode_delay))
-    hub.broadcast(COLORMAP_PREFIX + hub.colormap_string())
-    event_queue.put(("colormap", hub.colormap_snapshot()))
-    event_queue.put(("roster", hub.names()))
 
+    # Everything from here on is inside try/finally so that *any* failure still
+    # removes the guest — otherwise a "ghost" would block the name until restart.
     try:
+        hub.apply_ghost_ip_mute(sock, addr[0])
+        hub.assign_color(guest_name)
+
+        if hub.is_muted(sock):
+            info = hub.get_info(sock)
+            hub.send_private(sock, MUTE_STATUS_PREFIX + f"1:{info['muted_until']}")
+
+        event_queue.put(("system", f"{guest_name} joined from {addr[0]}"))
+        hub.broadcast(f"* {guest_name} joined the chat *", exclude_sock=sock)
+        hub.send_private(sock, ROSTER_PREFIX + ",".join([host_name] + hub.names()))
+        hub.send_private(sock, SLOWMODE_PREFIX + str(hub.slowmode_delay))
+        hub.broadcast_colormap()
+        event_queue.put(("colormap", hub.colormap_snapshot()))
+        event_queue.put(("roster", hub.names()))
+
         while True:
             try: text = recv_message(sock, hub.fernet)
             except InvalidToken: continue
             except (OSError, ConnectionError): break
 
-            is_admin = guest_name.lower() in hub.admins
-
-            if text.startswith(TYPING_START_PREFIX):
-                if hub.is_muted(sock): continue
-                hub.mark_typing(text[len(TYPING_START_PREFIX):])
-                hub.broadcast(text, exclude_sock=sock)
-                event_queue.put(("typing", hub.typing_names()))
-                continue
-
-            elif text.startswith(TYPING_STOP_PREFIX):
-                hub.mark_stopped_typing(text[len(TYPING_STOP_PREFIX):])
-                hub.broadcast(text, exclude_sock=sock)
-                event_queue.put(("typing", hub.typing_names()))
-                continue
-
-            elif text.startswith(DND_PREFIX):
-                dname, _, state = text[len(DND_PREFIX):].partition("|")
-                active = state == "on"
-                if hub.set_dnd(dname, active):
-                    verb = "turned on" if active else "turned off"
-                    hub.broadcast(f"* {dname} {verb} Do Not Disturb *", exclude_sock=sock)
-                    event_queue.put(("system", f"{dname} {verb} Do Not Disturb"))
-                continue
-
-            elif text.startswith(RAINBOW_UNLOCK_PREFIX):
-                hub.set_gradient(guest_name, RAINBOW_SENTINEL)
-                hub.broadcast(COLORMAP_PREFIX + hub.colormap_string())
-                event_queue.put(("colormap", hub.colormap_snapshot()))
-                continue
-
-            elif text.startswith(BLUE_UNLOCK_PREFIX):
-                hub.set_gradient(guest_name, BLUE_SENTINEL)
-                hub.broadcast(COLORMAP_PREFIX + hub.colormap_string())
-                event_queue.put(("colormap", hub.colormap_snapshot()))
-                continue
-
-            elif text.startswith(FINGERPRINT_PREFIX):
-                fp = text[len(FINGERPRINT_PREFIX):].strip()
-                hub.set_fingerprint(sock, fp)
-                event_queue.put(("system", f"{guest_name}'s device fingerprint: {fp}"))
-                continue
-
-            elif text.startswith(CMD_PREFIX):
-                cmd_name, _, arg = text[len(CMD_PREFIX):].partition("|")
-                if cmd_name == "color":
-                    if guest_name.lower() in hub.color_changed_once:
-                        hub.send_private(sock, NOTICE_PREFIX + "You can only change you color once during a chat session.")
-                    elif arg.lower() in COLOR_PALETTE:
-                        hub.colors[guest_name.lower()] = COLOR_PALETTE[arg.lower()]
-                        hub.color_changed_once.add(guest_name.lower())
-                        hub.send_private(sock, NOTICE_PREFIX + f"Color changed successfully to {arg.lower()}.")
-                        hub.broadcast(COLORMAP_PREFIX + hub.colormap_string())
-                        event_queue.put(("colormap", hub.colormap_snapshot()))
-                        event_queue.put(("chat", {"raw": f"* {guest_name} changed their color to {arg.lower()} *", "colors": hub.colormap_snapshot()}))
-                    else:
-                        hub.send_private(sock, NOTICE_PREFIX + f"Invalid color. Available: {', '.join(COLOR_PALETTE.keys())}")
-                elif cmd_name == "whisper":
-                    target_name, _, msg = arg.partition("|")
-                    if target_name.lower() == host_name.lower():
-                        event_queue.put(("private", f"[Whisper from {guest_name}]: {msg}"))
-                        hub.send_private(sock, NOTICE_PREFIX + f"[Whisper to {host_name}]: {msg}")
-                    else:
-                        target_sock = hub.find_socket_by_name(target_name)
-                        if target_sock:
-                            hub.send_private(target_sock, NOTICE_PREFIX + f"[Whisper from {guest_name}]: {msg}")
-                            hub.send_private(sock, NOTICE_PREFIX + f"[Whisper to {target_name}]: {msg}")
-                        else:
-                            hub.send_private(sock, NOTICE_PREFIX + f"No one named '{target_name}' is connected.")
-                elif cmd_name == "mod":
-                    if is_admin:
-                        run_mod_command(arg, hub, guest_name, lambda t: hub.send_private(sock, NOTICE_PREFIX + t))
-                    else:
-                        hub.send_private(sock, NOTICE_PREFIX + "You do not have permission to use moderation commands.")
-                continue
-
-            if hub.is_muted(sock):
-                info = hub.get_info(sock)
-                hub.send_private(sock, MUTE_NOTICE_PREFIX + f"You are muted by {info['muted_by']} until {format_time(info['muted_until'])}. Reason: {info['mute_reason']}")
-                continue
-
-            if text.startswith(FILE_PREFIX):
-                if hub.slowmode_delay > 0 and not is_admin:
-                    now = time.time()
-                    last_t = hub.last_msg_time.get(guest_name.lower(), 0.0)
-                    if now - last_t < hub.slowmode_delay:
-                        rem = hub.slowmode_delay - (now - last_t)
-                        hub.send_private(sock, NOTICE_PREFIX + f"Slowmode is active! Please wait {rem:.1f} seconds.")
-                        continue
-                    hub.last_msg_time[guest_name.lower()] = now
-
-                handle_incoming_file(text, event_queue)
-                hub.broadcast(text, exclude_sock=sock)
-                continue
-
-            elif text.startswith(REACT_PREFIX):
-                hub.broadcast(text, exclude_sock=sock)
-                msg_id, _, rest = text[len(REACT_PREFIX):].partition("|")
-                emoji, _, sender = rest.partition("|")
-                event_queue.put(("react", {"msg_id": msg_id, "emoji": emoji, "sender": sender or guest_name}))
-                continue
-
-            elif text.startswith(MSG_PREFIX):
-                if hub.slowmode_delay > 0 and not is_admin:
-                    now = time.time()
-                    last_t = hub.last_msg_time.get(guest_name.lower(), 0.0)
-                    if now - last_t < hub.slowmode_delay:
-                        rem = hub.slowmode_delay - (now - last_t)
-                        hub.send_private(sock, NOTICE_PREFIX + f"Slowmode is active! Please wait {rem:.1f} seconds.")
-                        continue
-                    hub.last_msg_time[guest_name.lower()] = now
-
-                msg_id, _, raw_text = text[len(MSG_PREFIX):].partition("|")
-
-                target_name, raw_mention = extract_ping_target(raw_text, hub.names() + [host_name])
-                if target_name:
-                    if target_name.lower() == host_name.lower():
-                        if hub.is_dnd(host_name): hub.send_private(sock, NOTICE_PREFIX + f"{host_name} is on Do Not Disturb — they won't be notified.")
-                        else: event_queue.put(("ping", guest_name))
-                    else:
-                        target_sock = hub.find_socket_by_name(target_name)
-                        if target_sock:
-                            if hub.is_dnd(target_name): hub.send_private(sock, NOTICE_PREFIX + f"{target_name} is on Do Not Disturb — they won't be notified.")
-                            else: hub.send_private(target_sock, PING_PREFIX + guest_name)
-                elif raw_mention:
-                    hub.send_private(sock, NOTICE_PREFIX + f"No one named '{raw_mention}' is here to ping.")
-
-                event_queue.put(("chat", {"raw": raw_text, "colors": hub.colormap_snapshot(), "msg_id": msg_id}))
-                hub.broadcast(text, exclude_sock=sock)
-
+            try:
+                _process_guest_message(text, sock, guest_name, hub, host_name, event_queue)
+            except Exception:
+                traceback.print_exc()  # one bad message must never end the guest's session
     finally:
         info = hub.remove_client(sock)
         hub.free_color(guest_name)
         try: sock.close()
         except OSError: pass
-        name = info["name"] if info else guest_name
-        if not (info and info.get("kicked")):
-            event_queue.put(("system", f"{name} disconnected"))
-            hub.broadcast(f"* {name} left the chat *", exclude_sock=sock)
-            hub.broadcast(COLORMAP_PREFIX + hub.colormap_string())
-            event_queue.put(("colormap", hub.colormap_snapshot()))
-        event_queue.put(("roster", hub.names()))
-
+        if not hub.closed:
+            name = info["name"] if info else guest_name
+            if not (info and info.get("kicked")):
+                event_queue.put(("system", f"{name} disconnected"))
+                hub.broadcast(f"* {name} left the chat *", exclude_sock=sock)
+                hub.broadcast_colormap()
+                event_queue.put(("colormap", hub.colormap_snapshot()))
+            event_queue.put(("roster", hub.names()))
 
 
 def host_accept_loop(server: socket.socket, hub: Hub, host_name: str, event_queue: queue.Queue):
@@ -1583,382 +1695,342 @@ def host_accept_loop(server: socket.socket, hub: Hub, host_name: str, event_queu
         threading.Thread(target=handle_guest_connection, args=(conn, addr, hub, host_name, event_queue), daemon=True).start()
 
 
+# ---- Slash commands ----
+
 HELP_TEXT = (
     "Commands: /mute <name> <min> [reason], /unmute <name>, /kick <name> [reason], "
     "/ban <name> [min|perm] [reason], /unban <ip>, /slowmode [sec], /admin <name>, /unadmin <name>, "
-    "/color <name>, /colors, /list, /clear [lines], /whisper <name> <msg>, /help"
+    "/color <name>, /colors, /list, /clear [lines], /whisper <name> <msg>, /help — "
+    "host only: /ipban <ip> [min|perm] [reason]"
 )
 
+PERMANENT_WORDS = ("perm", "indefinite", "0", "infinite")
+
+def parse_ban_args(parts: list) -> tuple:
+    """`parts` = [target, duration?, reason?] -> (until_timestamp, reason).
+    A duration that isn't a number or a 'permanent' word is treated as the
+    start of the reason, with the ban permanent."""
+    dur = parts[1].lower() if len(parts) > 1 else "perm"
+    reason = parts[2] if len(parts) > 2 else ""
+    if dur in PERMANENT_WORDS:
+        until = float("inf")
+    else:
+        try:
+            until = time.time() + float(dur) * 60
+        except ValueError:
+            until = float("inf")
+            reason = f"{dur} {reason}".strip()
+    return until, reason or "no reason given"
+
+def _cmd_help(arg, hub, me, reply):
+    reply(HELP_TEXT)
+
+def _cmd_list(arg, hub, me, reply):
+    names = hub.names()
+    reply("Connected: " + (", ".join(names) if names else "(no one yet)"))
+
+def _cmd_colors(arg, hub, me, reply):
+    reply("Available colors: " + ", ".join(COLOR_PALETTE))
+
+def _cmd_color(arg, hub, me, reply):
+    color = arg.lower()
+    is_host = hub.is_host(me)
+    if not color:
+        reply("Usage: /color <name> — see /colors")
+    elif not is_host and me.lower() in hub.color_changed_once:
+        reply("You can only change your color once in one chat session.")
+    elif color in COLOR_PALETTE:
+        hub.set_color(me, COLOR_PALETTE[color], once=not is_host)
+        hub.broadcast_colormap()
+        reply(f"Color changed successfully to {color}.")
+    else:
+        reply(f"Invalid color. Available: {', '.join(COLOR_PALETTE)}")
+
+def _cmd_whisper(arg, hub, me, reply):
+    parts = arg.split(maxsplit=1)
+    if len(parts) < 2:
+        return reply("Usage: /whisper <name> <message>")
+    target_name, wmsg = parts
+    if target_name.lower() == me.lower():
+        return reply("You cannot whisper to yourself!")
+    target_sock = hub.find_socket_by_name(target_name)
+    if not target_sock:
+        return reply(f"No one named '{target_name}' is connected.")
+    _guest_notice(hub, target_sock, f"[Whisper from {me}]: {wmsg}")
+    reply(f"[Whisper to {target_name}]: {wmsg}")
+
+def _cmd_admin(arg, hub, me, reply):
+    if not arg: return reply("Usage: /admin <name>")
+    if hub.is_host(arg): return reply("You cannot admin the host.")
+    target_sock = hub.find_socket_by_name(arg)
+    if not target_sock:
+        return reply(f"No one named '{arg}' is connected.")
+    hub.admins.add(arg.lower())
+    hub.send_private(target_sock, ADMIN_NOTICE_PREFIX + "1")
+    hub.broadcast(f"* {arg} is now an admin *")
+    hub.log_admin_action(me, f"granted admin privileges to {arg}.")
+    reply(f"Granted admin privileges to {arg}.")
+
+def _cmd_unadmin(arg, hub, me, reply):
+    if not arg: return reply("Usage: /unadmin <name>")
+    if hub.is_host(arg): return reply("You cannot unadmin the host.")
+    if arg.lower() not in hub.admins:
+        return reply(f"'{arg}' is not an admin.")
+    hub.admins.discard(arg.lower())
+    target_sock = hub.find_socket_by_name(arg)
+    if target_sock:
+        hub.send_private(target_sock, ADMIN_NOTICE_PREFIX + "0")
+    hub.broadcast(f"* {arg} is no longer an admin *")
+    hub.log_admin_action(me, f"revoked admin privileges from {arg}.")
+    reply(f"Revoked admin privileges from {arg}.")
+
+def _cmd_slowmode(arg, hub, me, reply):
+    if not arg:
+        hub.slowmode_delay = 0.0 if hub.slowmode_delay > 0 else 2.0
+    else:
+        try: hub.slowmode_delay = max(0.0, float(arg))
+        except ValueError:
+            return reply("Usage: /slowmode [seconds]")
+    status = f"set to {hub.slowmode_delay:g}s" if hub.slowmode_delay > 0 else "disabled"
+    hub.broadcast(f"* Slowmode has been {status} *")
+    hub.broadcast(SLOWMODE_PREFIX + str(hub.slowmode_delay))
+    hub.log_admin_action(me, f"set slowmode to {hub.slowmode_delay:g}s.")
+    reply(f"Slowmode has been {status}.")
+
+def _cmd_ban(arg, hub, me, reply):
+    parts = arg.split(maxsplit=2)
+    if not parts: return reply("Usage: /ban <name> [minutes|perm] [reason]")
+    name = parts[0]
+    if hub.is_host(name): return reply("You cannot ban the host.")
+    target = hub.find_socket_by_name(name)
+    if not target:
+        return reply(f"No one named '{name}' is connected.")
+
+    until, reason = parse_ban_args(parts)
+    ip = hub.get_info(target).get("ip")
+    if ip: hub.ban_ip(ip, until, me, reason)
+    until_str = format_time(until)
+    hub.eject(target, BAN_NOTICE_PREFIX + f"{until_str}|{reason}", f"* {name} has been IP banned *")
+    hub.log_admin_action(me, f"banned {name} ({ip}) until {until_str}. Reason: {reason}")
+    reply(f"Banned {name} ({ip}) until {until_str}. Reason: {reason}")
+
+def _cmd_ipban(arg, hub, me, reply):
+    if not hub.is_host(me): return reply("Only the host can use /ipban.")
+    parts = arg.split(maxsplit=2)
+    if not parts: return reply("Usage: /ipban <ip> [minutes|perm] [reason]")
+    ip = parts[0].strip()
+    until, reason = parse_ban_args(parts)
+    hub.ban_ip(ip, until, me, reason)
+    until_str = format_time(until)
+
+    # If someone is connected from that IP right now (under any name), kick
+    # them too — otherwise the ban only bites on their next connection attempt.
+    target = hub.find_socket_by_ip(ip)
+    if target:
+        target_name = hub.get_info(target).get("name", "someone")
+        hub.eject(target, BAN_NOTICE_PREFIX + f"{until_str}|{reason}", f"* {target_name} has been IP banned *")
+
+    hub.log_admin_action(me, f"IP-banned {ip} directly until {until_str}. Reason: {reason}")
+    reply(f"IP {ip} banned until {until_str}. Reason: {reason}")
+
+def _cmd_unban(arg, hub, me, reply):
+    if not arg: return reply("Usage: /unban <ip>")
+    if not hub.unban_ip(arg):
+        return reply(f"IP '{arg}' is not currently banned.")
+    hub.broadcast(f"* IP {arg} has been unbanned *")
+    hub.log_admin_action(me, f"unbanned IP: {arg}")
+    reply(f"Unbanned IP: {arg}")
+
+def _cmd_mute(arg, hub, me, reply):
+    parts = arg.split(maxsplit=2)
+    if len(parts) < 2: return reply("Usage: /mute <name> <minutes> [reason]")
+    name = parts[0]
+    if hub.is_host(name): return reply("You cannot mute the host.")
+    try: minutes = float(parts[1])
+    except ValueError:
+        return reply("Usage: /mute <name> <minutes> [reason]")
+    reason = parts[2] if len(parts) > 2 else "no reason given"
+    until = time.time() + minutes * 60
+    if not hub.mute(name, until, me, reason):
+        return reply(f"No one named '{name}' is connected.")
+
+    hub.broadcast(f"* {name} has been muted *")
+    target_sock = hub.find_socket_by_name(name)
+    if target_sock:
+        hub.send_private(target_sock, MUTE_NOTICE_PREFIX + f"You were muted by {me} for {minutes:g} minute(s). Reason: {reason}")
+        hub.send_private(target_sock, MUTE_STATUS_PREFIX + f"1:{until}")
+    hub.log_admin_action(me, f"muted {name} for {minutes:g} min. Reason: {reason}")
+    reply(f"Muted {name} for {minutes:g} min until {format_time(until)}. Reason: {reason}")
+
+def _cmd_unmute(arg, hub, me, reply):
+    if not arg: return reply("Usage: /unmute <name>")
+    if hub.is_host(arg): return reply("You cannot unmute the host.")
+    target_sock = hub.find_socket_by_name(arg)
+    if not hub.unmute(arg):
+        return reply(f"No one named '{arg}' is connected or muted.")
+    hub.broadcast(f"* {arg} has been unmuted *")
+    if target_sock:
+        hub.send_private(target_sock, MUTE_STATUS_PREFIX + "0")
+    hub.log_admin_action(me, f"unmuted {arg}.")
+    reply(f"Unmuted {arg}.")
+
+def _cmd_kick(arg, hub, me, reply):
+    parts = arg.split(maxsplit=1)
+    if not parts: return reply("Usage: /kick <name> [reason]")
+    name = parts[0]
+    if hub.is_host(name): return reply("You cannot kick the host.")
+    reason = parts[1] if len(parts) > 1 else "no reason given"
+    target = hub.find_socket_by_name(name)
+    if not target:
+        return reply(f"No one named '{name}' is connected.")
+    hub.eject(target, KICK_NOTICE_PREFIX + f"{me}|{reason}", f"* {name} has been kicked *")
+    hub.log_admin_action(me, f"kicked {name}. Reason: {reason}")
+    reply(f"Kicked {name}. Reason: {reason}")
+
+COMMAND_HANDLERS = {
+    "/help": _cmd_help, "/list": _cmd_list, "/colors": _cmd_colors, "/color": _cmd_color,
+    "/whisper": _cmd_whisper, "/admin": _cmd_admin, "/unadmin": _cmd_unadmin,
+    "/slowmode": _cmd_slowmode, "/ban": _cmd_ban, "/ipban": _cmd_ipban, "/unban": _cmd_unban,
+    "/mute": _cmd_mute, "/unmute": _cmd_unmute, "/kick": _cmd_kick,
+}
+# Commands a guest may only send if the host has made them an admin.
+MOD_COMMAND_NAMES = frozenset({"/mute", "/unmute", "/kick", "/ban", "/unban", "/ipban", "/slowmode", "/admin", "/unadmin"})
 
 def run_mod_command(msg: str, hub: Hub, my_name: str, reply_func) -> bool:
-    stripped = msg.strip()
+    """Runs a slash command against the hub. Returns False if `msg` isn't one
+    of ours (so the caller should treat it as ordinary chat)."""
+    name, _, arg = msg.strip().partition(" ")
+    handler = COMMAND_HANDLERS.get(name.lower())
+    if handler is None:
+        return False
+    handler(arg.strip(), hub, my_name, reply_func)
+    return True
 
-    if stripped == "/help":
-        reply_func(HELP_TEXT)
-        return True
 
-    if stripped == "/list":
-        names = hub.names()
-        reply_func("Connected: " + (", ".join(names) if names else "(no one yet)"))
-        return True
+# ---- Guest-side receive loop ----
 
-    if stripped == "/colors":
-        reply_func("Available colors: " + ", ".join(COLOR_PALETTE.keys()))
-        return True
+# prefix -> UI event kind, for messages that need no processing beyond stripping the prefix
+GUEST_SIMPLE_EVENTS = (
+    (PING_PREFIX, "ping"),
+    (ADMIN_NOTICE_PREFIX, "admin_status"),
+    (ADMIN_LOG_PREFIX, "system"),
+    (MUTE_STATUS_PREFIX, "mute_status"),
+    (MUTE_NOTICE_PREFIX, "private"),
+    (NOTICE_PREFIX, "private"),
+)
+LEAVE_PATTERN = re.compile(r"^\* (.+?) (?:left the chat|has been kicked|has been IP banned) \*$")
+JOIN_PATTERN = re.compile(r"^\* (.+?) joined the chat \*$")
 
-    if stripped.startswith("/color "):
-        color = stripped[len("/color "):].strip().lower()
-        is_host = my_name.lower() == hub.host_name.lower()
-        if not is_host and my_name.lower() in hub.color_changed_once:
-            reply_func("You can only change your color once in one chat session.")
-        elif color in COLOR_PALETTE:
-            hub.colors[my_name.lower()] = COLOR_PALETTE[color]
-            if not is_host:
-                hub.color_changed_once.add(my_name.lower())
-            hub.broadcast(COLORMAP_PREFIX + hub.colormap_string())
-            reply_func(f"Color changed successfully to {color}.")
-        else:
-            reply_func(f"Invalid color. Available: {', '.join(COLOR_PALETTE.keys())}")
-        return True
-
-    if stripped.startswith("/whisper "):
-        parts = stripped[len("/whisper "):].split(maxsplit=1)
-        if len(parts) < 2:
-            reply_func("Usage: /whisper <name> <message>")
-            return True
-        target_name, wmsg = parts[0], parts[1]
-        if target_name.lower() == my_name.lower():
-            reply_func("You cannot whisper to yourself!")
-            return True
-        target_sock = hub.find_socket_by_name(target_name)
-        if not target_sock:
-            reply_func(f"No one named '{target_name}' is connected.")
-            return True
-        hub.send_private(target_sock, NOTICE_PREFIX + f"[Whisper from {my_name}]: {wmsg}")
-        reply_func(f"[Whisper to {target_name}]: {wmsg}")
-        return True
-
-    if stripped.startswith("/admin "):
-        target = stripped[len("/admin "):].strip()
-        if target.lower() == hub.host_name.lower():
-            reply_func("You cannot admin the host.")
-            return True
-        target_sock = hub.find_socket_by_name(target)
-        if target_sock:
-            hub.admins.add(target.lower())
-            hub.send_private(target_sock, ADMIN_NOTICE_PREFIX + "1")
-            hub.broadcast(f"* {target} is now an admin *")
-            hub.log_admin_action(my_name, f"granted admin privileges to {target}.")
-            reply_func(f"Granted admin privileges to {target}.")
-        else:
-            reply_func(f"No one named '{target}' is connected.")
-        return True
-
-    if stripped.startswith("/unadmin "):
-        target = stripped[len("/unadmin "):].strip()
-        if target.lower() == hub.host_name.lower():
-            reply_func("You cannot unadmin the host.")
-            return True
-        if target.lower() in hub.admins:
-            hub.admins.remove(target.lower())
-            target_sock = hub.find_socket_by_name(target)
-            if target_sock:
-                hub.send_private(target_sock, ADMIN_NOTICE_PREFIX + "0")
-            hub.broadcast(f"* {target} is no longer an admin *")
-            hub.log_admin_action(my_name, f"revoked admin privileges from {target}.")
-            reply_func(f"Revoked admin privileges from {target}.")
-        else:
-            reply_func(f"'{target}' is not an admin.")
-        return True
-
-    if stripped.startswith("/slowmode"):
-        arg = stripped[len("/slowmode"):].strip()
-        if not arg:
-            hub.slowmode_delay = 0.0 if hub.slowmode_delay > 0 else 2.0
-        else:
-            try: hub.slowmode_delay = max(0.0, float(arg))
-            except ValueError:
-                reply_func("Usage: /slowmode [seconds]")
-                return True
-        status = f"set to {hub.slowmode_delay:g}s" if hub.slowmode_delay > 0 else "disabled"
-        hub.broadcast(f"* Slowmode has been {status} *")
-        hub.broadcast(SLOWMODE_PREFIX + str(hub.slowmode_delay))
-        hub.log_admin_action(my_name, f"set slowmode to {hub.slowmode_delay:g}s.")
-        reply_func(f"Slowmode has been {status}.")
-        return True
-
-    if stripped.startswith("/ban "):
-        parts = stripped[len("/ban "):].split(maxsplit=2)
-        if not parts:
-            reply_func("Usage: /ban <name> [minutes|perm] [reason]")
-            return True
-        name = parts[0]
-        if name.lower() == hub.host_name.lower():
-            reply_func("You cannot ban the host.")
-            return True
-        dur_str = parts[1].lower() if len(parts) > 1 else "perm"
-        reason = parts[2] if len(parts) > 2 else "no reason given"
-        
-        if dur_str in ("perm", "indefinite", "0", "infinite"): until = float('inf')
-        else:
-            try: until = time.time() + float(dur_str) * 60
-            except ValueError:
-                until = float('inf')
-                reason = f"{dur_str} {reason}".strip()
-
-        target_sock = hub.find_socket_by_name(name)
-        if not target_sock:
-            reply_func(f"No one named '{name}' is connected.")
-            return True
-        
-        info = hub.get_info(target_sock)
-        ip = info.get("ip")
-        if ip: hub.ban_ip(ip, until, my_name, reason)
-
-        until_str = format_time(until)
-        hub.send_private(target_sock, BAN_NOTICE_PREFIX + f"{until_str}|{reason}")
-        hub.mark_kicked(target_sock)
-        hub.broadcast(f"* {name} has been IP banned *", exclude_sock=target_sock)
-        hub.disconnect(target_sock)
-        
-        hub.log_admin_action(my_name, f"banned {name} ({ip}) until {until_str}. Reason: {reason}")
-        reply_func(f"Banned {name} ({ip}) until {until_str}. Reason: {reason}")
-        return True
-
-    if stripped.startswith("/ipban "):
-        if my_name.lower() != hub.host_name.lower():
-            reply_func("Only the host can use /ipban.")
-            return True
-        parts = stripped[len("/ipban "):].split(maxsplit=2)
-        if not parts:
-            reply_func("Usage: /ipban <ip> [minutes|perm] [reason]")
-            return True
-        ip = parts[0].strip()
-        dur_str = parts[1].lower() if len(parts) > 1 else "perm"
-        reason = parts[2] if len(parts) > 2 else "no reason given"
-
-        if dur_str in ("perm", "indefinite", "0", "infinite"): until = float('inf')
-        else:
-            try: until = time.time() + float(dur_str) * 60
-            except ValueError:
-                until = float('inf')
-                reason = f"{dur_str} {reason}".strip()
-
-        hub.ban_ip(ip, until, my_name, reason)
-        until_str = format_time(until)
-
-        # If someone happens to be connected from that IP right now
-        # (even under a different name than any live /ban target),
-        # kick them too — otherwise this only takes effect on their
-        # next connection attempt.
-        target_sock = hub.find_socket_by_ip(ip)
-        if target_sock:
-            target_info = hub.get_info(target_sock)
-            target_name = target_info.get("name", "someone") if target_info else "someone"
-            hub.send_private(target_sock, BAN_NOTICE_PREFIX + f"{until_str}|{reason}")
-            hub.mark_kicked(target_sock)
-            hub.broadcast(f"* {target_name} has been IP banned *", exclude_sock=target_sock)
-            hub.disconnect(target_sock)
-
-        hub.log_admin_action(my_name, f"IP-banned {ip} directly until {until_str}. Reason: {reason}")
-        reply_func(f"IP {ip} banned until {until_str}. Reason: {reason}")
-        return True
-
-    if stripped.startswith("/unban "):
-        ip = stripped[len("/unban "):].strip()
-        if not ip:
-            reply_func("Usage: /unban <ip>")
-            return True
-        if hub.unban_ip(ip):
-            hub.broadcast(f"* IP {ip} has been unbanned *")
-            hub.log_admin_action(my_name, f"unbanned IP: {ip}")
-            reply_func(f"Unbanned IP: {ip}")
-        else:
-            reply_func(f"IP '{ip}' is not currently banned.")
-        return True
-
-    if stripped.startswith("/mute "):
-        parts = stripped[len("/mute "):].split(maxsplit=2)
-        if len(parts) < 2:
-            reply_func("Usage: /mute <name> <minutes> [reason]")
-            return True
-        name, minutes_str = parts[0], parts[1]
-        if name.lower() == hub.host_name.lower():
-            reply_func("You cannot mute the host.")
-            return True
-        reason = parts[2] if len(parts) > 2 else "no reason given"
-        try: minutes = float(minutes_str)
-        except ValueError:
-            reply_func("Usage: /mute <name> <minutes> [reason]")
-            return True
-        until = time.time() + minutes * 60
-        if not hub.mute(name, until, my_name, reason):
-            reply_func(f"No one named '{name}' is connected.")
-            return True
-            
-        hub.broadcast(f"* {name} has been muted *")
-        target_sock = hub.find_socket_by_name(name)
-        if target_sock:
-            hub.send_private(target_sock, MUTE_NOTICE_PREFIX + f"You were muted by {my_name} for {minutes:g} minute(s). Reason: {reason}")
-            hub.send_private(target_sock, MUTE_STATUS_PREFIX + f"1:{until}")
-            
-        hub.log_admin_action(my_name, f"muted {name} for {minutes:g} min. Reason: {reason}")
-        reply_func(f"Muted {name} for {minutes:g} min until {format_time(until)}. Reason: {reason}")
-        return True
-
-    if stripped.startswith("/unmute "):
-        name = stripped[len("/unmute "):].strip()
-        if name.lower() == hub.host_name.lower():
-            reply_func("You cannot unmute the host.")
-            return True
-        target_sock = hub.find_socket_by_name(name)
-        if not hub.unmute(name):
-            reply_func(f"No one named '{name}' is connected or muted.")
-            return True
-        hub.broadcast(f"* {name} has been unmuted *")
-        if target_sock:
-            hub.send_private(target_sock, MUTE_STATUS_PREFIX + "0")
-        
-        hub.log_admin_action(my_name, f"unmuted {name}.")
-        reply_func(f"Unmuted {name}.")
-        return True
-
-    if stripped.startswith("/kick "):
-        parts = stripped[len("/kick "):].split(maxsplit=1)
-        name = parts[0] if parts else ""
-        if name.lower() == hub.host_name.lower():
-            reply_func("You cannot kick the host.")
-            return True
-        reason = parts[1] if len(parts) > 1 else "no reason given"
-        target = hub.find_socket_by_name(name)
-        if not target:
-            reply_func(f"No one named '{name}' is connected.")
-            return True
-            
-        hub.send_private(target, KICK_NOTICE_PREFIX + f"{my_name}|{reason}")
-        hub.mark_kicked(target)
-        hub.broadcast(f"* {name} has been kicked *", exclude_sock=target)
-        hub.disconnect(target)
-        
-        hub.log_admin_action(my_name, f"kicked {name}. Reason: {reason}")
-        reply_func(f"Kicked {name}. Reason: {reason}")
-        return True
-
-    return False
-
-def guest_recv_loop(sock: socket.socket, fernet: Fernet, event_queue: queue.Queue, local_colors: dict, colors_lock: threading.Lock, known_names: set, host_ip: str = ""):
+def guest_recv_loop(sock, fernet, event_queue, local_colors, colors_lock, known_names, host_ip, closing):
     typing_names = set()
+    put = event_queue.put
+
+    def handle(text) -> bool:
+        """Returns False when the session is over."""
+        if text.startswith(TYPING_START_PREFIX):
+            typing_names.add(text[len(TYPING_START_PREFIX):])
+            put(("typing", list(typing_names)))
+            return True
+        if text.startswith(TYPING_STOP_PREFIX):
+            typing_names.discard(text[len(TYPING_STOP_PREFIX):])
+            put(("typing", list(typing_names)))
+            return True
+
+        for prefix, kind in GUEST_SIMPLE_EVENTS:
+            if text.startswith(prefix):
+                put((kind, text[len(prefix):]))
+                return True
+
+        if text.startswith(SLOWMODE_PREFIX):
+            try: put(("slowmode", float(text[len(SLOWMODE_PREFIX):])))
+            except ValueError: pass
+            return True
+        if text.startswith(BAN_NOTICE_PREFIX):
+            until_str, _, reason = text[len(BAN_NOTICE_PREFIX):].partition("|")
+            put(("disconnected", f"You were banned from the chat hosted by {host_ip} until {until_str}. Reason: {reason}"))
+            return False
+        if text.startswith(KICK_NOTICE_PREFIX):
+            by, _, reason = text[len(KICK_NOTICE_PREFIX):].partition("|")
+            put(("disconnected", f"You were kicked by {by}. Reason: {reason}"))
+            return False
+        if text.startswith(HOST_DISCONNECT_PREFIX):
+            put(("disconnected", "Host disconnected."))
+            return False
+        if text.startswith(ROSTER_PREFIX):
+            known_names.update(n.strip() for n in text[len(ROSTER_PREFIX):].split(",") if n.strip())
+            put(("roster", sorted(known_names)))
+            return True
+        if text.startswith(COLORMAP_PREFIX):
+            new_map = dict(pair.split("=", 1) for pair in text[len(COLORMAP_PREFIX):].split(",") if "=" in pair)
+            with colors_lock:
+                local_colors.clear()
+                local_colors.update(new_map)
+            put(("colormap", dict(new_map)))
+            return True
+        if text.startswith(FILE_PREFIX):
+            handle_incoming_file(text, event_queue)
+            return True
+        if text.startswith(REACT_PREFIX):
+            msg_id, _, rest = text[len(REACT_PREFIX):].partition("|")
+            emoji, _, sender = rest.partition("|")
+            put(("react", {"msg_id": msg_id, "emoji": emoji, "sender": sender}))
+            return True
+
+        msg_id = None
+        if text.startswith(MSG_PREFIX):
+            msg_id, _, text = text[len(MSG_PREFIX):].partition("|")
+
+        if m := JOIN_PATTERN.match(text):
+            known_names.add(m.group(1))
+            put(("roster", sorted(known_names)))
+        elif m := LEAVE_PATTERN.match(text):
+            known_names.discard(m.group(1))
+            put(("roster", sorted(known_names)))
+        elif m := re.match(r"^(.+?): ", text):
+            known_names.add(m.group(1))
+
+        with colors_lock:
+            colors_copy = dict(local_colors)
+        put(("chat", {"raw": text, "colors": colors_copy, "msg_id": msg_id}))
+        return True
 
     while True:
         try: text = recv_message(sock, fernet)
         except InvalidToken:
-            event_queue.put(("system", "[received a message that failed to decrypt — key mismatch?]"))
+            put(("system", "[received a message that failed to decrypt — key mismatch?]"))
             continue
         except (OSError, ConnectionError):
-            event_queue.put(("disconnected", "Disconnected from host."))
+            if not closing.is_set():  # a deliberate Disconnect isn't an error worth reporting
+                put(("disconnected", "Disconnected from host."))
             break
 
-        if text.startswith(TYPING_START_PREFIX):
-            typing_names.add(text[len(TYPING_START_PREFIX):])
-            event_queue.put(("typing", list(typing_names)))
-            continue
-        elif text.startswith(TYPING_STOP_PREFIX):
-            typing_names.discard(text[len(TYPING_STOP_PREFIX):])
-            event_queue.put(("typing", list(typing_names)))
-            continue
-        elif text.startswith(PING_PREFIX):
-            event_queue.put(("ping", text[len(PING_PREFIX):]))
-            continue
-        elif text.startswith(ADMIN_NOTICE_PREFIX):
-            event_queue.put(("admin_status", text[len(ADMIN_NOTICE_PREFIX):]))
-            continue
-        elif text.startswith(ADMIN_LOG_PREFIX):
-            event_queue.put(("system", text[len(ADMIN_LOG_PREFIX):]))
-            continue
-        elif text.startswith(SLOWMODE_PREFIX):
-            event_queue.put(("slowmode", float(text[len(SLOWMODE_PREFIX):])))
-            continue
-        elif text.startswith(BAN_NOTICE_PREFIX):
-            until_str, _, reason = text[len(BAN_NOTICE_PREFIX):].partition("|")
-            event_queue.put(("disconnected", f"You were banned from the chat hosted by {host_ip} until {until_str}. Reason: {reason}"))
-            break
-        elif text.startswith(KICK_NOTICE_PREFIX):
-            by, _, reason = text[len(KICK_NOTICE_PREFIX):].partition("|")
-            event_queue.put(("disconnected", f"You were kicked by {by}. Reason: {reason}"))
-            break
-        elif text.startswith(MUTE_STATUS_PREFIX):
-            event_queue.put(("mute_status", text[len(MUTE_STATUS_PREFIX):]))
-            continue
-        elif text.startswith(MUTE_NOTICE_PREFIX):
-            event_queue.put(("private", text[len(MUTE_NOTICE_PREFIX):]))
-            continue
-        elif text.startswith(NOTICE_PREFIX):
-            event_queue.put(("private", text[len(NOTICE_PREFIX):]))
-            continue
-        elif text.startswith(ROSTER_PREFIX):
-            for n in text[len(ROSTER_PREFIX):].split(","):
-                if n.strip(): known_names.add(n.strip())
-            event_queue.put(("roster", sorted(known_names)))
-            continue
-        elif text.startswith(COLORMAP_PREFIX):
-            new_map = {}
-            for pair in text[len(COLORMAP_PREFIX):].split(","):
-                if "=" in pair:
-                    n, c = pair.split("=", 1)
-                    new_map[n] = c
-            with colors_lock:
-                local_colors.clear()
-                local_colors.update(new_map)
-            event_queue.put(("colormap", dict(new_map)))
-            continue
-        elif text.startswith(HOST_DISCONNECT_PREFIX):
-            event_queue.put(("disconnected", "Host disconnected."))
-            break
-        elif text.startswith(FILE_PREFIX):
-            handle_incoming_file(text, event_queue)
-            continue
-        elif text.startswith(REACT_PREFIX):
-            msg_id, _, rest = text[len(REACT_PREFIX):].partition("|")
-            emoji, _, sender = rest.partition("|")
-            event_queue.put(("react", {"msg_id": msg_id, "emoji": emoji, "sender": sender}))
-            continue
+        try:
+            if not handle(text):
+                break
+        except Exception:
+            traceback.print_exc()  # a malformed message must not kill the receive thread
 
-        if text.startswith(MSG_PREFIX):
-            msg_id, _, text = text[len(MSG_PREFIX):].partition("|")
-        else:
-            msg_id = None
 
-        m = re.match(r"^\* (.+?) joined the chat \*$", text)
-        if m:
-            known_names.add(m.group(1))
-            event_queue.put(("roster", sorted(known_names)))
-        else:
-            m = re.match(r"^(.+?): ", text)
-            if m: known_names.add(m.group(1))
-
-        with colors_lock:
-            colors_copy = dict(local_colors)
-        event_queue.put(("chat", {"raw": text, "colors": colors_copy, "msg_id": msg_id}))
-
+# ---- Connections ----
 
 class HostConnection:
     def __init__(self, name, room_code, fernet, event_queue):
         self.name = name
         self.fernet = fernet
         self.event_queue = event_queue
-        
+
         self.hub = Hub(
-            fernet, name, 
+            fernet, name,
             on_typing_change=lambda: event_queue.put(("typing", self.hub.typing_names())),
-            on_admin_log=lambda msg: event_queue.put(("system", msg))
+            on_admin_log=lambda msg: event_queue.put(("system", msg)),
         )
-        
+
         self.server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.server.bind(("0.0.0.0", 0)) 
+        self.server.bind(("0.0.0.0", 0))
         self.tcp_port = self.server.getsockname()[1]
         self.server.listen(MAX_GUESTS)
-        
+
         self.stop_event = threading.Event()
 
         threading.Thread(target=self._udp_discovery_loop, args=(room_code,), daemon=True).start()
@@ -1966,23 +2038,32 @@ class HostConnection:
 
     def _udp_discovery_loop(self, room_code):
         udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        udp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        udp_sock.bind(("", DISCOVERY_PORT))
+        try:
+            udp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            udp_sock.bind(("", DISCOVERY_PORT))
+        except OSError as e:
+            udp_sock.close()
+            self.event_queue.put(("system", f"Room Code lookup is unavailable ({e}) — guests will need to enter your IP:port instead."))
+            return
         udp_sock.settimeout(1.0)
-        
+        expected = f"DISCOVER:{room_code}"
+        offer = f"OFFER:{self.tcp_port}".encode("utf-8")
+
         while not self.stop_event.is_set():
             try:
                 data, addr = udp_sock.recvfrom(1024)
-                if data.decode('utf-8') == f"DISCOVER:{room_code}":
-                    udp_sock.sendto(f"OFFER:{self.tcp_port}".encode('utf-8'), addr)
+                if data.decode("utf-8", errors="replace") == expected:
+                    udp_sock.sendto(offer, addr)
             except (socket.timeout, OSError):
-                if self.stop_event.is_set(): break
+                continue
         udp_sock.close()
 
     def send_chat(self, text: str):
         if run_mod_command(text, self.hub, self.name, lambda t: self.event_queue.put(("system", t))):
+            # Commands like /color change shared state; refresh our own view now.
+            self.event_queue.put(("colormap", self.hub.colormap_snapshot()))
             return
-            
+
         target_name, raw_mention = extract_ping_target(text, self.hub.names())
         if target_name:
             target_sock = self.hub.find_socket_by_name(target_name)
@@ -1991,13 +2072,11 @@ class HostConnection:
                 else: self.hub.send_private(target_sock, PING_PREFIX + self.name)
         elif raw_mention:
             self.event_queue.put(("system", f"No one named '{raw_mention}' is here to ping."))
-        
+
         msg_id = os.urandom(4).hex()
         full_msg = f"{self.name}: {text}"
-        full_proto = f"{MSG_PREFIX}{msg_id}|{full_msg}"
-        
         self.event_queue.put(("chat", {"raw": full_msg, "colors": self.hub.colormap_snapshot(), "msg_id": msg_id}))
-        self.hub.broadcast(full_proto)
+        self.hub.broadcast(f"{MSG_PREFIX}{msg_id}|{full_msg}")
 
     def send_dnd(self, active: bool):
         if self.hub.set_dnd(self.name, active):
@@ -2012,241 +2091,514 @@ class HostConnection:
         self.hub.broadcast(f"{REACT_PREFIX}{msg_id}|{emoji}|{self.name}")
         self.event_queue.put(("react", {"msg_id": msg_id, "emoji": emoji, "sender": self.name}))
 
-    def send_file(self, filepath: str):
-        msg = build_file_message(self.name, filepath)
+    def _share_file(self, msg: str):
         handle_incoming_file(msg, self.event_queue)
         self.hub.broadcast(msg)
+
+    def send_file(self, filepath: str):
+        self._share_file(build_file_message(self.name, filepath))
 
     def send_file_bytes(self, filename: str, data: bytes):
-        msg = FILE_PREFIX + self.name + "|" + filename + "|" + base64.b64encode(data).decode("ascii")
-        handle_incoming_file(msg, self.event_queue)
-        self.hub.broadcast(msg)
+        self._share_file(encode_file_message(self.name, filename, data))
 
     def close(self):
+        self.hub.closed = True
         self.stop_event.set()
         self.hub.broadcast(HOST_DISCONNECT_PREFIX)
         with self.hub.lock:
-            for s in list(self.hub.clients.keys()):
-                try: s.close()
-                except OSError: pass
+            sockets = list(self.hub.clients)
+        for s in sockets:
+            self.hub.disconnect(s)
+        try: self.server.shutdown(socket.SHUT_RDWR)  # wakes the blocked accept() thread
+        except OSError: pass
         try: self.server.close()
         except OSError: pass
 
 
 class GuestConnection:
+    """Connect + handshake happen in __init__ (raising PermissionError or
+    ConnectionError on failure). The receive thread only starts once the UI
+    calls start(), so no events can arrive before the UI is ready for them."""
+
     def __init__(self, name, host, port, fernet, event_queue):
         self.name = name
+        self.host = host
         self.fernet = fernet
         self.event_queue = event_queue
         self.local_colors = {}
         self.colors_lock = threading.Lock()
-        
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.sock.settimeout(5)
-        self.sock.connect((host, port))
-        self.sock.settimeout(None)
+        self.closing = threading.Event()
+        self.is_admin = False
 
-        send_encrypted(self.sock, fernet, HELLO_PREFIX + name)
-        
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            self.sock.settimeout(5)
+            self.sock.connect((host, port))
+            self.sock.settimeout(None)
+            self._handshake()
+        except BaseException:
+            self.sock.close()
+            raise
+
+    def _handshake(self):
+        send_encrypted(self.sock, self.fernet, HELLO_PREFIX + self.name)
         try:
             length = int.from_bytes(recv_exact(self.sock, MSG_LEN_BYTES), "big")
             if length == 0xFFFFFFFF: raise PermissionError("Password is incorrect.")
-            response = fernet.decrypt(recv_exact(self.sock, length)).decode("utf-8", errors="surrogatepass")
+            response = self.fernet.decrypt(recv_exact(self.sock, length)).decode("utf-8", errors="surrogatepass")
         except InvalidToken: raise PermissionError("Password is incorrect.")
-        except Exception as e: raise e if isinstance(e, PermissionError) else ConnectionError("Host disconnected unexpectedly.")
+        except PermissionError: raise
+        except Exception: raise ConnectionError("Host disconnected unexpectedly.")
 
         if response.startswith(BAN_NOTICE_PREFIX):
             until_str, _, reason = response[len(BAN_NOTICE_PREFIX):].partition("|")
             raise PermissionError(f"You are banned from this room until {until_str}. Reason: {reason}")
-            
         if response.startswith(NOTICE_PREFIX): raise PermissionError(response[len(NOTICE_PREFIX):])
         if not response.startswith(ROSTER_PREFIX): raise ConnectionError("Invalid handshake from host.")
 
-        self.event_queue.put(("connect_success", {"name": name, "host": host, "port": port}))
+        self.known_names = {n.strip() for n in response[len(ROSTER_PREFIX):].split(",") if n.strip()}
+        self.initial_roster = sorted(self.known_names)
 
-        known_names = set(n.strip() for n in response[len(ROSTER_PREFIX):].split(",") if n.strip())
-        self.event_queue.put(("roster", sorted(known_names)))
-
+    def start(self, unlock_prefix: str = None):
         threading.Thread(
-            target=guest_recv_loop, 
-            args=(self.sock, fernet, event_queue, self.local_colors, self.colors_lock, known_names, host),
+            target=guest_recv_loop,
+            args=(self.sock, self.fernet, self.event_queue, self.local_colors, self.colors_lock, self.known_names, self.host, self.closing),
             daemon=True,
         ).start()
+        self._send(FINGERPRINT_PREFIX + get_machine_fingerprint(), report=False)
+        if unlock_prefix:
+            self._send(unlock_prefix + "1", report=False)
 
-        try: send_encrypted(self.sock, fernet, FINGERPRINT_PREFIX + get_machine_fingerprint())
-        except OSError: pass
+    def _send(self, payload: str, report: bool = True) -> bool:
+        try:
+            send_encrypted(self.sock, self.fernet, payload)
+            return True
+        except OSError:
+            if report and not self.closing.is_set():
+                self.event_queue.put(("disconnected", "Connection lost."))
+            return False
 
-    def send_rainbow_unlock(self):
-        try: send_encrypted(self.sock, self.fernet, RAINBOW_UNLOCK_PREFIX + "1")
-        except OSError: pass
-
-    def send_blue_unlock(self):
-        try: send_encrypted(self.sock, self.fernet, BLUE_UNLOCK_PREFIX + "1")
-        except OSError: pass
+    def _colors_copy(self) -> dict:
+        with self.colors_lock:
+            return dict(self.local_colors)
 
     def send_react(self, msg_id: str, emoji: str):
-        try: send_encrypted(self.sock, self.fernet, f"{REACT_PREFIX}{msg_id}|{emoji}|{self.name}")
-        except OSError: pass
-        # Optimistic local update — the host's broadcast excludes the
-        # original sender (standard practice, avoids an unnecessary
-        # echo), so without this the reacting guest would never see
-        # their own reaction applied at all.
+        self._send(f"{REACT_PREFIX}{msg_id}|{emoji}|{self.name}", report=False)
+        # Optimistic local update — the host's broadcast excludes the original
+        # sender (avoids an echo), so without this the reacting guest would
+        # never see their own reaction applied.
         self.event_queue.put(("react", {"msg_id": msg_id, "emoji": emoji, "sender": self.name}))
 
     def send_chat(self, text: str):
         stripped = text.strip()
-        if stripped in ("/help", "/list", "/colors"):
-            if stripped == "/help": self.event_queue.put(("system", HELP_TEXT))
-            elif stripped == "/colors": self.event_queue.put(("system", "Available colors: " + ", ".join(COLOR_PALETTE.keys())))
+        put = self.event_queue.put
+        cmd, _, arg = stripped.partition(" ")
+        cmd = cmd.lower()
+
+        if cmd == "/help": return put(("system", HELP_TEXT))
+        if cmd == "/colors": return put(("system", "Available colors: " + ", ".join(COLOR_PALETTE)))
+        if cmd == "/list": return put(("system", "Connected: " + ", ".join(sorted(self.known_names, key=str.lower))))
+
+        if cmd == "/color":
+            if not arg.strip(): return put(("system", "Usage: /color <name> — see /colors"))
+            self._send(CMD_PREFIX + f"color|{arg.strip()}")
             return
-            
-        if stripped.startswith("/color "):
-            color = stripped[len("/color "):].strip()
-            try: send_encrypted(self.sock, self.fernet, CMD_PREFIX + f"color|{color}")
-            except OSError: self.event_queue.put(("disconnected", "Connection lost."))
+
+        if cmd == "/whisper":
+            parts = arg.split(maxsplit=1)
+            if len(parts) < 2: return put(("system", "Usage: /whisper <name> <message>"))
+            if parts[0].lower() == self.name.lower(): return put(("system", "You cannot whisper to yourself!"))
+            self._send(CMD_PREFIX + f"whisper|{parts[0]}|{parts[1]}")
             return
-            
-        if stripped.startswith("/whisper "):
-            parts = stripped[len("/whisper "):].split(maxsplit=1)
-            if len(parts) < 2:
-                self.event_queue.put(("system", "Usage: /whisper <name> <message>"))
-                return
-            if parts[0].lower() == self.name.lower():
-                self.event_queue.put(("system", "You cannot whisper to yourself!"))
-                return
-            try: send_encrypted(self.sock, self.fernet, CMD_PREFIX + f"whisper|{parts[0]}|{parts[1]}")
-            except OSError: self.event_queue.put(("disconnected", "Connection lost."))
-            return
-            
-        if stripped.startswith(("/mute ", "/unmute ", "/kick ", "/ban ", "/unban ", "/slowmode", "/admin ", "/unadmin ")):
-            if getattr(self, "is_admin", False):
-                try: send_encrypted(self.sock, self.fernet, CMD_PREFIX + f"mod|{stripped}")
-                except OSError: self.event_queue.put(("disconnected", "Connection lost."))
-            else:
-                self.event_queue.put(("system", "Only admins can use moderation commands."))
+
+        if cmd in MOD_COMMAND_NAMES:
+            if self.is_admin: self._send(CMD_PREFIX + f"mod|{stripped}")
+            else: put(("system", "Only admins can use moderation commands."))
             return
 
         msg_id = os.urandom(4).hex()
         full_msg = f"{self.name}: {text}"
-        try: send_encrypted(self.sock, self.fernet, f"{MSG_PREFIX}{msg_id}|{full_msg}")
-        except OSError:
-            self.event_queue.put(("disconnected", "Connection lost."))
-            return
-            
-        with self.colors_lock: colors_copy = dict(self.local_colors)
-        self.event_queue.put(("chat", {"raw": full_msg, "colors": colors_copy, "msg_id": msg_id}))
+        if self._send(f"{MSG_PREFIX}{msg_id}|{full_msg}"):
+            put(("chat", {"raw": full_msg, "colors": self._colors_copy(), "msg_id": msg_id}))
 
     def send_typing(self, started: bool):
-        try: send_encrypted(self.sock, self.fernet, (TYPING_START_PREFIX if started else TYPING_STOP_PREFIX) + self.name)
-        except OSError: pass
+        self._send((TYPING_START_PREFIX if started else TYPING_STOP_PREFIX) + self.name, report=False)
 
     def send_dnd(self, active: bool):
         verb = "turned on" if active else "turned off"
         self.event_queue.put(("system", f"You {verb} Do Not Disturb."))
-        try: send_encrypted(self.sock, self.fernet, DND_PREFIX + f"{self.name}|{'on' if active else 'off'}")
-        except OSError: pass
+        self._send(DND_PREFIX + f"{self.name}|{'on' if active else 'off'}", report=False)
+
+    def _share_file(self, msg: str):
+        if self._send(msg):
+            handle_incoming_file(msg, self.event_queue)
 
     def send_file(self, filepath: str):
-        try:
-            msg = build_file_message(self.name, filepath)
-            send_encrypted(self.sock, self.fernet, msg)
-            handle_incoming_file(msg, self.event_queue)
-        except OSError:
-            self.event_queue.put(("disconnected", "Connection lost."))
+        self._share_file(build_file_message(self.name, filepath))
 
     def send_file_bytes(self, filename: str, data: bytes):
-        msg = FILE_PREFIX + self.name + "|" + filename + "|" + base64.b64encode(data).decode("ascii")
-        try:
-            send_encrypted(self.sock, self.fernet, msg)
-            handle_incoming_file(msg, self.event_queue)
-        except OSError:
-            self.event_queue.put(("disconnected", "Connection lost."))
+        self._share_file(encode_file_message(self.name, filename, data))
 
     def close(self):
-        try: send_encrypted(self.sock, self.fernet, f"[{self.name} left the chat]")
+        self.closing.set()
+        self._send(f"[{self.name} left the chat]", report=False)
+        # shutdown() so the receive thread (blocked in recv) wakes up and the host
+        # actually sees us leave — a bare close() from another thread doesn't.
+        try: self.sock.shutdown(socket.SHUT_RDWR)
         except OSError: pass
         try: self.sock.close()
         except OSError: pass
 
 
 def make_button(parent, text, command, bg, fg="white", font=BOLD_FONT, padx=14, pady=6, hover_bg=None):
+    """A flat, label-based button (native Tk buttons ignore bg colors on macOS).
+    The returned frame has: .label, .base_bg, .disabled, .paint(color), .set_enabled(bool)."""
     frame = tk.Frame(parent, bg=bg, cursor="hand2")
     label = tk.Label(frame, text=text, bg=bg, fg=fg, font=font, padx=padx, pady=pady)
     label.pack(fill="both", expand=True)
-    
+
+    frame.label = label
     frame.base_bg = bg
     frame.disabled = False
 
+    def paint(color):
+        frame.configure(bg=color)
+        label.configure(bg=color)
+
+    def set_enabled(enabled: bool):
+        frame.disabled = not enabled
+        paint(frame.base_bg if enabled else BG_INPUT)
+        label.configure(fg=fg if enabled else FG_MUTED)
+
     def on_click(event=None):
-        if not getattr(frame, "disabled", False): command()
+        if not frame.disabled: command()
 
-    frame.bind("<Button-1>", on_click)
-    label.bind("<Button-1>", on_click)
+    def on_enter(event=None):
+        if not frame.disabled: paint(hover_bg)
 
-    if hover_bg:
-        def on_enter(event=None):
-            if not getattr(frame, "disabled", False):
-                frame.configure(bg=hover_bg)
-                label.configure(bg=hover_bg)
+    def on_leave(event=None):
+        if not frame.disabled: paint(frame.base_bg)
 
-        def on_leave(event=None):
-            if not getattr(frame, "disabled", False):
-                frame.configure(bg=frame.base_bg)
-                label.configure(bg=frame.base_bg)
-
-        for w in (frame, label):
+    for w in (frame, label):
+        w.bind("<Button-1>", on_click)
+        if hover_bg:
             w.bind("<Enter>", on_enter)
             w.bind("<Leave>", on_leave)
 
-    frame.label = label
+    frame.paint, frame.set_enabled = paint, set_enabled
     return frame
 
 
+def resolve_join_target(room_code: str, manual_target: str = None):
+    """Works out where to connect for a Join. Returns
+    (host_ip, port, unlock_prefix, error_message) — error_message is None on success."""
+    unlock_prefix = None
+    if manual_target:
+        match = GRADIENT_UNLOCK_CODES.get(manual_target.strip().lower())
+        if match:
+            # Not a real address — a secret code. Join as if the field were empty.
+            unlock_prefix, manual_target = match[1], None
+
+    host_ip = port = None
+    if manual_target:
+        ip_str, sep, port_str = manual_target.partition(":")
+        host_ip = ip_str.strip()
+        if sep:
+            try: port = int(port_str.strip())
+            except ValueError:
+                return None, None, unlock_prefix, f"'{manual_target}' isn't a valid address. Use an IP like 192.168.1.42, or IP:port if you have both."
+
+    if not ENABLE_WAN_RELAY and not (host_ip and port):
+        if host_ip:
+            host_ip, port = discover_host(room_code, target_ip=host_ip)
+        else:
+            # Fast path first: Room Code = last two octets, so try the likely address directly.
+            prefix = ".".join(get_local_ip().split(".")[:2])
+            if prefix and not prefix.startswith("127."):
+                guess = f"{prefix}.{int(room_code[:3])}.{int(room_code[3:])}"
+                host_ip, port = discover_host(room_code, target_ip=guess, timeout=1.5)
+            if not host_ip:
+                host_ip, port = discover_host(room_code)
+
+    if not host_ip:
+        return None, None, unlock_prefix, f"Could not find Room {room_code}. Ensure the host is running and you are on the same Wi-Fi/network."
+    return host_ip, port, unlock_prefix, None
+
+
 class ChatApp(tk.Tk):
+    BUILTIN_STICKERS = {"GG": "#57F287", "RIP": "#ED4245", "HELLO": "#5B8CFF", "WOW": "#FEE75C", "BRUH": "#FFA347"}
+    REACTION_CHOICES = ("😀", "😂", "❤️", "👍", "🔥", "😢", "😡")
+    BASE_COMMANDS = ("/color", "/colors", "/list", "/clear", "/whisper", "/help")
+    ADMIN_COMMANDS = ("/mute", "/unmute", "/kick", "/ban", "/unban", "/slowmode", "/admin", "/unadmin")
+    PLAYER_ARG_COMMANDS = frozenset({"/mute", "/unmute", "/kick", "/ban", "/whisper", "/admin", "/unadmin"})
+    ACTIVITY_RANKED_COMMANDS = frozenset({"/mute", "/kick", "/ban"})
+    # Keys that never change the text, so they shouldn't refresh suggestions or typing state.
+    NON_EDIT_KEYSYMS = frozenset({
+        "Tab", "ISO_Left_Tab", "Up", "Down", "Return", "KP_Enter", "Escape", "Caps_Lock",
+        "Shift_L", "Shift_R", "Control_L", "Control_R", "Alt_L", "Alt_R", "Meta_L", "Meta_R",
+        "Super_L", "Super_R", "Command", "Option_L", "Option_R",
+    })
+    STATUS_COLORS = {"error": COLOR_PALETTE["red"], "info": COLOR_PALETTE["yellow"], "ok": COLOR_PALETTE["green"]}
+    DEFAULT_DND_KEYBIND = "<Control-d>"
+
+    MAX_LOG_LINES = 3000      # older lines are trimmed once the log grows past this
+    TRIM_EVERY = 40           # ...checked every N appended lines
+    HISTORY_MAX = 50          # sent messages recalled with Up/Down
+    MAX_EVENTS_PER_POLL = 200
+
     def __init__(self):
         super().__init__()
-        self.title(f"chat_gui.py v{VERSION}")
+        self.settings = load_json(SETTINGS_FILE, dict)
         self.geometry("900x600")
         self.minsize(640, 420)
         self.configure(bg=BG_DARK)
 
+        # connection
         self.connection = None
         self.my_name = ""
-        self.is_admin = False 
-        self._mute_expiry_timer = None
-        self.current_roster = []
+        self.is_admin = False
+        self._connecting = False
         self.event_queue = queue.Queue()
-        self.known_colors = {}
-        self.known_tags = set()
-        self.typing_active = False
-        self.last_typing_sent = 0.0
-        self.photo_cache = [] 
-        self._typing_timer = None
-        self.typing_last_seen = {}
-        self.message_reactions = {}
-        self.slowmode_delay = 0.0
-        self._slowmode_cd_timer = None
-        self._slowmode_cd_end = 0.0
-        self.user_msg_times = {}       # name.lower() -> recent message timestamps (spam ranking)
-        self.user_last_msg_time = {}   # name.lower() -> timestamp of their last message (idle ranking)
-        
+        self._host_local_ip = None
+
+        # shared UI plumbing
+        self._timers = {}              # key -> pending after() id (see _set_timer)
+        self._popups = {}              # key -> open Toplevel (see _open_dialog / _toggle_picker)
+        self._picker_closed_at = {}    # key -> when a picker last closed by losing focus
+        self.photo_cache = []          # keeps PhotoImages alive — Tk drops them otherwise
         self.suggest_popup = None
-        self.current_suggestions = []
-        self._emoji_popup = None
-        self._sticker_popup = None
-        self.dnd_keybind = "<Control-d>"
-        self._dnd_keybind_popup = None
-        self._dnd_cd = 0.0
         self._snake_win = None
+        self._rainbow_instance_seq = 0
+        self._jump_visible = False
+        self.sent_history, self._history_pos, self._history_draft = [], None, ""
+        self._active_dnd_bind = None
+        saved_bind = self.settings.get("dnd_keybind")
+        self.dnd_keybind = saved_bind if isinstance(saved_bind, str) and saved_bind else self.DEFAULT_DND_KEYBIND
+        self._init_session_state()
+
+        self._event_handlers = {
+            "connect_success": self._on_connect_success,
+            "connect_fail": self._on_connect_fail,
+            "chat": self._on_chat_event,
+            "react": lambda p: self.add_reaction(p["msg_id"], p["emoji"], p.get("sender", "")),
+            "system": self.append_system_line,
+            "private": self.append_private_line,
+            "roster": self.update_roster,
+            "colormap": self._on_colormap_event,
+            "typing": self.update_typing,
+            "ping": lambda p: notify_ping(p, root=self),
+            "file": self.render_incoming_file,
+            "disconnected": self._handle_disconnected,
+            "slowmode": self._on_slowmode_event,
+            "admin_status": self._on_admin_status,
+            "mute_status": self._on_mute_status,
+            "update_check_result": self._handle_update_check_result,
+            "update_apply_result": self._handle_update_apply_result,
+        }
 
         self._build_connect_frame()
         self._build_chat_frame()
+        self._apply_dnd_keybind()
+        self._update_window_title()
         self.connect_frame.pack(fill="both", expand=True)
-        self.bind_all(SNAKE_KEYBIND, self.on_open_snake)
+        self._focus_first_empty()
 
+        self.bind_all(SNAKE_KEYBIND, self.on_open_snake)
+        self.bind("<FocusIn>", self._on_focus_in)
         self.protocol("WM_DELETE_WINDOW", self.on_close)
         self.after(50, self.poll_queue)
-        self.after(500, self._typing_prune_loop)
+
+    def _init_session_state(self):
+        """Everything that belongs to one chat session (reset on every join/host)."""
+        self.current_roster = []
+        self._roster_sig = None
+        self.known_colors = {}
+        self.known_tags = set()
+        self.message_reactions = {}
+        self.typing_last_seen = {}
+        self.user_msg_times = {}       # name.lower() -> recent message timestamps (spam ranking)
+        self.user_last_msg_time = {}   # name.lower() -> timestamp of their last message (idle ranking)
+        self.typing_active = False
+        self.last_typing_sent = 0.0
+        self._last_entry_text = ""
+        self.dnd_active = False
+        self._dnd_cd = 0.0
+        self.slowmode_delay = 0.0
+        self._slowmode_cd_end = 0.0
+        self.current_suggestions = []
+        self._unread = 0
+        self._appended = 0
+
+    # ------------------------------------------------------------------
+    # Small shared helpers
+    # ------------------------------------------------------------------
+
+    def _set_timer(self, key, ms, fn):
+        """Schedules fn, replacing any pending timer with the same key."""
+        self._cancel_timer(key)
+        def run():
+            self._timers.pop(key, None)
+            fn()
+        self._timers[key] = self.after(ms, run)
+
+    def _cancel_timer(self, key):
+        job = self._timers.pop(key, None)
+        if job is not None:
+            try: self.after_cancel(job)
+            except Exception: pass
+
+    def _close_popup(self, name):
+        popup = self._popups.pop(name, None)
+        if popup is not None:
+            try: popup.destroy()
+            except tk.TclError: pass
+
+    def _open_dialog(self, name, title, padx=20, pady=16, resizable=False):
+        """A single-instance dialog (Esc / the window's X close it). Returns the
+        new Toplevel, or None if one is already open (which is raised instead)."""
+        existing = self._popups.get(name)
+        if existing is not None:
+            try:
+                existing.lift()
+                existing.focus_force()
+            except tk.TclError:
+                pass
+            return None
+        popup = tk.Toplevel(self)
+        popup.title(title)
+        popup.configure(bg=BG_PANEL, padx=padx, pady=pady)
+        popup.resizable(resizable, resizable)
+        popup.transient(self)
+        popup.protocol("WM_DELETE_WINDOW", lambda: self._close_popup(name))
+        popup.bind("<Escape>", lambda e: self._close_popup(name))
+        self._popups[name] = popup
+        popup.focus_set()
+        return popup
+
+    def _toggle_picker(self, name, anchor, build):
+        """A borderless picker that opens just above `anchor`, and closes on
+        Esc, on losing focus, or when its button is clicked again."""
+        if name in self._popups:
+            return self._close_popup(name)
+        # Clicking the anchor button while the picker is open first makes the
+        # picker lose focus (closing it) — don't instantly reopen it.
+        if time.time() - self._picker_closed_at.get(name, 0.0) < 0.25:
+            return
+        popup = tk.Toplevel(self)
+        popup.overrideredirect(True)
+        popup.configure(bg=BG_PANEL, padx=6, pady=6)
+        self._popups[name] = popup
+        build(popup)
+        popup.update_idletasks()
+        x = anchor.winfo_rootx()
+        y = max(0, anchor.winfo_rooty() - popup.winfo_reqheight() - 6)
+        popup.geometry(f"+{x}+{y}")
+        popup.bind("<FocusOut>", lambda e: self._picker_lost_focus(name))
+        popup.bind("<Escape>", lambda e: self._close_popup(name))
+        popup.focus_set()
+
+    def _picker_lost_focus(self, name):
+        self._picker_closed_at[name] = time.time()
+        self._close_popup(name)
+
+    @contextmanager
+    def _log_edit(self):
+        self.log.configure(state="normal")
+        try: yield
+        finally: self.log.configure(state="disabled")
+
+    @contextmanager
+    def _log_append(self, force_scroll=False):
+        """Edit the log, then scroll to the end only if the reader was already
+        at the bottom (or force_scroll) — so reading history isn't interrupted."""
+        follow = force_scroll or self._at_bottom()
+        with self._log_edit():
+            yield
+        if follow:
+            self.log.see("end")
+            self._hide_jump()
+        else:
+            self._show_jump()
+            # Layout may not have caught up with the insert (common right after a
+            # room starts) — re-check once it has, so a stale reading can't leave
+            # the button stuck on while you're actually at the bottom.
+            self.after(80, self._sync_jump_btn)
+        self._appended += 1
+        if follow and self._appended % self.TRIM_EVERY == 0:
+            self._trim_log()
+
+    def _at_bottom(self, precise: bool = False) -> bool:
+        """Is the reader looking at the end of the log? `precise` first lets Tk finish
+        pending layout and also accepts "last line is visible" — slower, so it's used
+        only for the delayed re-check, not on every appended line."""
+        if not self.log.winfo_ismapped():
+            return True  # not on screen yet (e.g. the room is still starting) — nothing to be "behind" on
+        if precise:
+            self.log.update_idletasks()
+            if self.log.dlineinfo("end-1c") is not None:
+                return True
+        return self.log.yview()[1] >= 0.999
+
+    def _show_jump(self):
+        if not self._jump_visible and self.log.winfo_ismapped():
+            self.jump_btn.place(relx=1.0, rely=1.0, anchor="se", x=-12, y=-8)
+            self._jump_visible = True
+
+    def _hide_jump(self):
+        if self._jump_visible:
+            self.jump_btn.place_forget()
+            self._jump_visible = False
+
+    def _scroll_to_bottom(self):
+        self.log.see("end")
+        self._hide_jump()
+
+    def _sync_jump_btn(self):
+        if self._jump_visible and self._at_bottom(precise=True):
+            self._hide_jump()
+
+    def _trim_log(self):
+        excess = int(self.log.index("end-1c").split(".")[0]) - self.MAX_LOG_LINES
+        if excess <= 0:
+            return
+        with self._log_edit():
+            self.log.delete("1.0", f"{excess + 1}.0")
+        # Marks inside a deleted range collapse to its start — drop the stranded
+        # reaction anchors so late reactions to trimmed messages are ignored.
+        for mark in self.log.mark_names():
+            if mark.startswith("react_mark_") and self.log.compare(mark, "==", "1.0"):
+                self.log.mark_unset(mark)
+
+    def _set_status(self, text, kind="error"):
+        self.status_label.configure(text=text, fg=self.STATUS_COLORS[kind])
+
+    def _update_window_title(self):
+        prefix = f"({self._unread}) " if self._unread else ""
+        self.title(f"{prefix}chat_gui.py v{VERSION}")
+
+    def _note_unread(self):
+        try: unfocused = self.focus_displayof() is None
+        except Exception: unfocused = False
+        if unfocused:
+            self._unread += 1
+            self._update_window_title()
+
+    def _on_focus_in(self, event=None):
+        if self._unread:
+            self._unread = 0
+            self._update_window_title()
+
+    def _save_settings(self):
+        self.settings.update(
+            name=self.my_name or self.name_entry.get().strip(),
+            mode=self.mode_var.get(),
+            dnd_keybind=self.dnd_keybind,
+        )
+        save_json(SETTINGS_FILE, self.settings)
+
+    # ------------------------------------------------------------------
+    # Connect screen
+    # ------------------------------------------------------------------
 
     def _build_connect_frame(self):
         f = tk.Frame(self, bg=BG_DARK)
@@ -2255,84 +2607,83 @@ class ChatApp(tk.Tk):
         card = tk.Frame(f, bg=BG_PANEL, padx=32, pady=28)
         card.place(relx=0.5, rely=0.5, anchor="center")
 
-        self._update_popup = None
         corner_frame = tk.Frame(f, bg=BG_DARK)
         corner_frame.place(relx=1.0, rely=1.0, anchor="se", x=-10, y=-8)
-
-        changelog_label = tk.Label(
-            corner_frame, text="View Changelog", bg=BG_DARK, fg=FG_MUTED,
-            font=(CHAT_FONT[0], 8, "underline"), cursor="hand2"
-        )
+        link_font = (CHAT_FONT[0], 8, "underline")
+        changelog_label = tk.Label(corner_frame, text="View Changelog", bg=BG_DARK, fg=FG_MUTED, font=link_font, cursor="hand2")
         changelog_label.pack(anchor="e", pady=(0, 2))
         changelog_label.bind("<Button-1>", lambda e: self.on_show_changelog())
-
-        version_label = tk.Label(
-            corner_frame, text=f"v{VERSION} — Check for Updates", bg=BG_DARK, fg=FG_MUTED,
-            font=(CHAT_FONT[0], 8, "underline"), cursor="hand2"
-        )
+        version_label = tk.Label(corner_frame, text=f"v{VERSION} — Check for Updates", bg=BG_DARK, fg=FG_MUTED, font=link_font, cursor="hand2")
         version_label.pack(anchor="e")
         version_label.bind("<Button-1>", lambda e: self.on_check_updates())
 
-        tk.Label(card, text="chat_gui", font=(CHAT_FONT[0], 20, "bold"), bg=BG_PANEL, fg=FG_TEXT).grid(
-            row=0, column=0, columnspan=2, pady=(0, 16)
-        )
+        tk.Label(card, text="chat_gui", font=(CHAT_FONT[0], 20, "bold"), bg=BG_PANEL, fg=FG_TEXT).grid(row=0, column=0, columnspan=3, pady=(0, 16))
 
-        self.mode_var = tk.StringVar(value="host")
+        saved_mode = self.settings.get("mode")
+        self.mode_var = tk.StringVar(value=saved_mode if saved_mode in ("host", "join") else "host")
         mode_row = tk.Frame(card, bg=BG_PANEL)
-        mode_row.grid(row=1, column=0, columnspan=2, pady=(0, 12))
-        for text, val in [("Host a chat", "host"), ("Join a chat", "join")]:
+        mode_row.grid(row=1, column=0, columnspan=3, pady=(0, 12))
+        for text, val in (("Host a chat", "host"), ("Join a chat", "join")):
             tk.Radiobutton(
-                mode_row, text=text, variable=self.mode_var, value=val, bg=BG_PANEL, fg=FG_TEXT, 
-                selectcolor=BG_INPUT, activebackground=BG_PANEL, activeforeground=FG_TEXT, font=CHAT_FONT
+                mode_row, text=text, variable=self.mode_var, value=val, bg=BG_PANEL, fg=FG_TEXT,
+                selectcolor=BG_INPUT, activebackground=BG_PANEL, activeforeground=FG_TEXT, font=CHAT_FONT, cursor="hand2",
             ).pack(side="left", padx=8)
 
-        def field(row, label, validate_cmd=None, entry_width=28):
+        def field(row, label, validate_cmd=None, entry_width=28, show=None):
             label_widget = tk.Label(card, text=label, bg=BG_PANEL, fg=FG_MUTED, anchor="w", font=CHAT_FONT)
             label_widget.grid(row=row, column=0, sticky="w", pady=(6, 0))
             kwargs = {"validate": "key", "validatecommand": validate_cmd} if validate_cmd else {}
+            if show: kwargs["show"] = show
             entry = tk.Entry(
-                card, bg=BG_INPUT, fg=FG_TEXT, insertbackground=FG_TEXT, relief="flat",
-                width=entry_width, font=CHAT_FONT,
-                readonlybackground=BG_INPUT,  # Tk uses a separate bg for state="readonly";
-                                               # left unset it defaults to a near-white system
-                                               # color, making light text unreadable on it.
-                **kwargs
+                card, bg=BG_INPUT, fg=FG_TEXT, insertbackground=FG_TEXT, relief="flat", width=entry_width, font=CHAT_FONT,
+                # Tk uses a separate bg for state="readonly"; left unset it's a
+                # near-white system color that makes light text unreadable.
+                readonlybackground=BG_INPUT, **kwargs,
             )
             entry.grid(row=row, column=1, sticky="ew", pady=(6, 0), padx=(10, 0))
+            entry.bind("<Return>", lambda e: self.on_connect_clicked())
             entry.label = label_widget
             return entry
 
         card.grid_columnconfigure(1, weight=1)
 
         self.name_entry = field(2, "Display name", validate_cmd=(self.register(lambda p: " " not in p and len(p) <= 30), "%P"))
+        saved_name = self.settings.get("name")
+        if isinstance(saved_name, str) and saved_name:
+            self.name_entry.insert(0, saved_name[:30])
 
-        # ---- Recent chats (Join mode only): quick-fill from past successful
-        # connections. Hidden entirely when there's nothing to show. ----
+        # Recent chats (Join mode only): quick-fill from past successful
+        # connections. Hidden entirely when there's nothing to show.
         self.recent_frame = tk.Frame(card, bg=BG_PANEL)
         self.recent_frame.grid(row=3, column=0, columnspan=3, sticky="ew")
         tk.Label(self.recent_frame, text="Recent", bg=BG_PANEL, fg=FG_MUTED, font=CHAT_FONT).pack(anchor="w", pady=(6, 2))
         self.recent_list_frame = tk.Frame(self.recent_frame, bg=BG_PANEL)
         self.recent_list_frame.pack(fill="x")
 
-        self.room_entry = field(4, "Room Code", entry_width=20)
+        digits_only = (self.register(lambda p: p == "" or (p.isdigit() and len(p) <= 6)), "%P")
+        self.room_entry = field(4, "Room Code", validate_cmd=digits_only, entry_width=20)
         self.regen_room_btn = make_button(card, "Refresh", self._regenerate_room_code, bg=BTN_NEUTRAL, hover_bg=BTN_NEUTRAL_HOVER, padx=8, pady=4, font=CHAT_FONT)
         self.regen_room_btn.grid(row=4, column=2, sticky="w", padx=(8, 0), pady=(6, 0))
 
         self.host_ip_entry = field(5, "Host IP (only if Room Code fails)")
+        self.key_entry = field(6, "Shared key", show="*")
 
-        tk.Label(card, text="Shared key", bg=BG_PANEL, fg=FG_MUTED, anchor="w", font=CHAT_FONT).grid(row=6, column=0, sticky="w", pady=(6, 0))
-        self.key_entry = tk.Entry(card, bg=BG_INPUT, fg=FG_TEXT, insertbackground=FG_TEXT, relief="flat", width=28, show="*", font=CHAT_FONT)
-        self.key_entry.grid(row=6, column=1, sticky="ew", pady=(6, 0), padx=(10, 0))
-
-        self.status_label = tk.Label(card, text="", bg=BG_PANEL, fg=COLOR_PALETTE["red"], wraplength=280, justify="left", font=CHAT_FONT)
-        self.status_label.grid(row=7, column=0, columnspan=2, sticky="w", pady=(10, 0))
+        self.status_label = tk.Label(card, text="", bg=BG_PANEL, fg=self.STATUS_COLORS["error"], wraplength=300, justify="left", font=CHAT_FONT)
+        self.status_label.grid(row=7, column=0, columnspan=3, sticky="w", pady=(10, 0))
 
         self.connect_btn = make_button(card, "Connect", self.on_connect_clicked, bg=BTN_GREEN, hover_bg=BTN_GREEN_HOVER)
-        self.connect_btn.grid(row=8, column=0, columnspan=2, pady=(16, 0), sticky="ew")
+        self.connect_btn.grid(row=8, column=0, columnspan=3, pady=(16, 0), sticky="ew")
 
-        self._host_local_ip = None
         self.mode_var.trace_add("write", lambda *_args: self._on_mode_change())
         self._on_mode_change()
+
+    def _focus_first_empty(self):
+        """Puts the cursor where the user will most likely type next."""
+        for entry in (self.name_entry, self.room_entry, self.key_entry):
+            if str(entry["state"]) == "normal" and not entry.get():
+                entry.focus_set()
+                return
+        self.key_entry.focus_set()
 
     def _on_mode_change(self):
         if self.mode_var.get() == "host":
@@ -2350,6 +2701,7 @@ class ChatApp(tk.Tk):
             self.host_ip_entry.grid()
             self.host_ip_entry.label.grid()
             self._render_recent_list()
+        self.after_idle(self._focus_first_empty)
 
     def _regenerate_room_code(self):
         if self.mode_var.get() != "host": return
@@ -2373,63 +2725,226 @@ class ChatApp(tk.Tk):
 
     def _build_recent_row(self, parent, entry):
         row = tk.Frame(parent, bg=BG_INPUT, cursor="hand2")
-        row.base_bg = BG_INPUT
         title = tk.Label(row, text=f"Room {entry['room_code']}", bg=BG_INPUT, fg=FG_TEXT, font=BOLD_FONT, anchor="w")
         title.pack(fill="x", padx=10, pady=(6, 0))
         subtitle = tk.Label(row, text=f"{entry['host_ip']} · {relative_time_str(entry['last_connected'])}", bg=BG_INPUT, fg=FG_MUTED, font=CHAT_FONT, anchor="w")
         subtitle.pack(fill="x", padx=10, pady=(0, 6))
 
-        def on_click(event=None): self._on_recent_row_clicked(entry)
-        def on_enter(event=None):
-            for w in (row, title, subtitle): w.configure(bg=BTN_NEUTRAL_HOVER)
-        def on_leave(event=None):
-            for w in (row, title, subtitle): w.configure(bg=row.base_bg)
+        def paint(color):
+            for w in (row, title, subtitle): w.configure(bg=color)
 
         for w in (row, title, subtitle):
-            w.bind("<Button-1>", on_click)
-            w.bind("<Enter>", on_enter)
-            w.bind("<Leave>", on_leave)
+            w.bind("<Button-1>", lambda e: self._on_recent_row_clicked(entry))
+            w.bind("<Enter>", lambda e: paint(BTN_NEUTRAL_HOVER))
+            w.bind("<Leave>", lambda e: paint(BG_INPUT))
         return row
 
     def _on_recent_row_clicked(self, entry):
-        # Just prefills the normal fields with what worked last time —
-        # the user still types the shared key and hits Connect as usual.
+        # Just prefills the normal fields with what worked last time — the user
+        # still enters the shared key and hits Connect as usual.
         self.room_entry.configure(state="normal")
         self.room_entry.delete(0, "end")
         self.room_entry.insert(0, entry["room_code"])
         self.host_ip_entry.delete(0, "end")
         self.host_ip_entry.insert(0, f"{entry['host_ip']}:{entry['port']}")
-        self.status_label.configure(text="Filled in from a recent connection — enter the shared key and press Connect.", fg=COLOR_PALETTE["yellow"])
+        self._set_status("Filled in from a recent connection — enter the shared key and press Connect.", "info")
         self.key_entry.focus_set()
+
+    # ---- Connecting ----
+
+    def _set_connecting(self, connecting: bool):
+        self._connecting = connecting
+        self.connect_btn.set_enabled(not connecting)
+        self.connect_btn.label.configure(text="Connecting..." if connecting else "Connect")
+
+    def _validate_connect_inputs(self, name, room_code, key):
+        if not name: return "Enter a display name."
+        if " " in name: return "Display name cannot contain spaces."
+        if not (len(room_code) == 6 and room_code.isdigit() and 0 <= int(room_code[:3]) <= 255 and 0 <= int(room_code[3:]) <= 255):
+            return "Room Code must be 6 digits (from the host's screen)."
+        if not key: return "Enter the shared key password."
+        return None
+
+    def on_connect_clicked(self):
+        if self._connecting or self.connection: return
+        name, key = self.name_entry.get().strip(), self.key_entry.get()
+        room_code, mode = self.room_entry.get().strip(), self.mode_var.get()
+
+        error = self._validate_connect_inputs(name, room_code, key)
+        if error:
+            return self._set_status(error, "error")
+
+        self._set_connecting(True)
+        self._set_status("Connecting, please wait..." if mode == "join" else "Starting your room...", "info")
+        manual_target = (self.host_ip_entry.get().strip() or None) if mode == "join" else None
+        threading.Thread(
+            target=self._async_connect,
+            args=(mode, name, room_code, Fernet(derive_key(key)), manual_target),
+            daemon=True,
+        ).start()
+
+    def _async_connect(self, mode, name, room_code, fernet, manual_target):
+        """Runs on a worker thread so the window never freezes while we do
+        network work (ban-list lookup, room discovery, the handshake)."""
+        put = self.event_queue.put
+        ban = check_global_ban()
+        if ban:
+            return put(("connect_fail", f"This device isn't able to use chat_gui. ({ban.get('reason', 'no reason given')})"))
+
+        if mode == "host":
+            try:
+                conn = HostConnection(name, room_code, fernet, self.event_queue)
+            except OSError as e:
+                return put(("connect_fail", f"Couldn't start: {e}"))
+            return put(("connect_success", {"connection": conn, "mode": "host", "name": name, "room_code": room_code}))
+
+        host_ip, port, unlock_prefix, error = resolve_join_target(room_code, manual_target)
+        if error:
+            return put(("connect_fail", error))
+        try:
+            conn = GuestConnection(name, host_ip, port, fernet, self.event_queue)
+        except PermissionError as e:
+            return put(("connect_fail", str(e)))
+        except (OSError, ConnectionError) as e:
+            return put(("connect_fail", f"Connection failed: {e}"))
+        remember_recent_host(room_code, host_ip, port)
+        put(("connect_success", {"connection": conn, "mode": "join", "name": name, "room_code": room_code, "unlock_prefix": unlock_prefix}))
+
+    def _on_connect_success(self, payload):
+        self._set_connecting(False)
+        self.connection = payload["connection"]
+        self.my_name = payload["name"]
+        self.is_admin = payload["mode"] == "host"
+        self._transition_to_chat(payload["mode"], payload["name"], payload["room_code"])
+        if payload["mode"] == "join":
+            self.update_roster(self.connection.initial_roster)
+            self.connection.start(payload.get("unlock_prefix"))
+        self._save_settings()
+
+    def _on_connect_fail(self, message):
+        self._set_connecting(False)
+        self._set_status(message, "error")
+        self._teardown_connection()
+        self._focus_first_empty()
+
+    def _reset_session_state(self):
+        self._teardown_popups()
+        for key in ("slowmode", "mute", "dnd", "typing", "typing_prune"):
+            self._cancel_timer(key)
+        self._init_session_state()
+        self.photo_cache = []
+        self._history_pos = None
+
+        with self._log_edit():
+            self.log.delete("1.0", "end")
+        self._hide_jump()
+        self.typing_var.set("")
+        self.dnd_btn.disabled = False
+        self._set_dnd_button_style(False)
+        self._apply_mute_state(False)
+        if self._snake_win is not None:
+            try: self._snake_win._on_close()
+            except Exception: pass
+            self._snake_win = None
+        for child in self.member_list_frame.winfo_children(): child.destroy()
+        self._update_window_title()
+
+    def _transition_to_chat(self, mode, name, room_code):
+        self._reset_session_state()
+        self.known_colors = {name.lower(): HOST_COLOR if mode == "host" else FG_TEXT}
+        self.update_roster([name])
+        self.title_label.configure(text=f"{'Hosting as' if mode == 'host' else 'Connected as'} {name} — Room {room_code}")
+        self.connect_frame.pack_forget()
+        self.chat_frame.pack(fill="both", expand=True)
+        self.msg_entry.focus_set()
+
+        if mode == "host":
+            local_ip = self._host_local_ip or get_local_ip()
+            self.append_system_line(
+                f"Hosting Room {room_code} on {local_ip}. Guests on your same network segment can join with just the Room Code. "
+                f"If that doesn't work, have them enter {local_ip}:{self.connection.tcp_port} in the 'Host IP' field. Type /help for commands."
+            )
+        else:
+            self.append_system_line(f"You joined Room {room_code} as {name}. Type /help for commands.")
+
+    def _return_to_connect_screen(self, message, kind):
+        self._teardown_connection()
+        self._set_connecting(False)
+        self.chat_frame.pack_forget()
+        self.connect_frame.pack(fill="both", expand=True)
+        self._set_status(message, kind)
+        self._regenerate_room_code()
+        if self.mode_var.get() == "join": self._render_recent_list()
+        self._unread = 0
+        self._update_window_title()
+        self._focus_first_empty()
+
+    def on_disconnect_clicked(self):
+        self._return_to_connect_screen("Disconnected.", "ok")
+
+    def _handle_disconnected(self, reason: str):
+        if self.connection is None:
+            return  # already left; a late event from the old session
+        self._return_to_connect_screen(reason, "error")
+
+    def _teardown_popups(self):
+        self.destroy_suggestions()
+        self._close_popup("emoji")
+        self._close_popup("stickers")
+
+    def _teardown_connection(self):
+        self._teardown_popups()
+        self._stop_typing_signal()
+        if self.connection:
+            try: self.connection.close()
+            except Exception: pass
+            self.connection = None
+
+    # ------------------------------------------------------------------
+    # Chat screen
+    # ------------------------------------------------------------------
 
     def _build_chat_frame(self):
         self.chat_frame = tk.Frame(self, bg=BG_DARK)
         top = tk.Frame(self.chat_frame, bg=BG_PANEL, height=40)
         top.pack(side="top", fill="x")
-        
+
         self.title_label = tk.Label(top, text="", bg=BG_PANEL, fg=FG_TEXT, font=TITLE_FONT)
         self.title_label.pack(side="left", padx=12, pady=8)
 
         make_button(top, "Disconnect", self.on_disconnect_clicked, bg=BTN_RED, hover_bg=BTN_RED_HOVER, padx=12, pady=5).pack(side="right", padx=12, pady=6)
 
-        self.dnd_active = False
-        self.dnd_btn = make_button(top, "🔕 DND", self.on_dnd_toggle, bg=BTN_NEUTRAL, hover_bg=BTN_NEUTRAL_HOVER, padx=12, pady=5)
+        self.dnd_btn = make_button(top, "🔕 DND: OFF", self.on_dnd_toggle, bg=BTN_NEUTRAL, hover_bg=BTN_NEUTRAL_HOVER, padx=12, pady=5)
         self.dnd_btn.pack(side="right", padx=(12, 0), pady=6)
-        
-        for bind in ["<Button-2>", "<Button-3>"]:
+        for bind in ("<Button-2>", "<Button-3>"):
             self.dnd_btn.bind(bind, lambda e: self.on_dnd_keybind_picker())
             self.dnd_btn.label.bind(bind, lambda e: self.on_dnd_keybind_picker())
-        self._apply_dnd_keybind()
 
         body = tk.Frame(self.chat_frame, bg=BG_DARK)
         body.pack(fill="both", expand=True)
 
-        self.log = scrolledtext.ScrolledText(body, bg=BG_DARK, fg=FG_TEXT, insertbackground=FG_TEXT, relief="flat", state="disabled", wrap="word", padx=10, pady=8, font=CHAT_FONT)
+        self.log = scrolledtext.ScrolledText(body, bg=BG_DARK, fg=FG_TEXT, insertbackground=FG_TEXT, relief="flat", state="disabled", wrap="word", padx=10, pady=8, font=CHAT_FONT, highlightthickness=0, bd=0)
         self.log.pack(side="left", fill="both", expand=True)
         self.log.tag_configure("system", foreground=FG_MUTED, font=(CHAT_FONT[0], 9, "italic"))
         self.log.tag_configure("private", foreground=COLOR_PALETTE["yellow"])
         self.log.tag_configure("timestamp", foreground=FG_MUTED, font=(CHAT_FONT[0], 8))
         self.log.tag_configure("reaction_style", foreground=COLOR_PALETTE["yellow"], font=(CHAT_FONT[0], 9))
+        self.log.tag_configure("align_right", justify="right")
+        self.log.tag_configure("align_left", justify="left")
+
+        # One right-click handler for the whole log (finds the message under the
+        # cursor) instead of two Tcl bindings per message.
+        for bind in ("<Button-2>", "<Button-3>"):
+            self.log.bind(bind, self._on_log_right_click)
+        # Hide the "new messages" button once the reader scrolls back to the end
+        # (also when the window is resized, which can put the end back in view).
+        self.log.bind("<Configure>", lambda e: self.after_idle(self._sync_jump_btn), add="+")
+        for widget in (self.log, self.log.vbar):
+            for bind in ("<MouseWheel>", "<Button-4>", "<Button-5>", "<ButtonRelease-1>", "<KeyRelease>"):
+                widget.bind(bind, lambda e: self.after_idle(self._sync_jump_btn), add="+")
+
+        self.jump_btn = tk.Label(self.log, text="↓ New messages", bg=COLOR_PALETTE["blue"], fg="white", font=BOLD_FONT, padx=10, pady=4, cursor="hand2")
+        self.jump_btn.bind("<Button-1>", lambda e: self._scroll_to_bottom())
 
         member_panel = tk.Frame(body, bg=BG_PANEL, width=160)
         member_panel.pack(side="right", fill="y")
@@ -2447,134 +2962,146 @@ class ChatApp(tk.Tk):
         self.bottom_bar = tk.Frame(self.chat_frame, bg=BG_DARK)
         self.bottom_bar.pack(fill="x", padx=10, pady=(0, 10))
 
-        self.attach_btn = make_button(self.bottom_bar, "📎", self.on_attach_file, bg=BG_INPUT, hover_bg=BTN_NEUTRAL_HOVER, padx=10, pady=6)
-        self.attach_btn.pack(side="left", padx=(0, 6))
+        def tool_button(text, command):
+            btn = make_button(self.bottom_bar, text, command, bg=BG_INPUT, hover_bg=BTN_NEUTRAL_HOVER, padx=10, pady=6)
+            btn.pack(side="left", padx=(0, 6))
+            return btn
 
-        self.sticker_btn = make_button(self.bottom_bar, "🌠", self.on_sticker_picker, bg=BG_INPUT, hover_bg=BTN_NEUTRAL_HOVER, padx=10, pady=6)
-        self.sticker_btn.pack(side="left", padx=(0, 6))
-
-        self.emoji_btn = make_button(self.bottom_bar, "😀", self.on_emoji_picker, bg=BG_INPUT, hover_bg=BTN_NEUTRAL_HOVER, padx=10, pady=6)
-        self.emoji_btn.pack(side="left", padx=(0, 6))
+        self.attach_btn = tool_button("📎", self.on_attach_file)
+        self.sticker_btn = tool_button("🌠", self.on_sticker_picker)
+        self.emoji_btn = tool_button("😀", self.on_emoji_picker)
 
         self.msg_entry = tk.Entry(self.bottom_bar, bg=BG_INPUT, fg=FG_TEXT, insertbackground=FG_TEXT, relief="flat", font=CHAT_FONT)
         self.msg_entry.pack(side="left", fill="x", expand=True, ipady=6)
-
         self.msg_entry.bind("<Return>", self.on_send)
         self.msg_entry.bind("<KeyRelease>", self.on_entry_key)
         self.msg_entry.bind("<Tab>", self.on_tab_autocomplete)
         self.msg_entry.bind("<Up>", self._on_up_arrow)
         self.msg_entry.bind("<Down>", self._on_down_arrow)
+        self.msg_entry.bind("<Escape>", self._on_escape)
         self.msg_entry.bind("<FocusOut>", lambda e: self.after(150, self.destroy_suggestions))
-
-        self._apply_dnd_keybind()  # re-apply now that msg_entry exists (see _apply_dnd_keybind)
 
         self.send_btn = make_button(self.bottom_bar, "Send", self.on_send, bg=COLOR_PALETTE["blue"], hover_bg=BTN_BLUE_HOVER, padx=16, pady=6)
         self.send_btn.pack(side="left", padx=(6, 0))
 
-    def _set_button_enabled(self, btn, enabled: bool):
-        btn.disabled = not enabled
-        bg = btn.base_bg if enabled else BG_INPUT
-        btn.configure(bg=bg)
-        btn.label.configure(bg=bg, fg="white" if enabled else FG_MUTED)
-
     def _set_input_state(self, enabled: bool):
         self.msg_entry.configure(state="normal" if enabled else "disabled")
         for btn in (self.send_btn, self.attach_btn, self.sticker_btn, self.emoji_btn):
-            self._set_button_enabled(btn, enabled)
+            btn.set_enabled(enabled)
+
+    # ---- mute / slowmode ----
 
     def _apply_mute_state(self, muted: bool, until: float = 0.0):
-        if getattr(self, "_mute_expiry_timer", None):
-            try:
-                self.after_cancel(self._mute_expiry_timer)
-            except Exception:
-                pass
-            self._mute_expiry_timer = None
-
+        self._cancel_timer("mute")
         self._set_input_state(not muted)
-        self.mute_status_var.set(f"🔇 You are muted{f' until {format_time(until)}' if until else ''} — messages won't send." if muted else "")
+        until_text = f" until {format_time(until)}" if until else ""
+        self.mute_status_var.set(f"🔇 You are muted{until_text} — messages won't send." if muted else "")
 
         if muted and until:
-            # The server only tells us "you're muted until X" once, up
-            # front — nothing proactively pushes an unmute when the
-            # timer simply runs out (as opposed to an explicit
-            # /unmute). Schedule our own local re-check so the input
-            # box doesn't stay stuck disabled after the mute has
-            # actually expired.
+            # The host only tells us "you're muted until X" once; nothing pushes
+            # an unmute when the timer simply runs out, so re-check locally.
             remaining_ms = max(0, int((until - time.time()) * 1000)) + 250
-            self._mute_expiry_timer = self.after(remaining_ms, self._on_mute_expired)
+            self._set_timer("mute", remaining_ms, self._on_mute_expired)
 
     def _on_mute_expired(self):
-        self._mute_expiry_timer = None
         self._apply_mute_state(False)
         self.append_system_line("🔇 Your mute has expired — you can send messages again.")
 
+    def _on_mute_status(self, payload):
+        if payload == "0":
+            return self._apply_mute_state(False)
+        try: until = float(payload.partition(":")[2])
+        except ValueError: until = 0.0
+        self._apply_mute_state(True, until)
+
+    def _on_slowmode_event(self, delay):
+        self.slowmode_delay = delay
+        if delay == 0.0: self._end_slowmode_cooldown()
+
+    def _on_admin_status(self, payload):
+        self.is_admin = payload == "1"
+        if self.connection: self.connection.is_admin = self.is_admin
+        self.append_system_line(f"Your admin privileges have been {'granted' if self.is_admin else 'revoked'}.")
+
+    def _maybe_start_slowmode_cooldown(self):
+        if self.slowmode_delay > 0 and not self.is_admin:
+            self._set_input_state(False)
+            self._slowmode_cd_end = time.time() + self.slowmode_delay
+            self._tick_slowmode_cooldown()
+
+    def _tick_slowmode_cooldown(self):
+        remaining = self._slowmode_cd_end - time.time()
+        if remaining <= 0:
+            return self._end_slowmode_cooldown()
+        if not self.mute_status_var.get().startswith("🔇"):
+            self.mute_status_var.set(f"⏳ Slowmode is active, you cannot send messages for {remaining:.1f}s")
+        self._set_timer("slowmode", 100, self._tick_slowmode_cooldown)
+
+    def _end_slowmode_cooldown(self):
+        self._cancel_timer("slowmode")
+        if self.mute_status_var.get().startswith("🔇"):
+            return  # still muted for a separate reason — leave that message/lock alone
+        self.mute_status_var.set("")
+        self._set_input_state(True)
+
+    # ---- activity ranking for suggestions ----
+
     def _record_user_message_time(self, sender_name: str):
-        key = sender_name.lower()
-        now = time.time()
+        key, now = sender_name.lower(), time.time()
         self.user_last_msg_time[key] = now
         times = [t for t in self.user_msg_times.get(key, []) if now - t <= SPAM_SUGGESTION_WINDOW]
         times.append(now)
         self.user_msg_times[key] = times
 
     def _rank_by_recent_activity(self, names: list) -> list:
-        """Most messages within SPAM_SUGGESTION_WINDOW first — surfaces
-        whoever's currently sending the most messages in the shortest
-        time, as a shortcut for /mute /kick /ban."""
+        """Most messages within SPAM_SUGGESTION_WINDOW first — a shortcut for /mute /kick /ban."""
         now = time.time()
         def score(name):
-            times = self.user_msg_times.get(name.lower(), [])
-            return len([t for t in times if now - t <= SPAM_SUGGESTION_WINDOW])
+            return sum(1 for t in self.user_msg_times.get(name.lower(), ()) if now - t <= SPAM_SUGGESTION_WINDOW)
         return sorted(names, key=lambda n: (-score(n), n.lower()))
 
     def _rank_by_idle_time(self, names: list) -> list:
-        """Longest since their last message first (never-sent = most
-        idle of all) — surfaces who's most likely away, as a shortcut
-        for @ pings."""
+        """Longest since their last message first (never-sent = most idle) — a shortcut for @ pings."""
         now = time.time()
         def idle_for(name):
             last = self.user_last_msg_time.get(name.lower())
             return float("inf") if last is None else now - last
         return sorted(names, key=lambda n: (-idle_for(n), n.lower()))
 
+    # ---- live suggestions ----
+
     def evaluate_live_suggestions(self):
         text, cursor_pos = self.msg_entry.get(), self.msg_entry.index("insert")
         left_text = text[:cursor_pos]
         words = left_text.split(" ")
-        self.current_suggestions = []
+        suggestions = []
 
         if left_text.startswith("/"):
             base_cmd = words[0].lower()
             if len(words) == 1:
-                all_cmds = ["/color", "/colors", "/list", "/clear", "/whisper", "/help"]
-                if self.mode_var.get() == "host" or getattr(self, 'is_admin', False):
-                    all_cmds.extend(["/mute", "/unmute", "/kick", "/ban", "/unban", "/slowmode", "/admin", "/unadmin"])
-                if self.mode_var.get() == "host":
-                    all_cmds.append("/ipban")
-                self.current_suggestions = [c for c in all_cmds if c.startswith(base_cmd)]
-            elif len(words) >= 2:
-                current_arg = words[-1].lower() if left_text[-1] != " " else ""
-                if base_cmd in {"/mute", "/unmute", "/kick", "/ban", "/whisper", "/admin", "/unadmin"} and len(words) == 2:
-                    matches = [n for n in self.current_roster if n.lower() != self.my_name.lower() and n.lower().startswith(current_arg)]
-                    # Punitive/moderation actions: surface whoever's been
-                    # most active recently first — usually who you're
-                    # actually about to target.
-                    if base_cmd in {"/mute", "/kick", "/ban"}:
-                        matches = self._rank_by_recent_activity(matches)
-                    self.current_suggestions = matches
-                elif base_cmd == "/color" and len(words) == 2:
-                    self.current_suggestions = [col for col in COLOR_PALETTE if col.startswith(current_arg)]
+                is_host = isinstance(self.connection, HostConnection)
+                commands = list(self.BASE_COMMANDS)
+                if self.is_admin: commands.extend(self.ADMIN_COMMANDS)
+                if is_host: commands.append("/ipban")
+                suggestions = [c for c in commands if c.startswith(base_cmd)]
+            elif len(words) == 2:
+                arg = words[1].lower()
+                if base_cmd in self.PLAYER_ARG_COMMANDS:
+                    suggestions = [n for n in self.current_roster if n.lower() != self.my_name.lower() and n.lower().startswith(arg)]
+                    # Punitive actions: surface whoever's been most active
+                    # recently first — usually who you're about to target.
+                    if base_cmd in self.ACTIVITY_RANKED_COMMANDS:
+                        suggestions = self._rank_by_recent_activity(suggestions)
+                elif base_cmd == "/color":
+                    suggestions = [c for c in COLOR_PALETTE if c.startswith(arg)]
 
-        if words and words[-1].startswith("@") and len(words[-1]) >= 1:
+        if words[-1].startswith("@"):
             query = words[-1][1:].lower()
-            ping_matches = self._rank_by_idle_time([
-                n for n in self.current_roster
-                if n.lower() != self.my_name.lower() and n.lower().startswith(query)
-            ])
-            self.current_suggestions.extend(
-                f"@{n}" for n in ping_matches if f"@{n}" not in self.current_suggestions
-            )
+            candidates = [n for n in self.current_roster if n.lower() != self.my_name.lower() and n.lower().startswith(query)]
+            suggestions.extend(f"@{n}" for n in self._rank_by_idle_time(candidates) if f"@{n}" not in suggestions)
 
-        if self.current_suggestions: self.render_suggestion_popup()
+        self.current_suggestions = suggestions
+        if suggestions: self.render_suggestion_popup()
         else: self.destroy_suggestions()
 
     def render_suggestion_popup(self):
@@ -2583,35 +3110,35 @@ class ChatApp(tk.Tk):
             self.suggest_popup.wm_overrideredirect(True)
             self.suggest_popup.configure(bg=BG_PANEL, bd=1, relief="solid")
             self.suggest_popup.attributes("-topmost", True)
-            # Clicking the popup's own background (e.g. the padding around
-            # the listbox) should dismiss it and hand focus straight back
-            # to the entry — without this, losing focus to a borderless
-            # overrideredirect window can leave the entry in a stuck,
-            # unresponsive state on macOS until the user clicks elsewhere
-            # and back.
+            # Clicking the popup's own padding should dismiss it and hand focus
+            # straight back to the entry — otherwise losing focus to a
+            # borderless window can leave the entry unresponsive on macOS.
             self.suggest_popup.bind("<Button-1>", self._on_suggestion_popup_clicked)
 
             self.suggest_listbox = tk.Listbox(
                 self.suggest_popup, bg=BG_PANEL, fg=FG_TEXT, font=CHAT_FONT,
                 selectbackground=BTN_NEUTRAL, selectforeground="white",
-                relief="flat", highlightthickness=0
+                relief="flat", highlightthickness=0, activestyle="none",
             )
             self.suggest_listbox.pack(fill="both", expand=True, padx=4, pady=4)
             self.suggest_listbox.bind("<Button-1>", self._on_suggestion_clicked)
-        
+
         self.suggest_listbox.delete(0, "end")
-        for item in self.current_suggestions: self.suggest_listbox.insert("end", f"  {item}  ")
+        self.suggest_listbox.insert("end", *(f"  {item}  " for item in self.current_suggestions))
         self.suggest_listbox.selection_set(0)
         self.suggest_listbox.configure(height=min(6, len(self.current_suggestions)))
-        
-        x, y = self.msg_entry.winfo_rootx(), self.msg_entry.winfo_rooty() - self.suggest_popup.winfo_reqheight() - 5
-        self.suggest_popup.wm_geometry(f"{max(self.msg_entry.winfo_width() // 2, 220)}x{self.suggest_popup.winfo_reqheight()}+{x}+{y}")
+        self.suggest_popup.update_idletasks()
+
+        height = self.suggest_popup.winfo_reqheight()
+        x, y = self.msg_entry.winfo_rootx(), self.msg_entry.winfo_rooty() - height - 5
+        self.suggest_popup.wm_geometry(f"{max(self.msg_entry.winfo_width() // 2, 220)}x{height}+{x}+{y}")
 
     def destroy_suggestions(self):
         if self.suggest_popup:
             try: self.suggest_popup.destroy()
             except Exception: pass
-            self.suggest_popup, self.current_suggestions = None, []
+            self.suggest_popup = None
+        self.current_suggestions = []
 
     def _on_suggestion_popup_clicked(self, event):
         self.destroy_suggestions()
@@ -2631,301 +3158,359 @@ class ChatApp(tk.Tk):
 
     def _apply_chosen_suggestion(self, chosen):
         text, cursor_pos = self.msg_entry.get(), self.msg_entry.index("insert")
-        left_text, right_text, words = text[:cursor_pos], text[cursor_pos:], text[:cursor_pos].split(" ")
+        left_text, right_text = text[:cursor_pos], text[cursor_pos:]
+        words = left_text.split(" ")
 
         if len(words) == 1: new_left = chosen + " "
-        elif left_text[-1] == " ": new_left = left_text + chosen + " "
+        elif left_text.endswith(" "): new_left = left_text + chosen + " "
         else:
             words[-1] = chosen
             new_left = " ".join(words) + " "
 
-        self.msg_entry.delete(0, "end")
-        self.msg_entry.insert(0, new_left + right_text)
-        self.msg_entry.icursor(len(new_left))
-
-        self.destroy_suggestions()
+        self._set_entry_text(new_left + right_text, cursor=len(new_left))
         self.msg_entry.focus_set()
+
+    def _move_suggestion(self, delta: int):
+        count = len(self.current_suggestions)
+        selection = self.suggest_listbox.curselection()
+        current = selection[0] if selection else (count if delta < 0 else -1)
+        new_idx = min(max(current + delta, 0), count - 1)
+        self.suggest_listbox.selection_clear(0, "end")
+        self.suggest_listbox.selection_set(new_idx)
+        self.suggest_listbox.see(new_idx)
+
+    def on_tab_autocomplete(self, event):
+        if self.suggest_popup and self.current_suggestions:
+            selection = self.suggest_listbox.curselection()
+            self._apply_chosen_suggestion(self.current_suggestions[selection[0] if selection else 0])
+        return "break"
+
+    # ---- entry helpers: history, escape ----
+
+    def _set_entry_text(self, text: str, cursor: int = None):
+        self.msg_entry.delete(0, "end")
+        self.msg_entry.insert(0, text)
+        self.msg_entry.icursor("end" if cursor is None else cursor)
+        self._last_entry_text = text
+        self.destroy_suggestions()
+
+    def _history_step(self, delta: int):
+        if not self.sent_history: return "break"
+        if delta < 0:
+            if self._history_pos is None:
+                self._history_draft = self.msg_entry.get()
+                self._history_pos = len(self.sent_history) - 1
+            else:
+                self._history_pos = max(0, self._history_pos - 1)
+        else:
+            if self._history_pos is None: return "break"
+            self._history_pos += 1
+            if self._history_pos >= len(self.sent_history):
+                self._history_pos = None
+                self._set_entry_text(self._history_draft)
+                return "break"
+        self._set_entry_text(self.sent_history[self._history_pos])
+        return "break"
 
     def _on_up_arrow(self, event):
         if self.suggest_popup and self.current_suggestions:
-            idx = self.suggest_listbox.curselection()
-            new_idx = max(0, (idx[0] if idx else len(self.current_suggestions)) - 1)
-            self.suggest_listbox.selection_clear(0, "end")
-            self.suggest_listbox.selection_set(new_idx)
-            self.suggest_listbox.see(new_idx)
+            self._move_suggestion(-1)
             return "break"
+        return self._history_step(-1)
 
     def _on_down_arrow(self, event):
         if self.suggest_popup and self.current_suggestions:
-            idx = self.suggest_listbox.curselection()
-            new_idx = min(len(self.current_suggestions)-1, (idx[0] if idx else -1) + 1)
-            self.suggest_listbox.selection_clear(0, "end")
-            self.suggest_listbox.selection_set(new_idx)
-            self.suggest_listbox.see(new_idx)
+            self._move_suggestion(1)
             return "break"
+        return self._history_step(1)
 
-    def on_tab_autocomplete(self, event):
-        if not self.suggest_popup or not self.current_suggestions: return "break"
-        chosen = self.current_suggestions[self.suggest_listbox.curselection()[0]] if self.suggest_listbox.curselection() else self.current_suggestions[0]
-        self._apply_chosen_suggestion(chosen)
+    def _on_escape(self, event):
+        if self.suggest_popup:
+            self.destroy_suggestions()
+        elif self._history_pos is not None:
+            self._history_pos = None
+            self._set_entry_text(self._history_draft)
         return "break"
 
-    def on_connect_clicked(self):
-        name, key, room_code, mode = self.name_entry.get().strip(), self.key_entry.get(), self.room_entry.get().strip(), self.mode_var.get()
-        if not name: return self.status_label.configure(text="Enter a display name.", fg=COLOR_PALETTE["red"])
-        if " " in name: return self.status_label.configure(text="Display name cannot contain spaces.", fg=COLOR_PALETTE["red"])
-        if not (len(room_code) == 6 and room_code.isdigit() and 0 <= int(room_code[:3]) <= 255 and 0 <= int(room_code[3:]) <= 255):
-            return self.status_label.configure(text="Room Code must be 6 digits (from the host's screen).", fg=COLOR_PALETTE["red"])
-        if not key: return self.status_label.configure(text="Enter the shared key password.", fg=COLOR_PALETTE["red"])
+    def _remember_sent(self, text: str):
+        if not self.sent_history or self.sent_history[-1] != text:
+            self.sent_history.append(text)
+            del self.sent_history[:-self.HISTORY_MAX]
 
-        ban = check_global_ban()
-        if ban:
-            return self.status_label.configure(
-                text=f"This device isn't able to use chat_gui. ({ban.get('reason', 'no reason given')})",
-                fg=COLOR_PALETTE["red"],
-            )
+    # ---- sending ----
 
-        self.status_label.configure(text="Connecting, please wait...", fg=COLOR_PALETTE["yellow"])
-        self.update_idletasks()
+    def on_send(self, event=None):
+        if not self.connection or str(self.msg_entry["state"]) == "disabled": return "break"
+        text = self.msg_entry.get().strip()
+        if not text: return "break"
+        self._set_entry_text("")
+        self._history_pos = None
 
-        fernet, self.my_name = Fernet(derive_key(key)), name
-        
-        if mode == "host":
-            try:
-                self.connection = HostConnection(name, room_code, fernet, self.event_queue)
-                self.is_admin = True
-                self.title_label.configure(text=f"Hosting as {name} — Room {room_code}")
-                self._transition_to_chat(mode, name, room_code)
-            except OSError as e:
-                self.status_label.configure(text=f"Couldn't start: {e}", fg=COLOR_PALETTE["red"])
+        first_word = text.split()[0].lower()
+        if first_word == "/clear":
+            self._handle_clear_command(text.split())
+            return "break"
+
+        if first_word == "/globalban":
+            parts = text.split(maxsplit=2)
+            fingerprint = parts[1] if len(parts) > 1 else ""
+            reason = parts[2] if len(parts) > 2 else "no reason given"
+            self.append_system_line(perform_globalban(fingerprint, reason))
+            return "break"
+
+        self._remember_sent(text)
+        self._stop_typing_signal()
+        self.connection.send_chat(text)
+        self._maybe_start_slowmode_cooldown()
+        return "break"
+
+    def _handle_clear_command(self, parts):
+        if len(parts) > 1 and parts[1].isdigit():
+            with self._log_edit():
+                self.log.delete(self.log.index(f'end-1c - {int(parts[1])} lines'), "end")
+        elif messagebox.askyesno("Confirm Clear", "Are you sure you want to completely clear the chat log?"):
+            self.photo_cache = []
+            with self._log_edit():
+                self.log.delete("1.0", "end")
+            self._hide_jump()
+
+    def on_entry_key(self, event=None):
+        if event and event.keysym in self.NON_EDIT_KEYSYMS: return
+        text = self.msg_entry.get()
+        changed = text != self._last_entry_text
+        self._last_entry_text = text
+        self.evaluate_live_suggestions()
+
+        if not self.connection or not changed: return
+        if text.strip():
+            now = time.time()
+            if not self.typing_active or (now - self.last_typing_sent > 1.0):
+                self.connection.send_typing(True)
+                self.typing_active, self.last_typing_sent = True, now
+            self._set_timer("typing", int(TYPING_IDLE_TIMEOUT * 1000), self._stop_typing_signal)
         else:
-            self.is_admin = False
-            threading.Thread(target=self._async_guest_connect, args=(name, room_code, fernet, self.host_ip_entry.get().strip() or None), daemon=True).start()
+            self._stop_typing_signal()
 
-    def _async_guest_connect(self, name, room_code, fernet, manual_target=None):
-        host_ip, port = None, None
-        pending_unlock_prefix = None
+    def _stop_typing_signal(self):
+        self._cancel_timer("typing")
+        if self.typing_active and self.connection:
+            self.connection.send_typing(False)
+        self.typing_active, self.last_typing_sent = False, 0.0
 
-        if manual_target:
-            match = GRADIENT_UNLOCK_CODES.get(manual_target.strip().lower())
-            if match:
-                _, pending_unlock_prefix = match
-                manual_target = None  # not a real address — proceed as if the field was empty
-
-        if manual_target:
-            if ":" in manual_target:
-                ip_str, _, port_str = manual_target.partition(":")
-                try: host_ip, port = ip_str.strip(), int(port_str.strip())
-                except ValueError:
-                    return self.event_queue.put(("connect_fail", f"'{manual_target}' isn't a valid address. Use an IP like 192.168.1.42, or IP:port if you have both."))
-            else: host_ip = manual_target
-
-        if not ENABLE_WAN_RELAY:
-            if host_ip and port: pass 
-            elif host_ip: host_ip, port = discover_host(room_code, target_ip=host_ip)
-            else:
-                if len(room_code) == 6 and room_code.isdigit():
-                    prefix = ".".join(get_local_ip().split(".")[:2])
-                    if prefix and not prefix.startswith("127."):
-                        host_ip, port = discover_host(room_code, target_ip=f"{prefix}.{int(room_code[:3])}.{int(room_code[3:])}", timeout=1.5)
-                if not host_ip: host_ip, port = discover_host(room_code)
-
-        if not host_ip:
-            return self.event_queue.put(("connect_fail", f"Could not find Room {room_code}. Ensure the host is running and you are on the same Wi-Fi/network."))
-
+    def on_attach_file(self):
+        if not self.connection: return
+        path = filedialog.askopenfilename(title="Choose a file to send")
+        if not path: return
         try:
-            self.connection = GuestConnection(name, host_ip, port, fernet, self.event_queue)
-            remember_recent_host(room_code, host_ip, port)
-            if pending_unlock_prefix == RAINBOW_UNLOCK_PREFIX:
-                self.connection.send_rainbow_unlock()
-            elif pending_unlock_prefix == BLUE_UNLOCK_PREFIX:
-                self.connection.send_blue_unlock()
-        except PermissionError as e: self.event_queue.put(("connect_fail", str(e)))
-        except (OSError, ConnectionError) as e: self.event_queue.put(("connect_fail", f"Connection failed: {e}"))
+            self.connection.send_file(path)
+            self._maybe_start_slowmode_cooldown()
+        except ValueError as e: messagebox.showerror("File too large", str(e))
+        except OSError as e: messagebox.showerror("Couldn't read file", str(e))
 
-    def _reset_session_state(self):
-        self._close_emoji_popup()
-        self._close_sticker_popup()
-        self._stop_typing_signal()
-        self.photo_cache = []
-        
-        self.log.configure(state="normal")
-        self.log.delete("1.0", "end")
-        self.log.configure(state="disabled")
-        
-        self.known_colors, self.known_tags, self.current_roster, self.message_reactions, self.typing_last_seen = {}, set(), [], {}, {}
-        self.user_msg_times, self.user_last_msg_time = {}, {}
-        self.typing_var.set("")
-        self.dnd_active, self._dnd_cd, self.dnd_btn.disabled, self.slowmode_delay = False, 0.0, False, 0.0
-        self._set_dnd_button_style(False)
-        if getattr(self, "_slowmode_cd_timer", None):
-            try: self.after_cancel(self._slowmode_cd_timer)
-            except Exception: pass
-            self._slowmode_cd_timer = None
-        self._apply_mute_state(False)
-        if self._snake_win is not None:
-            try: self._snake_win._on_close()
-            except Exception: pass
-            self._snake_win = None
-        
-        for child in self.member_list_frame.winfo_children(): child.destroy()
-
-    def _transition_to_chat(self, mode, name, room_code):
-        self._reset_session_state()
-        self.known_colors = {name.lower(): HOST_COLOR if mode == "host" else FG_TEXT}
-        self.update_roster([name])
-        self.connect_frame.pack_forget()
-        self.chat_frame.pack(fill="both", expand=True)
-        self.msg_entry.focus_set()
-        
-        if mode == "host":
-            local_ip = self._host_local_ip or get_local_ip()
-            self.append_system_line(f"Hosting Room {room_code} on {local_ip}. Guests on your same network segment can join with just the Room Code. If that doesn't work, have them enter {local_ip}:{self.connection.tcp_port} in the 'Host IP' field. Type /help for commands.")
-        else:
-            self.append_system_line(f"You joined Room {room_code} as {name}. Type /help for commands.")
-
-    def on_disconnect_clicked(self):
-        self._teardown_connection()
-        self.chat_frame.pack_forget()
-        self.connect_frame.pack(fill="both", expand=True)
-        self.status_label.configure(text="Disconnected.", fg=COLOR_PALETTE["green"])
-        self._regenerate_room_code()
-        if self.mode_var.get() == "join": self._render_recent_list()
-
-    def _handle_disconnected(self, reason: str):
-        self._teardown_connection()
-        self.chat_frame.pack_forget()
-        self.connect_frame.pack(fill="both", expand=True)
-        self.status_label.configure(text=reason, fg=COLOR_PALETTE["red"])
-        self._regenerate_room_code()
-        if self.mode_var.get() == "join": self._render_recent_list()
-
-    def _teardown_connection(self):
-        self.destroy_suggestions()
-        self._stop_typing_signal()
-        if self.connection:
-            try: self.connection.close()
-            except Exception: pass
-            self.connection = None
+    # ---- Do Not Disturb ----
 
     def on_dnd_toggle(self):
         if not self.connection or (time.time() - self._dnd_cd < DND_ANNOUNCE_COOLDOWN): return
-            
         self._dnd_cd, self.dnd_active = time.time(), not self.dnd_active
         self._set_dnd_button_style(self.dnd_active)
-        
+
         self.dnd_btn.disabled = True
         self.dnd_btn.label.configure(text="🔕 Cooldown...")
-        self.after(int(DND_ANNOUNCE_COOLDOWN * 1000), self._restore_dnd_btn)
+        self._set_timer("dnd", int(DND_ANNOUNCE_COOLDOWN * 1000), self._restore_dnd_btn)
         self.connection.send_dnd(self.dnd_active)
 
     def _restore_dnd_btn(self):
         self.dnd_btn.disabled = False
         self._set_dnd_button_style(self.dnd_active)
 
+    def _set_dnd_button_style(self, active: bool):
+        bg, text = (BTN_RED, "🔕 DND: ON") if active else (BTN_NEUTRAL, "🔕 DND: OFF")
+        self.dnd_btn.base_bg = bg
+        self.dnd_btn.paint(bg)
+        self.dnd_btn.label.configure(text=text)
+
     def _apply_dnd_keybind(self):
-        try: self.unbind_all(self.dnd_keybind)
-        except Exception: pass
-        if hasattr(self, "msg_entry"):
-            try: self.msg_entry.unbind(self.dnd_keybind)
-            except Exception: pass
-        if self.dnd_keybind:
-            self.bind_all(self.dnd_keybind, lambda e: self._trigger_dnd_toggle())
-            if hasattr(self, "msg_entry"):
-                # Bound directly on the entry too: instance-level bindings
-                # fire before the Entry widget's own class binding (which
-                # is what types the character in), so returning "break"
-                # here actually stops a letter-key DND bind from also
-                # typing that letter into the chat box. bind_all alone
-                # can't do this — "all" bindings are checked last.
-                self.msg_entry.bind(self.dnd_keybind, lambda e: self._trigger_dnd_toggle())
+        """(Re)binds the DND shortcut, removing whichever one was active before."""
+        old = self._active_dnd_bind
+        if old:
+            for unbind in (self.unbind_all, self.msg_entry.unbind):
+                try: unbind(old)
+                except tk.TclError: pass
+            self._active_dnd_bind = None
+
+        handler = lambda e: self._trigger_dnd_toggle()
+        for attempt in (self.dnd_keybind, self.DEFAULT_DND_KEYBIND):
+            try:
+                self.bind_all(attempt, handler)
+                # Bound on the entry too: instance bindings fire before the
+                # Entry class binding (which types the character), so "break"
+                # stops a letter-key bind from also typing that letter.
+                self.msg_entry.bind(attempt, handler)
+            except tk.TclError:
+                continue
+            self.dnd_keybind = self._active_dnd_bind = attempt
+            return
 
     def _trigger_dnd_toggle(self):
         self.on_dnd_toggle()
         return "break"
 
     def on_dnd_keybind_picker(self):
-        if self._dnd_keybind_popup is not None: return
-        popup = tk.Toplevel(self)
-        popup.title("DND Keybind")
-        popup.configure(bg=BG_PANEL, padx=16, pady=14)
-        popup.resizable(False, False)
-        popup.transient(self)
-        self._dnd_keybind_popup = popup
-
+        popup = self._open_dialog("dnd_bind", "DND Keybind", padx=16, pady=14)
+        if popup is None: return
         tk.Label(popup, text="Press any key combination to bind Do Not Disturb...", bg=BG_PANEL, fg=FG_TEXT, font=BOLD_FONT).pack(anchor="w", pady=(0, 10))
-        tk.Label(popup, text=f"Current bind: {self.dnd_keybind}", bg=BG_INPUT, fg=FG_TEXT, font=CHAT_FONT).pack(fill="x", pady=5)
+        tk.Label(popup, text=f"Current bind: {self.dnd_keybind}   (Esc to cancel)", bg=BG_INPUT, fg=FG_TEXT, font=CHAT_FONT).pack(fill="x", pady=5)
 
         def capture(e):
-            if e.keysym.endswith("_L") or e.keysym.endswith("_R"): return
+            if e.keysym.endswith(("_L", "_R")): return  # a bare modifier press
             is_mac = sys.platform == "darwin"
             parts = []
             if e.state & 4: parts.append("Control")
             if e.state & 1: parts.append("Shift")
             if is_mac:
-                # Tk's Aqua port reports Command under the same bit X11
-                # calls "Mod1" (historically mislabeled "Alt" below) —
-                # and Command/Option are Tk's own native modifier names
-                # on macOS, not "Alt". Binding "<Alt-x>" here would never
-                # actually fire on a real Command press, since Tk doesn't
-                # report Command presses under that name on this platform.
+                # Tk's Aqua port reports Command under the bit X11 calls "Mod1",
+                # and Command/Option are its native modifier names on macOS —
+                # "<Alt-x>" would never fire on a real Command press there.
                 if e.state & 8: parts.append("Command")
                 if e.state & 16: parts.append("Option")
-            else:
-                if e.state & 131072 or e.state & 8: parts.append("Alt")
+            elif e.state & 131072 or e.state & 8:
+                parts.append("Alt")
 
             keyname = e.keysym
             if is_mac and (e.state & 16):
+                # Option composes accents (Option+e -> dead key); recover the physical key.
                 keyname = MAC_VIRTUAL_KEYCODE_TO_KEY.get(e.keycode, keyname)
             parts.append(keyname)
-            
-            try: self.unbind_all(self.dnd_keybind)
-            except Exception: pass
-            if hasattr(self, "msg_entry"):
-                try: self.msg_entry.unbind(self.dnd_keybind)
-                except Exception: pass
-                
+
             self.dnd_keybind = "<" + "-".join(parts) + ">"
             self._apply_dnd_keybind()
-            self._dnd_keybind_popup = None
-            popup.destroy()
+            self._save_settings()
+            self._close_popup("dnd_bind")
 
         popup.bind("<KeyPress>", capture)
-        popup.focus_set()
-        popup.protocol("WM_DELETE_WINDOW", lambda: (setattr(self, '_dnd_keybind_popup', None), popup.destroy()))
 
-    def _set_dnd_button_style(self, active: bool):
-        bg, text = (BTN_RED, "🔕 DND: ON") if active else (BTN_NEUTRAL, "🔕 DND: OFF")
-        self.dnd_btn.configure(bg=bg)
-        self.dnd_btn.base_bg = bg
-        self.dnd_btn.label.configure(text=text, bg=bg)
+    # ---- changelog ----
 
     def on_show_changelog(self):
-        entries = full_changelog()
-        popup = tk.Toplevel(self)
-        popup.title("Changelog")
-        popup.configure(bg=BG_PANEL, padx=16, pady=14)
-        popup.resizable(False, False)
-        popup.transient(self)
+        popup = self._open_dialog("changelog", "Changelog", padx=16, pady=14, resizable=True)
+        if popup is None: return
+        # Buttons first (packed at the bottom) so shrinking the window never hides Close.
+        make_button(popup, "Close", lambda: self._close_popup("changelog"), bg=BTN_NEUTRAL, hover_bg=BTN_NEUTRAL_HOVER, padx=12, pady=5).pack(side="bottom", pady=(10, 0))
 
-        text = scrolledtext.ScrolledText(
-            popup, width=56, height=16, bg=BG_INPUT, fg=FG_TEXT, font=CHAT_FONT,
-            wrap="word", relief="flat", padx=8, pady=8
-        )
-        text.pack()
+        text = scrolledtext.ScrolledText(popup, width=64, height=20, bg=BG_INPUT, fg=FG_TEXT, font=CHAT_FONT, wrap="word", relief="flat", padx=8, pady=8)
+        text.pack(fill="both", expand=True)
         text.tag_configure("ver", font=(CHAT_FONT[0], CHAT_FONT[1], "bold"), foreground=COLOR_PALETTE["blue"])
 
+        entries = full_changelog()
         if not entries:
             text.insert("1.0", "No changelog entries yet.")
-        else:
-            for i, e in enumerate(entries):
-                if i:
-                    text.insert("end", "\n\n")
-                text.insert("end", f"v{e.get('version', '?')} — {e.get('date', 'unknown date')}\n", ("ver",))
-                text.insert("end", e.get("notes") or "(no notes)")
+        for i, e in enumerate(entries):
+            if i: text.insert("end", "\n\n")
+            text.insert("end", f"v{e.get('version', '?')} — {e.get('date', 'unknown date')}\n", ("ver",))
+            text.insert("end", e.get("notes") or "(no notes)")
         text.configure(state="disabled")
 
-        make_button(popup, "Close", popup.destroy, bg=BTN_NEUTRAL, hover_bg=BTN_NEUTRAL_HOVER, padx=12, pady=5).pack(pady=(10, 0))
+    # ---- updates ----
+
+    def on_check_updates(self):
+        if not UPDATE_MANIFEST_URL:
+            messagebox.showinfo(
+                "Check for Updates",
+                "No update server is configured yet. Set UPDATE_MANIFEST_URL near the top of chat_gui.py to enable this.",
+            )
+            return
+        popup = self._open_dialog("update", "Check for Updates")
+        if popup is None: return
+        self._pending_manifest = None
+        self._update_status_var = tk.StringVar(value=f"Checking for updates (current: v{VERSION})...")
+        tk.Label(popup, textvariable=self._update_status_var, bg=BG_PANEL, fg=FG_TEXT, font=CHAT_FONT, wraplength=320, justify="left").pack(pady=(0, 12))
+        self._update_btn_row = tk.Frame(popup, bg=BG_PANEL)
+        self._update_btn_row.pack()
+        threading.Thread(target=self._async_check_updates, daemon=True).start()
+
+    def _show_update_state(self, text, *buttons) -> bool:
+        """Sets the update dialog's message and buttons ((label, command, 'green'|'neutral'), ...).
+        Returns False if the dialog was closed in the meantime."""
+        if "update" not in self._popups:
+            return False
+        self._update_status_var.set(text)
+        for w in self._update_btn_row.winfo_children(): w.destroy()
+        colors = {"green": (BTN_GREEN, BTN_GREEN_HOVER), "neutral": (BTN_NEUTRAL, BTN_NEUTRAL_HOVER)}
+        for i, (label, command, kind) in enumerate(buttons):
+            bg, hover = colors[kind]
+            make_button(self._update_btn_row, label, command, bg=bg, hover_bg=hover, padx=12, pady=5).pack(side="left", padx=(0, 8) if i < len(buttons) - 1 else 0)
+        return True
+
+    def _close_update_dialog(self):
+        self._close_popup("update")
+
+    def _async_check_updates(self):
+        try:
+            manifest = fetch_update_manifest(UPDATE_MANIFEST_URL)
+        except Exception as e:
+            self.event_queue.put(("update_check_result", {"ok": False, "error": str(e)}))
+            return
+        self.event_queue.put(("update_check_result", {"ok": True, "manifest": manifest}))
+
+    def _handle_update_check_result(self, result):
+        close = ("Close", self._close_update_dialog, "neutral")
+        if not result["ok"]:
+            self._show_update_state(f"Couldn't check for updates:\n{result['error']}", close)
+            return
+
+        manifest = result["manifest"]
+        remote_version = manifest.get("version", "?")
+        if not is_newer_version(remote_version, VERSION):
+            self._show_update_state(f"You're up to date (v{VERSION}).", close)
+            return
+
+        notes = manifest.get("notes", "")
+        notes_line = f"\n\n{notes}" if notes else ""
+        self._pending_manifest = manifest
+        self._show_update_state(
+            f"Update available: v{remote_version} (you have v{VERSION}).{notes_line}\n\n"
+            "This will be signature-verified before anything is installed.",
+            ("Install & Restart", self._start_update_install, "green"),
+            ("Not now", self._close_update_dialog, "neutral"),
+        )
+
+    def _start_update_install(self):
+        if not self._pending_manifest: return
+        if self._show_update_state("Downloading and verifying update..."):
+            threading.Thread(target=self._async_install_update, args=(self._pending_manifest,), daemon=True).start()
+
+    def _async_install_update(self, manifest):
+        try:
+            payload = download_and_verify_update(manifest)
+            backup_path = apply_update(payload)
+            record_changelog_entry(manifest.get("version", "?"), manifest.get("notes", ""))
+        except Exception as e:
+            self.event_queue.put(("update_apply_result", {"ok": False, "error": str(e)}))
+            return
+        self.event_queue.put(("update_apply_result", {"ok": True, "backup": backup_path}))
+
+    def _handle_update_apply_result(self, result):
+        if not result["ok"]:
+            self._show_update_state(f"Update failed and was NOT installed:\n{result['error']}", ("Close", self._close_update_dialog, "neutral"))
+            return
+        self._show_update_state(
+            f"Update installed and verified. Your previous version was backed up as:\n"
+            f"{os.path.basename(result['backup'])}\n\nRestart to apply it.",
+            ("Restart Now", self._restart_app, "green"),
+            ("Later", self._close_update_dialog, "neutral"),
+        )
+
+    def _restart_app(self):
+        self._save_settings()
+        self._teardown_connection()
+        os.execv(sys.executable, [sys.executable] + sys.argv)
+
+    def on_close(self):
+        self._save_settings()
+        self._teardown_connection()
+        self.destroy()
+
+    # ---- snake ----
 
     def on_open_snake(self, event=None):
         if not self.connection:
@@ -2948,312 +3533,69 @@ class ChatApp(tk.Tk):
             return my_color
         return random.choice(list(COLOR_PALETTE.values()))
 
-    def on_check_updates(self):
-        if not UPDATE_MANIFEST_URL:
-            messagebox.showinfo(
-                "Check for Updates",
-                "No update server is configured yet. Set UPDATE_MANIFEST_URL near the "
-                "top of chat_gui.py to enable this."
-            )
-            return
-        if self._update_popup is not None:
-            return
-        self._open_update_popup(f"Checking for updates (current: v{VERSION})...")
-        threading.Thread(target=self._async_check_updates, daemon=True).start()
-
-    def _open_update_popup(self, status_text: str):
-        popup = tk.Toplevel(self)
-        popup.title("Check for Updates")
-        popup.configure(bg=BG_PANEL, padx=20, pady=16)
-        popup.resizable(False, False)
-        popup.transient(self)
-        popup.protocol("WM_DELETE_WINDOW", self._close_update_popup)
-        self._update_popup = popup
-        self._pending_manifest = None
-
-        self._update_status_var = tk.StringVar(value=status_text)
-        tk.Label(
-            popup, textvariable=self._update_status_var, bg=BG_PANEL, fg=FG_TEXT,
-            font=CHAT_FONT, wraplength=320, justify="left"
-        ).pack(pady=(0, 12))
-
-        self._update_btn_row = tk.Frame(popup, bg=BG_PANEL)
-        self._update_btn_row.pack()
-
-    def _close_update_popup(self):
-        if self._update_popup is not None:
-            try:
-                self._update_popup.destroy()
-            except Exception:
-                pass
-            self._update_popup = None
-
-    def _clear_update_buttons(self):
-        for w in self._update_btn_row.winfo_children():
-            w.destroy()
-
-    def _async_check_updates(self):
-        try:
-            manifest = fetch_update_manifest(UPDATE_MANIFEST_URL)
-        except Exception as e:
-            self.event_queue.put(("update_check_result", {"ok": False, "error": str(e)}))
-            return
-        self.event_queue.put(("update_check_result", {"ok": True, "manifest": manifest}))
-
-    def _handle_update_check_result(self, result):
-        if self._update_popup is None:
-            return
-        self._clear_update_buttons()
-        if not result["ok"]:
-            self._update_status_var.set(f"Couldn't check for updates:\n{result['error']}")
-            make_button(self._update_btn_row, "Close", self._close_update_popup, bg=BTN_NEUTRAL, hover_bg=BTN_NEUTRAL_HOVER, padx=12, pady=5).pack()
-            return
-
-        manifest = result["manifest"]
-        remote_version = manifest.get("version", "?")
-        if not is_newer_version(remote_version, VERSION):
-            self._update_status_var.set(f"You're up to date (v{VERSION}).")
-            make_button(self._update_btn_row, "Close", self._close_update_popup, bg=BTN_NEUTRAL, hover_bg=BTN_NEUTRAL_HOVER, padx=12, pady=5).pack()
-            return
-
-        notes = manifest.get("notes", "")
-        notes_line = f"\n\n{notes}" if notes else ""
-        self._update_status_var.set(
-            f"Update available: v{remote_version} (you have v{VERSION}).{notes_line}\n\n"
-            "This will be signature-verified before anything is installed."
-        )
-        self._pending_manifest = manifest
-        make_button(self._update_btn_row, "Install & Restart", self._start_update_install, bg=BTN_GREEN, hover_bg=BTN_GREEN_HOVER, padx=12, pady=5).pack(side="left", padx=(0, 8))
-        make_button(self._update_btn_row, "Not now", self._close_update_popup, bg=BTN_NEUTRAL, hover_bg=BTN_NEUTRAL_HOVER, padx=12, pady=5).pack(side="left")
-
-    def _start_update_install(self):
-        if not self._pending_manifest:
-            return
-        self._clear_update_buttons()
-        self._update_status_var.set("Downloading and verifying update...")
-        threading.Thread(target=self._async_install_update, args=(self._pending_manifest,), daemon=True).start()
-
-    def _async_install_update(self, manifest):
-        try:
-            payload = download_and_verify_update(manifest)
-            backup_path = apply_update(payload)
-            record_changelog_entry(manifest.get("version", "?"), manifest.get("notes", ""))
-        except Exception as e:
-            self.event_queue.put(("update_apply_result", {"ok": False, "error": str(e)}))
-            return
-        self.event_queue.put(("update_apply_result", {"ok": True, "backup": backup_path}))
-
-    def _handle_update_apply_result(self, result):
-        if self._update_popup is None:
-            return
-        self._clear_update_buttons()
-        if not result["ok"]:
-            self._update_status_var.set(f"Update failed and was NOT installed:\n{result['error']}")
-            make_button(self._update_btn_row, "Close", self._close_update_popup, bg=BTN_NEUTRAL, hover_bg=BTN_NEUTRAL_HOVER, padx=12, pady=5).pack()
-            return
-        self._update_status_var.set(
-            f"Update installed and verified. Your previous version was backed up as:\n"
-            f"{os.path.basename(result['backup'])}\n\nRestart to apply it."
-        )
-        make_button(self._update_btn_row, "Restart Now", self._restart_app, bg=BTN_GREEN, hover_bg=BTN_GREEN_HOVER, padx=12, pady=5).pack(side="left", padx=(0, 8))
-        make_button(self._update_btn_row, "Later", self._close_update_popup, bg=BTN_NEUTRAL, hover_bg=BTN_NEUTRAL_HOVER, padx=12, pady=5).pack(side="left")
-
-    def _restart_app(self):
-        self._teardown_connection()
-        os.execv(sys.executable, [sys.executable] + sys.argv)
-
-    def on_close(self):
-        self._teardown_connection()
-        self.destroy()
-
-    def _stop_typing_signal(self):
-        if getattr(self, "_typing_timer", None):
-            try: self.after_cancel(self._typing_timer)
-            except Exception: pass
-            self._typing_timer = None
-        if self.typing_active and self.connection:
-            self.connection.send_typing(False)
-            self.typing_active, self.last_typing_sent = False, 0.0
-
-    def _start_slowmode_cooldown(self):
-        self._set_input_state(False)
-        self.msg_entry.update()
-        self._slowmode_cd_end = time.time() + self.slowmode_delay
-        if getattr(self, "_slowmode_cd_timer", None):
-            try: self.after_cancel(self._slowmode_cd_timer)
-            except Exception: pass
-        self._tick_slowmode_cooldown()
-
-    def _tick_slowmode_cooldown(self):
-        remaining = self._slowmode_cd_end - time.time()
-        if remaining <= 0:
-            self._end_slowmode_cooldown()
-            return
-        if not self.mute_status_var.get().startswith("🔇"):
-            self.mute_status_var.set(f"⏳ Slowmode is active, you cannot send messages for {remaining:.1f}s")
-        self._slowmode_cd_timer = self.after(100, self._tick_slowmode_cooldown)
-
-    def _end_slowmode_cooldown(self):
-        if getattr(self, "_slowmode_cd_timer", None):
-            try: self.after_cancel(self._slowmode_cd_timer)
-            except Exception: pass
-            self._slowmode_cd_timer = None
-        if self.mute_status_var.get().startswith("🔇"):
-            return  # still muted for a separate reason — leave that message/lock alone
-        self.mute_status_var.set("")
-        self._set_input_state(True)
-
-    def _maybe_start_slowmode_cooldown(self):
-        if getattr(self, "slowmode_delay", 0) > 0 and not self.is_admin:
-            self._start_slowmode_cooldown()
-
-    def on_send(self, event=None):
-        if not self.connection or str(self.msg_entry["state"]) == "disabled": return
-        text = self.msg_entry.get().strip()
-        if not text: return
-        
-        if text.lower().startswith("/clear"):
-            parts = text.split()
-            if len(parts) > 1 and parts[1].isdigit():
-                self.log.configure(state="normal")
-                self.log.delete(self.log.index(f'{self.log.index("end-1c")} - {int(parts[1])} lines'), "end")
-                self.log.configure(state="disabled")
-            elif messagebox.askyesno("Confirm Clear", "Are you sure you want to completely clear the chat log?"):
-                self.photo_cache = []
-                self.log.configure(state="normal")
-                self.log.delete("1.0", "end")
-                self.log.configure(state="disabled")
-            
-            self.msg_entry.delete(0, "end")
-            self.destroy_suggestions()
-            return
-
-        if text.startswith("/globalban "):
-            parts = text[len("/globalban "):].strip().split(maxsplit=1)
-            fingerprint = parts[0] if parts else ""
-            reason = parts[1] if len(parts) > 1 else "no reason given"
-            self.msg_entry.delete(0, "end")
-            self.destroy_suggestions()
-            self.append_system_line(perform_globalban(fingerprint, reason))
-            return
-
-        self.msg_entry.delete(0, "end")
-        self.destroy_suggestions()
-        self._stop_typing_signal()
-        self.connection.send_chat(clean_non_bmp(text))
-        self._maybe_start_slowmode_cooldown()
-
-    def on_entry_key(self, event=None):
-        if event and event.keysym in ("Tab", "ISO_Left_Tab", "Up", "Down"): return "break"
-        self.evaluate_live_suggestions()
-        
-        if not self.connection: return
-        if self.msg_entry.get().strip():
-            now = time.time()
-            if not self.typing_active or (now - self.last_typing_sent > 1.0):
-                self.connection.send_typing(True)
-                self.typing_active, self.last_typing_sent = True, now
-
-            if getattr(self, "_typing_timer", None):
-                try: self.after_cancel(self._typing_timer)
-                except Exception: pass
-            self._typing_timer = self.after(2000, self._stop_typing_signal)
-        else:
-            self._stop_typing_signal()
-
-    def on_attach_file(self):
-        if not self.connection: return
-        path = filedialog.askopenfilename(title="Choose a file to send")
-        if not path: return
-        try:
-            self.connection.send_file(path)
-            self._maybe_start_slowmode_cooldown()
-        except ValueError as e: messagebox.showerror("File too large", str(e))
-        except OSError as e: messagebox.showerror("Couldn't read file", str(e))
-
-    BUILTIN_STICKERS = ["GG", "RIP", "HELLO", "WOW", "BRUH"]
+    # ------------------------------------------------------------------
+    # Stickers + emoji
+    # ------------------------------------------------------------------
 
     def on_sticker_picker(self):
         if Image is None or ImageDraw is None:
             return messagebox.showerror("Error", "Pillow (PIL) is required to use stickers.")
+        self._toggle_picker("stickers", self.sticker_btn, self._build_sticker_picker)
 
-        if getattr(self, "_sticker_popup", None) is not None:
-            try: self._sticker_popup.destroy()
-            except: pass
-            self._sticker_popup = None
-            return
+    def _picker_cell(self, parent, row, col, command, text=None, image=None, on_right=None, muted=False):
+        cell = tk.Label(
+            parent, text=text, image=image, font=(CHAT_FONT[0], 9) if muted else BOLD_FONT, bg=BG_INPUT,
+            fg=FG_MUTED if muted else FG_TEXT, padx=10, pady=10, cursor="hand2", bd=1, relief="solid",
+        )
+        cell.grid(row=row, column=col, padx=4, pady=4)
+        cell.bind("<Button-1>", lambda e: command())
+        if on_right:
+            for bind in ("<Button-2>", "<Button-3>"):
+                cell.bind(bind, lambda e: on_right())
+        cell.bind("<Enter>", lambda e: cell.configure(bg=BTN_NEUTRAL))
+        cell.bind("<Leave>", lambda e: cell.configure(bg=BG_INPUT))
+        return cell
 
-        popup = tk.Toplevel(self)
-        popup.overrideredirect(True)
-        popup.configure(bg=BG_PANEL, padx=6, pady=6)
-        self._sticker_popup = popup
-        self._sticker_thumb_cache = {}  # keeps PhotoImage refs alive — Tk GCs them otherwise
-
-        x, y = self.winfo_rootx() + self.bottom_bar.winfo_x() + 40, self.winfo_rooty() + self.bottom_bar.winfo_y() - 4
-        popup.geometry(f"+{x}+{y-140}")
-
+    def _build_sticker_picker(self, popup):
+        popup.thumbs = {}  # PhotoImage refs live as long as the popup does
         grid = tk.Frame(popup, bg=BG_PANEL)
         grid.pack()
 
-        col = 0
-        for s in self.BUILTIN_STICKERS:
-            btn = tk.Label(grid, text=s, font=BOLD_FONT, bg=BG_INPUT, fg=FG_TEXT, padx=10, pady=10, cursor="hand2", bd=1, relief="solid")
-            btn.grid(row=0, column=col, padx=4, pady=4)
-            btn.bind("<Button-1>", lambda e, name=s: self.send_sticker(name))
-            btn.bind("<Enter>", lambda e, w=btn: w.configure(bg=BTN_NEUTRAL))
-            btn.bind("<Leave>", lambda e, w=btn: w.configure(bg=BG_INPUT))
-            col += 1
+        for col, name in enumerate(self.BUILTIN_STICKERS):
+            self._picker_cell(grid, 0, col, lambda n=name: self.send_sticker(n), text=name)
 
         custom = _load_custom_stickers()
         row, col = 1, 0
         for name, b64data in custom.items():
             try:
-                img_bytes = base64.b64decode(b64data)
-                thumb = Image.open(io.BytesIO(img_bytes)).resize((64, 64), Image.LANCZOS)
-                photo = ImageTk.PhotoImage(thumb)
+                thumb = Image.open(io.BytesIO(base64.b64decode(b64data))).resize((64, 64), Image.LANCZOS)
+                popup.thumbs[name] = ImageTk.PhotoImage(thumb)
             except Exception:
                 continue
-            self._sticker_thumb_cache[name] = photo
-
-            btn = tk.Label(grid, image=photo, bg=BG_INPUT, cursor="hand2", bd=1, relief="solid")
-            btn.grid(row=row, column=col, padx=4, pady=4)
-            btn.bind("<Button-1>", lambda e, name=name: self.send_sticker(name))
-            btn.bind("<Button-3>", lambda e, name=name: self._delete_custom_sticker(name))
-            btn.bind("<Enter>", lambda e, w=btn: w.configure(bg=BTN_NEUTRAL))
-            btn.bind("<Leave>", lambda e, w=btn: w.configure(bg=BG_INPUT))
+            self._picker_cell(grid, row, col, lambda n=name: self.send_sticker(n), image=popup.thumbs[name], on_right=lambda n=name: self._delete_custom_sticker(n))
             col += 1
             if col >= 5:
                 col, row = 0, row + 1
 
-        upload_btn = tk.Label(grid, text="➕\nUpload", font=(CHAT_FONT[0], 9), bg=BG_INPUT, fg=FG_MUTED, padx=8, pady=8, cursor="hand2", bd=1, relief="solid")
-        upload_btn.grid(row=row, column=col, padx=4, pady=4)
-        upload_btn.bind("<Button-1>", lambda e: self.on_upload_sticker())
-        upload_btn.bind("<Enter>", lambda e: upload_btn.configure(bg=BTN_NEUTRAL))
-        upload_btn.bind("<Leave>", lambda e: upload_btn.configure(bg=BG_INPUT))
-
+        self._picker_cell(grid, row, col, self.on_upload_sticker, text="➕\nUpload", muted=True)
         if custom:
             tk.Label(popup, text="Right-click a custom sticker to delete it", bg=BG_PANEL, fg=FG_MUTED, font=(CHAT_FONT[0], 8)).pack(pady=(4, 0))
 
-        popup.bind("<FocusOut>", lambda e: self._close_sticker_popup())
-        popup.focus_set()
-
-    def _close_sticker_popup(self):
-        if getattr(self, "_sticker_popup", None):
-            try: self._sticker_popup.destroy()
-            except: pass
-            self._sticker_popup = None
+    def _reopen_sticker_picker(self):
+        self._close_popup("stickers")
+        self.on_sticker_picker()
 
     def on_upload_sticker(self):
         path = filedialog.askopenfilename(
             title="Choose a sticker image",
-            filetypes=[("Images", "*.png *.jpg *.jpeg *.gif *.bmp *.webp"), ("All files", "*.*")]
+            filetypes=[("Images", "*.png *.jpg *.jpeg *.gif *.bmp *.webp"), ("All files", "*.*")],
         )
         if not path:
             return
 
         custom = _load_custom_stickers()
         if len(custom) >= MAX_CUSTOM_STICKERS:
-            self._close_sticker_popup()
+            self._close_popup("stickers")
             return messagebox.showerror("Too many stickers", f"You can have at most {MAX_CUSTOM_STICKERS} custom stickers. Delete one first (right-click it).")
 
         name = simpledialog.askstring("Name this sticker", "Short name (shown as the filename when sent):", parent=self)
@@ -3264,7 +3606,7 @@ class ChatApp(tk.Tk):
         try:
             img = Image.open(path).convert("RGB")
         except Exception as e:
-            self._close_sticker_popup()
+            self._close_popup("stickers")
             return messagebox.showerror("Couldn't load image", str(e))
 
         img.thumbnail((240, 240), Image.LANCZOS)
@@ -3275,58 +3617,57 @@ class ChatApp(tk.Tk):
 
         custom[name] = base64.b64encode(bio.getvalue()).decode("ascii")
         _save_custom_stickers(custom)
-
-        self._close_sticker_popup()
-        self.on_sticker_picker()  # reopen, now showing the new sticker
+        self._reopen_sticker_picker()  # now showing the new sticker
 
     def _delete_custom_sticker(self, name):
         custom = _load_custom_stickers()
-        if name in custom:
-            del custom[name]
+        if custom.pop(name, None) is not None:
             _save_custom_stickers(custom)
-        self._close_sticker_popup()
-        self.on_sticker_picker()
+        self._reopen_sticker_picker()
+
+    def _render_builtin_sticker(self, name: str) -> bytes:
+        size = 240
+        img = Image.new("RGB", (size, size), color=BG_PANEL)
+        d = ImageDraw.Draw(img)
+        d.rectangle([10, 10, size - 10, size - 10], fill=self.BUILTIN_STICKERS[name], outline="white", width=6)
+
+        font = None
+        if ImageFont is not None:
+            for font_size in (64, 52, 40, 32):
+                try: font = ImageFont.load_default(size=font_size)
+                except Exception: font = None  # older Pillow: no sized default font
+                if font is None or d.textbbox((0, 0), name, font=font)[2] <= size - 50:
+                    break
+        if font is not None:
+            left, top, right, bottom = d.textbbox((0, 0), name, font=font)
+            d.text(((size - (right - left)) // 2 - left, (size - (bottom - top)) // 2 - top), name, fill="black", font=font)
+        else:
+            d.text((size // 2 - 4 * len(name), size // 2 - 6), name, fill="black")
+
+        bio = io.BytesIO()
+        img.save(bio, format="JPEG", quality=90)
+        return bio.getvalue()
 
     def send_sticker(self, name):
-        self._close_sticker_popup()
+        self._close_popup("stickers")
         if not self.connection: return
 
         if name in self.BUILTIN_STICKERS:
-            img = Image.new('RGB', (120, 120), color=BG_PANEL)
-            d = ImageDraw.Draw(img)
-            d.rectangle([5, 5, 115, 115], fill={"GG": "#57F287", "RIP": "#ED4245", "HELLO": "#5B8CFF", "WOW": "#FEE75C", "BRUH": "#FFA347"}.get(name, "#FFFFFF"), outline="white", width=3)
-            d.text((10, 50), name, fill="black")
-            bio = io.BytesIO()
-            img.resize((240, 240), Image.NEAREST).save(bio, format="JPEG")
-            img_bytes = bio.getvalue()
+            img_bytes = self._render_builtin_sticker(name)
         else:
-            custom = _load_custom_stickers()
-            b64data = custom.get(name)
-            if not b64data:
-                return
+            b64data = _load_custom_stickers().get(name)
+            if not b64data: return
             img_bytes = base64.b64decode(b64data)
 
         self.connection.send_file_bytes(f"Sticker_{name}.jpg", img_bytes)
         self._maybe_start_slowmode_cooldown()
 
     def on_emoji_picker(self):
-        if getattr(self, "_emoji_popup", None) is not None:
-            try: self._emoji_popup.destroy()
-            except Exception: pass
-            self._emoji_popup = None
-            return
+        self._toggle_picker("emoji", self.emoji_btn, self._build_emoji_picker)
 
-        popup = tk.Toplevel(self)
-        popup.overrideredirect(True)
-        popup.configure(bg=BG_PANEL, padx=6, pady=6)
-        self._emoji_popup = popup
-
-        x, y = self.winfo_rootx() + self.bottom_bar.winfo_x() + 40, self.winfo_rooty() + self.bottom_bar.winfo_y() - 4
-        popup.geometry(f"+{x}+{y-220}")
-
+    def _build_emoji_picker(self, popup):
         grid = tk.Frame(popup, bg=BG_PANEL)
         grid.pack()
-        
         for i, emoji_char in enumerate(EMOJI_PICKER_SET):
             btn = tk.Label(grid, text=emoji_char, font=EMOJI_FONT, bg=BG_PANEL, fg=FG_TEXT, padx=4, pady=4, cursor="hand2")
             btn.grid(row=i // 10, column=i % 10)
@@ -3334,62 +3675,40 @@ class ChatApp(tk.Tk):
             btn.bind("<Enter>", lambda e, w=btn: w.configure(bg=BTN_NEUTRAL))
             btn.bind("<Leave>", lambda e, w=btn: w.configure(bg=BG_PANEL))
 
-        popup.bind("<FocusOut>", lambda e: self._close_emoji_popup())
-        popup.focus_set()
-
     def _insert_emoji(self, emoji_char: str):
         self.msg_entry.insert("insert", emoji_char)
+        self._close_popup("emoji")
         self.msg_entry.focus_set()
-        self._close_emoji_popup()
+        self.on_entry_key()  # so the typing indicator reflects the inserted emoji
 
-    def _close_emoji_popup(self):
-        if getattr(self, "_emoji_popup", None) is not None:
-            try: self._emoji_popup.destroy()
-            except Exception: pass
-            self._emoji_popup = None
+    # ------------------------------------------------------------------
+    # Event loop
+    # ------------------------------------------------------------------
 
     def poll_queue(self):
-        try:
-            while True:
-                kind, payload = self.event_queue.get_nowait()
-                if kind == "connect_success":
-                    self.title_label.configure(text=f"Connected as {payload['name']} — Room {self.room_entry.get().strip()}")
-                    self._transition_to_chat("join", payload['name'], self.room_entry.get().strip())
-                elif kind == "connect_fail":
-                    self.status_label.configure(text=payload, fg=COLOR_PALETTE["red"])
-                    self._teardown_connection()
-                elif kind == "chat":
-                    self.known_colors.update(payload.get("colors") or {})
-                    self.append_chat_line(payload["raw"], payload.get("msg_id"))
-                elif kind == "react":
-                    self.add_reaction(payload["msg_id"], payload["emoji"], payload.get("sender", ""))
-                elif kind == "system": self.append_system_line(payload)
-                elif kind == "private": self.append_private_line(payload)
-                elif kind == "roster": self.update_roster(payload)
-                elif kind == "colormap":
-                    self.known_colors.update(payload)
-                    self.update_roster(self.current_roster)
-                elif kind == "typing": self.update_typing(payload)
-                elif kind == "ping": notify_ping(payload, root=self)
-                elif kind == "file": self.render_incoming_file(payload["sender"], payload["filename"], payload["data"])
-                elif kind == "disconnected": self._handle_disconnected(payload)
-                elif kind == "slowmode":
-                    self.slowmode_delay = payload
-                    if payload == 0.0: self._end_slowmode_cooldown()
-                elif kind == "admin_status":
-                    self.is_admin = (payload == "1")
-                    if self.connection: self.connection.is_admin = self.is_admin 
-                    self.append_system_line(f"Your admin privileges have been {'granted' if self.is_admin else 'revoked'}.")
-                elif kind == "mute_status":
-                    if payload == "0": self._apply_mute_state(False)
-                    else:
-                        try: until = float(payload.partition(":")[2])
-                        except ValueError: until = 0.0
-                        self._apply_mute_state(True, until)
-                elif kind == "update_check_result": self._handle_update_check_result(payload)
-                elif kind == "update_apply_result": self._handle_update_apply_result(payload)
-        except queue.Empty: pass
-        self.after(50, self.poll_queue)
+        for _ in range(self.MAX_EVENTS_PER_POLL):
+            try: kind, payload = self.event_queue.get_nowait()
+            except queue.Empty: break
+            handler = self._event_handlers.get(kind)
+            if handler is None: continue
+            try:
+                handler(payload)
+            except Exception:
+                traceback.print_exc()  # one bad event must never stop the UI loop
+        # Poll quickly while busy, lazily when idle.
+        self.after(30 if not self.event_queue.empty() else 70, self.poll_queue)
+
+    def _on_chat_event(self, payload):
+        self.known_colors.update(payload.get("colors") or {})
+        self.append_chat_line(payload["raw"], payload.get("msg_id"))
+
+    def _on_colormap_event(self, colors):
+        self.known_colors.update(colors)
+        self.update_roster(self.current_roster)
+
+    # ------------------------------------------------------------------
+    # Chat log rendering
+    # ------------------------------------------------------------------
 
     def _color_tag(self, color_hex: str) -> str:
         tag = f"c_{color_hex.lstrip('#')}"
@@ -3399,17 +3718,16 @@ class ChatApp(tk.Tk):
         return tag
 
     def _insert_name(self, name: str, color_value: str):
-        """Insert a name into the chat log. A gradient-unlocked sender's
-        name gets its own uniquely-tagged instance (so hovering over one
-        occurrence in the scroll history doesn't animate every other
-        occurrence of that name), with the same static-gradient/hover
-        animation the roster uses."""
+        """Insert a name into the chat log. A gradient-unlocked sender's name
+        gets its own uniquely-tagged instance (so hovering one occurrence in
+        the history doesn't animate every other), with the same
+        static-gradient/hover-animation the roster uses."""
         palette = GRADIENT_PALETTES.get(color_value)
         if palette is None:
             self.log.insert("end", name, (self._color_tag(color_value),))
             return
 
-        self._rainbow_instance_seq = getattr(self, "_rainbow_instance_seq", 0) + 1
+        self._rainbow_instance_seq += 1
         group_tag = f"rbname_{self._rainbow_instance_seq}"
         char_tags = []
         for i, ch in enumerate(name):
@@ -3427,139 +3745,126 @@ class ChatApp(tk.Tk):
         self.log.tag_bind(group_tag, "<Leave>", on_leave)
 
     def append_chat_line(self, raw: str, msg_id: str = None):
-        self.log.configure(state="normal")
-        start_index = self.log.index("end-1c")
-        
-        raw_safe = clean_non_bmp(raw)
-        self.log.insert("end", f"[{time.strftime('%H:%M')}] ", ("timestamp",))
-        
-        if ": " in raw_safe:
-            prefix, rest = raw_safe.split(": ", 1)
-            self._record_user_message_time(prefix)
-            self._insert_name(prefix, self.known_colors.get(prefix.lower(), FG_TEXT))
-            self.log.insert("end", ": " + rest)
-            
-            align_tag = "align_right" if prefix.lower() == self.my_name.lower() else "align_left"
-            if align_tag not in self.known_tags:
-                self.log.tag_configure(align_tag, justify="right" if align_tag == "align_right" else "left")
-                self.known_tags.add(align_tag)
-            
-            end_index = self.log.index("end-1c")
-            self.log.tag_add(align_tag, start_index, end_index)
-            
-            if msg_id:
-                tag_name = f"msg_{msg_id}"
-                self.log.tag_add(tag_name, start_index, end_index)
-                self.log.tag_bind(tag_name, "<Button-3>", lambda e, mid=msg_id: self.show_reaction_menu(e, mid))
-                self.log.tag_bind(tag_name, "<Button-2>", lambda e, mid=msg_id: self.show_reaction_menu(e, mid))
-                
-                self.log.mark_set(f"react_mark_{msg_id}", end_index)
-                self.log.mark_gravity(f"react_mark_{msg_id}", "left")
-        else:
-            self.log.insert("end", raw_safe)
+        prefix, sep, rest = raw.partition(": ")
+        is_chat = bool(sep)
+        mine = is_chat and prefix.lower() == self.my_name.lower()
 
-        self.log.insert("end", "\n")
-        self.log.configure(state="disabled")
-        self.log.see("end")
+        with self._log_append(force_scroll=mine):
+            start_index = self.log.index("end-1c")
+            self.log.insert("end", f"[{time.strftime('%H:%M')}] ", ("timestamp",))
+
+            if is_chat:
+                self._record_user_message_time(prefix)
+                self._insert_name(prefix, self.known_colors.get(prefix.lower(), FG_TEXT))
+                self.log.insert("end", ": " + rest)
+
+                end_index = self.log.index("end-1c")
+                self.log.tag_add("align_right" if mine else "align_left", start_index, end_index)
+                if msg_id:
+                    self.log.tag_add(f"msg_{msg_id}", start_index, end_index)
+                    self.log.mark_set(f"react_mark_{msg_id}", end_index)
+                    self.log.mark_gravity(f"react_mark_{msg_id}", "left")
+            else:
+                self.log.insert("end", raw)
+
+            self.log.insert("end", "\n")
+
+        if not mine:
+            self._note_unread()
+
+    def append_system_line(self, text: str):
+        with self._log_append():
+            self.log.insert("end", f"* {text}\n", ("system",))
+
+    def append_private_line(self, text: str):
+        with self._log_append():
+            self.log.insert("end", f"[private] {text}\n", ("private",))
+
+    # ---- reactions ----
+
+    def _on_log_right_click(self, event):
+        index = self.log.index(f"@{event.x},{event.y}")
+        for tag in self.log.tag_names(index):
+            if tag.startswith("msg_"):
+                self.show_reaction_menu(event, tag[len("msg_"):])
+                return "break"
 
     def show_reaction_menu(self, event, msg_id):
         menu = tk.Menu(self, tearoff=0, bg=BG_PANEL, fg=FG_TEXT)
-        for emoji in ["😀", "😂", "❤️", "👍", "🔥", "😢", "😡"]:
+        for emoji in self.REACTION_CHOICES:
             menu.add_command(label=emoji, command=lambda e=emoji: self.send_reaction(msg_id, e))
         try: menu.tk_popup(event.x_root, event.y_root)
         finally: menu.grab_release()
 
     def send_reaction(self, msg_id, emoji):
-        if not self.connection: return
-        self.connection.send_react(msg_id, emoji)
+        if self.connection:
+            self.connection.send_react(msg_id, emoji)
 
     def add_reaction(self, msg_id, emoji, sender_name):
         if not sender_name:
             return
-        reactors = self.message_reactions.setdefault(msg_id, {}).setdefault(emoji, set())
+        per_message = self.message_reactions.setdefault(msg_id, {})
+        reactors = per_message.setdefault(emoji, set())
         key = sender_name.lower()
         if key in reactors:
             reactors.discard(key)  # toggle off — clicking your own reaction again removes it
             if not reactors:
-                del self.message_reactions[msg_id][emoji]
-                if not self.message_reactions[msg_id]:
+                del per_message[emoji]
+                if not per_message:
                     del self.message_reactions[msg_id]
         else:
-            reactors.add(key)  # a set, so this is naturally idempotent even if a stray duplicate ever arrived
+            reactors.add(key)  # a set, so a stray duplicate is naturally idempotent
         self.render_reactions(msg_id)
 
     def render_reactions(self, msg_id):
         mark_name = f"react_mark_{msg_id}"
         try: self.log.index(mark_name)
-        except tk.TclError: return 
-        
+        except tk.TclError: return  # that message was trimmed away (or never had an id)
+
         react_tag = f"react_text_{msg_id}"
-        self.log.configure(state="normal")
-        
-        ranges = self.log.tag_ranges(react_tag)
-        if ranges: self.log.delete(ranges[0], ranges[1])
-        
-        if reactions := self.message_reactions.get(msg_id):
-            self.log.insert(mark_name, "  [" + " ".join(f"{e} {len(reactors)}" for e, reactors in reactions.items()) + "]", (react_tag, "reaction_style"))
-        
-        self.log.configure(state="disabled")
+        with self._log_edit():
+            ranges = self.log.tag_ranges(react_tag)
+            if ranges: self.log.delete(ranges[0], ranges[1])
+            if reactions := self.message_reactions.get(msg_id):
+                summary = "  [" + " ".join(f"{e} {len(reactors)}" for e, reactors in reactions.items()) + "]"
+                self.log.insert(mark_name, summary, (react_tag, "reaction_style"))
 
-    def append_system_line(self, text: str):
-        self.log.configure(state="normal")
-        self.log.insert("end", f"* {clean_non_bmp(text)}\n", ("system",))
-        self.log.configure(state="disabled")
-        self.log.see("end")
+    # ---- attachments ----
 
-    def append_private_line(self, text: str):
-        self.log.configure(state="normal")
-        self.log.insert("end", f"[private] {clean_non_bmp(text)}\n", ("private",))
-        self.log.configure(state="disabled")
-        self.log.see("end")
+    def render_incoming_file(self, payload):
+        sender, filename, data, thumb = payload["sender"], payload["filename"], payload["data"], payload.get("thumb")
+        mine = sender.lower() == self.my_name.lower()
 
-    def render_incoming_file(self, sender: str, filename: str, data: bytes):
-        self.log.configure(state="normal")
-        
-        align_tag = "align_right" if sender.lower() == self.my_name.lower() else "align_left"
-        if align_tag not in self.known_tags:
-            self.log.tag_configure(align_tag, justify="right" if align_tag == "align_right" else "left")
-            self.known_tags.add(align_tag)
+        with self._log_append(force_scroll=mine):
+            start_index = self.log.index("end-1c")
+            self.log.insert("end", f"[{time.strftime('%H:%M')}] ", ("timestamp",))
+            self._insert_name(sender, self.known_colors.get(sender.lower(), FG_TEXT))
+            self.log.insert("end", f" sent an attachment ({filename}):\n")
 
-        start_index = self.log.index("end-1c")
-        self.log.insert("end", f"[{time.strftime('%H:%M')}] ", ("timestamp",))
-        self._insert_name(sender, self.known_colors.get(sender.lower(), FG_TEXT))
-        self.log.insert("end", f" sent an attachment ({clean_non_bmp(filename)}):\n")
+            photo = None
+            if thumb is not None and ImageTk is not None:
+                try: photo = ImageTk.PhotoImage(thumb)
+                except Exception: photo = None
 
-        if Image is not None and filename.lower().endswith((".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp")):
-            try:
-                img = Image.open(io.BytesIO(data))
-                img.thumbnail((260, 260))
-                photo = ImageTk.PhotoImage(img)
+            if photo is not None:
                 self.photo_cache.append(photo)
                 self.log.image_create("end", image=photo)
-                
                 img_tag = f"img_{len(self.photo_cache)}"
                 self.log.tag_add(img_tag, self.log.index("end-2c"), self.log.index("end-1c"))
-                for bind in ["<Button-2>", "<Button-3>"]:
+                for bind in ("<Button-2>", "<Button-3>"):
                     self.log.tag_bind(img_tag, bind, lambda e, d=data, fn=filename: self._show_image_context_menu(e, d, fn))
-                
-                self.log.insert("end", "\n\n")
-                self.log.tag_add(align_tag, start_index, self.log.index("end-1c"))
-                self.log.configure(state="disabled")
-                self.log.see("end")
-                return
-            except Exception: pass
+            else:
+                embed = tk.Frame(self.log, bg=BG_PANEL, bd=1, relief="solid", padx=12, pady=8)
+                tk.Label(embed, text=f"📁  {filename}", bg=BG_PANEL, fg=FG_TEXT, font=BOLD_FONT).pack(side="left", padx=(0, 14))
+                tk.Label(embed, text=f"({len(data) / 1024:.1f} KB)", bg=BG_PANEL, fg=FG_MUTED, font=CHAT_FONT).pack(side="left", padx=(0, 14))
+                make_button(embed, "Download", lambda d=data, fn=filename: self._save_file_to_disk(d, fn), bg=BTN_GREEN, hover_bg=BTN_GREEN_HOVER, padx=10, pady=4).pack(side="right")
+                self.log.window_create("end", window=embed)
 
-        embed = tk.Frame(self.log, bg=BG_PANEL, bd=1, relief="solid", padx=12, pady=8)
-        tk.Label(embed, text=f"📁  {clean_non_bmp(filename)}", bg=BG_PANEL, fg=FG_TEXT, font=BOLD_FONT).pack(side="left", padx=(0, 14))
-        tk.Label(embed, text=f"({len(data) / 1024:.1f} KB)", bg=BG_PANEL, fg=FG_MUTED, font=CHAT_FONT).pack(side="left", padx=(0, 14))
-        make_button(embed, "Download", lambda d=data, fn=filename: self._save_file_to_disk(d, fn), bg=BTN_GREEN, hover_bg=BTN_GREEN_HOVER, padx=10, pady=4).pack(side="right")
+            self.log.insert("end", "\n\n")
+            self.log.tag_add("align_right" if mine else "align_left", start_index, self.log.index("end-1c"))
 
-        self.log.window_create("end", window=embed)
-        self.log.insert("end", "\n\n")
-        self.log.tag_add(align_tag, start_index, self.log.index("end-1c"))
-        
-        self.log.configure(state="disabled")
-        self.log.see("end")
+        if not mine:
+            self._note_unread()
 
     def _save_file_to_disk(self, data: bytes, filename: str):
         if path := filedialog.asksaveasfilename(initialfile=filename, title="Save file as"):
@@ -3575,25 +3880,33 @@ class ChatApp(tk.Tk):
         try: menu.tk_popup(event.x_root, event.y_root)
         finally: menu.grab_release()
 
+    # ------------------------------------------------------------------
+    # Member list + typing indicator
+    # ------------------------------------------------------------------
+
     def update_roster(self, names):
-        self.current_roster = [self.my_name] + sorted(n for n in names if n.lower() != self.my_name.lower())
+        me = self.my_name
+        roster = [me] + sorted((n for n in names if n.lower() != me.lower()), key=str.lower)
+        signature = tuple((n, self.known_colors.get(n.lower(), FG_TEXT)) for n in roster)
+        self.current_roster = roster
+        if signature == self._roster_sig:
+            return  # nothing visible changed — keep the existing widgets (and any hover animation)
+        self._roster_sig = signature
+
         for child in self.member_list_frame.winfo_children(): child.destroy()
-        for n in self.current_roster:
-            color = self.known_colors.get(n.lower(), FG_TEXT)
+        for n, color in signature:
             palette = GRADIENT_PALETTES.get(color)
             if palette:
-                self._build_rainbow_name_widget(self.member_list_frame, clean_non_bmp(n), palette).pack(fill="x", pady=2, anchor="w")
+                self._build_rainbow_name_widget(self.member_list_frame, n, palette).pack(fill="x", pady=2, anchor="w")
             else:
-                tk.Label(self.member_list_frame, text=clean_non_bmp(n), bg=BG_PANEL, fg=color, anchor="w", font=CHAT_FONT).pack(fill="x", pady=2)
+                tk.Label(self.member_list_frame, text=n, bg=BG_PANEL, fg=color, anchor="w", font=CHAT_FONT).pack(fill="x", pady=2)
 
     def _wire_rainbow_hover(self, apply_colors, palette_len: int = None):
-        """Shared 'static gradient by default, colors shift while
-        hovering' animation driver. `apply_colors(offset)` should
-        recolor whatever's being animated for the given palette offset
-        (and may raise tk.TclError if the underlying widget/tag is
-        gone — that's treated as a normal stop condition, not an error,
-        since a roster refresh or scrolled-away chat tag can destroy the
-        target mid-animation). Returns (on_enter, on_leave) to bind."""
+        """Shared 'static gradient by default, colors shift while hovering'
+        driver. `apply_colors(offset)` recolors whatever is being animated; it
+        may raise tk.TclError if the widget/tag is gone (a roster refresh or
+        trimmed chat line can destroy it mid-animation) — that's a normal stop
+        condition. Returns (on_enter, on_leave) to bind."""
         palette_len = palette_len or len(RAINBOW_PALETTE)
         anim = {"offset": 0, "active": False}
 
@@ -3624,12 +3937,9 @@ class ChatApp(tk.Tk):
         return on_enter, on_leave
 
     def _build_rainbow_name_widget(self, parent, name: str, palette: list = None):
-        """A name rendered in a small single-line Text widget with one
-        color tag per character — matches the chat log's own rendering
-        technique exactly (rather than separate Label widgets, which
-        each carry their own border/padding overhead that visibly
-        spaces the letters apart when packed side-by-side). Static
-        gradient by default; shifts while hovered, same as in chat."""
+        """A name in a small single-line Text widget with one color tag per
+        character — the same technique as the chat log (separate Labels carry
+        per-widget padding that visibly spaces the letters apart)."""
         palette = palette or RAINBOW_PALETTE
         txt = tk.Text(
             parent, height=1, width=max(len(name), 1), bg=BG_PANEL, fg=FG_TEXT,
@@ -3640,7 +3950,7 @@ class ChatApp(tk.Tk):
         txt.configure(state="disabled")
 
         char_tags = []
-        for i, ch in enumerate(name):
+        for i in range(len(name)):
             tag = f"c{i}"
             txt.tag_add(tag, f"1.{i}", f"1.{i + 1}")
             txt.tag_configure(tag, foreground=palette[i % len(palette)])
@@ -3656,22 +3966,31 @@ class ChatApp(tk.Tk):
         return txt
 
     def update_typing(self, names):
-        now = time.time()
-        for n in names:
-            if n.lower() != self.my_name.lower(): self.typing_last_seen[n] = now
+        """`names` is the authoritative list of who's typing right now."""
+        now, me = time.time(), self.my_name.lower()
+        self.typing_last_seen = {n: now for n in names if n.lower() != me}
         self._render_typing_var()
+        if self.typing_last_seen: self._ensure_typing_prune()
 
     def _render_typing_var(self):
-        active = [n for n, seen in self.typing_last_seen.items() if time.time() - seen <= TYPING_DISPLAY_TIMEOUT]
+        now = time.time()
+        active = [n for n, seen in self.typing_last_seen.items() if now - seen <= TYPING_DISPLAY_TIMEOUT]
         if not active: self.typing_var.set("")
-        elif len(active) == 1: self.typing_var.set(f"{clean_non_bmp(active[0])} is typing...")
-        else: self.typing_var.set(f"{', '.join(clean_non_bmp(n) for n in active)} are typing...")
+        elif len(active) == 1: self.typing_var.set(f"{active[0]} is typing...")
+        else: self.typing_var.set(f"{', '.join(active)} are typing...")
 
-    def _typing_prune_loop(self):
-        stale = [n for n, seen in self.typing_last_seen.items() if time.time() - seen > TYPING_DISPLAY_TIMEOUT]
+    def _ensure_typing_prune(self):
+        if "typing_prune" not in self._timers:
+            self._set_timer("typing_prune", 500, self._typing_prune)
+
+    def _typing_prune(self):
+        """Expires 'is typing' entries whose START was never followed by a STOP.
+        Only runs while someone is actually showing as typing."""
+        now = time.time()
+        stale = [n for n, seen in self.typing_last_seen.items() if now - seen > TYPING_DISPLAY_TIMEOUT]
         for n in stale: del self.typing_last_seen[n]
         if stale: self._render_typing_var()
-        self.after(500, self._typing_prune_loop)
+        if self.typing_last_seen: self._ensure_typing_prune()
 
 
 def main():
@@ -3683,7 +4002,6 @@ if __name__ == "__main__":
     try:
         main()
     except Exception:
-        import traceback
         traceback.print_exc()
         try: input("\nSomething crashed (see above). Press Enter to close this window...")
         except Exception: pass
