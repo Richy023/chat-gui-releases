@@ -1,6 +1,23 @@
 #!/usr/bin/env python3
 """
-chat_gui.py — v1.4.9 — ENCRYPTED instant messenger with a desktop GUI.
+chat_gui.py — v1.4.9b — ENCRYPTED instant messenger with a desktop GUI.
+
+Changes in 1.4.9b:
+- Everyone can edit or delete their own messages (right-click a message).
+  Admins (and the host) can also delete other people's messages. The host
+  can't have its messages deleted by an admin. Edited messages show
+  "(edited)"; deleted ones become "[message deleted]".
+- The admin log (host + admins) records every edit (old -> new text) and
+  delete (the text that was removed), with who did it.
+- Backwards compatible: edit/delete updates are only sent to clients that
+  announced support, so 1.4.9a/1.4.8x members just keep seeing the original
+  message instead of stray protocol text.
+
+Changes in 1.4.9a:
+- Fixed the "New messages" button sometimes staying on screen while you were
+  already at the bottom of the chat (most often right after starting a room,
+  seen on macOS). The button now re-checks once the window has finished laying
+  out, and also when the window is resized.
 
 Changes in 1.4.9 (tidy-up + UI/UX efficiency pass — no protocol changes,
 so 1.4.9 interoperates with 1.4.8x):
@@ -198,7 +215,7 @@ except ImportError:
 if sys.platform == "darwin":
     ensure_installed("pyobjus", required=False)
 
-VERSION = "1.4.9"
+VERSION = "1.4.9b"
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -303,6 +320,11 @@ REACT_PREFIX = "__REACT__:"
 RAINBOW_UNLOCK_PREFIX = "__RAINBOW_UNLOCK__:"
 BLUE_UNLOCK_PREFIX = "__BLUE_UNLOCK__:"
 FINGERPRINT_PREFIX = "__FINGERPRINT__:"
+EDIT_PREFIX = "__EDIT__:"          # guest -> host: "msg_id|new text"; host -> clients: "msg_id|editor|new text"
+DELETE_PREFIX = "__DELETE__:"      # guest -> host: "msg_id";          host -> clients: "msg_id|deleter"
+FEATURES_PREFIX = "__FEATURES__:"  # each side announces optional features it understands
+FEATURE_EDIT = "edit"              # edit/delete of messages (added in 1.4.9b)
+HOST_FEATURES = frozenset({FEATURE_EDIT})
 
 # ---- Secret gradient unlocks ----
 # Typed into the "Host IP" field on the join screen instead of an actual
@@ -927,6 +949,31 @@ def perform_globalban(fingerprint: str, reason: str) -> str:
 # install time, so the in-app viewer stays complete going forward
 # without needing the whole history re-embedded on every release.
 EMBEDDED_CHANGELOG = [
+    {   "version": "1.4.9b",
+        "date": "2026-10-13",
+        "notes": (
+            "New: edit and delete your own messages. Right-click a message you sent "
+            "and choose Edit or Delete — everyone's chat updates, edited messages show "
+            "'(edited)' and deleted ones show '[message deleted]'. Admins (and the host) "
+            "can also delete other people's messages from the same right-click menu; "
+            "the host's own messages can only be deleted by the host. The admin log "
+            "(what the host and admins see) now records every edit — showing the old "
+            "and new text — and every delete, with the username of whoever did it. "
+            "Editing/deleting needs the host and the person to be on 1.4.9b; anyone on "
+            "an older version simply keeps seeing the original message (no garbled "
+            "text), and if the host is older you'll be told it isn't supported."
+        ),
+    },
+    {   "version": "1.4.9a",
+        "date": "2026-10-12",
+        "notes": (
+            "Fixed the '↓ New messages' button sometimes staying on screen even "
+            "though you were already at the bottom of the chat — most noticeable "
+            "right after starting a room (seen on macOS). The button now re-checks "
+            "once the window has finished laying out, and also when the window is "
+            "resized. No other changes, and no protocol changes."
+        ),
+    },
     {   "version": "1.4.9",
         "date": "2026-10-09",
         "notes": (
@@ -1157,11 +1204,12 @@ def _save_custom_stickers(stickers: dict):
 
 
 class Hub:
-    def __init__(self, fernet: Fernet, host_name: str, on_typing_change, on_admin_log):
+    def __init__(self, fernet: Fernet, host_name: str, on_typing_change, on_admin_log, on_message_event=None):
         self.fernet = fernet
         self.host_name = host_name
         self.on_typing_change = on_typing_change
         self.on_admin_log = on_admin_log
+        self.on_message_event = on_message_event  # (kind, payload) for the host's own UI
         self.lock = threading.Lock()
         self.closed = False  # set when the host shuts the room down; handler threads then stay quiet
         self.clients = {}
@@ -1176,6 +1224,7 @@ class Hub:
         self.slowmode_delay = 0.0
         self.last_msg_time = {}
         self.gradient_users = {}  # name.lower() -> sentinel (RAINBOW_SENTINEL, BLUE_SENTINEL, ...)
+        self.messages = {}        # msg_id -> {"author", "text"}; oldest dropped past MAX_TRACKED_MESSAGES
 
     # ---- identity helpers ----
 
@@ -1232,6 +1281,83 @@ class Hub:
         for s in targets:
             self.send_private(s, msg_proto)
 
+    # ---- message ownership: edit / delete ----
+
+    MAX_TRACKED_MESSAGES = 1000
+
+    def record_message(self, msg_id: str, author: str, text: str):
+        """Remembers who sent a message so later edits/deletes can be authorised and
+        logged. An id we already know is never reassigned — otherwise someone could
+        re-send a victim's id and take over their message."""
+        if not msg_id or len(msg_id) > 32:
+            return
+        with self.lock:
+            if msg_id in self.messages:
+                return
+            self.messages[msg_id] = {"author": author, "text": text}
+            while len(self.messages) > self.MAX_TRACKED_MESSAGES:
+                self.messages.pop(next(iter(self.messages)))
+
+    def _emit(self, kind: str, payload: dict):
+        if self.on_message_event:
+            self.on_message_event(kind, payload)
+
+    def edit_message(self, msg_id: str, editor: str, new_text: str):
+        """Authors only. Returns an error message for the requester, or None on
+        success (or when nothing changed)."""
+        new_text = new_text.strip()
+        if not new_text:
+            return "An edited message can't be empty — delete it instead."
+        with self.lock:
+            record = self.messages.get(msg_id)
+            if record is None:
+                return "That message can't be edited any more."
+            if record["author"].lower() != editor.lower():
+                return "You can only edit your own messages."
+            old_text = record["text"]
+            if old_text == new_text:
+                return None
+            record["text"] = new_text
+        self.broadcast_feature(FEATURE_EDIT, f"{EDIT_PREFIX}{msg_id}|{editor}|{new_text}")
+        self._emit("msg_edit", {"msg_id": msg_id, "text": new_text, "editor": editor})
+        self.log_admin_action(editor, f'edited their message: "{_clip(old_text)}" → "{_clip(new_text)}"')
+        return None
+
+    def delete_message(self, msg_id: str, deleter: str, deleter_is_admin: bool):
+        """Authors may delete their own; admins (and the host) may delete anyone's
+        except the host's. Returns an error message, or None on success."""
+        with self.lock:
+            record = self.messages.get(msg_id)
+            if record is None:
+                return "That message can't be deleted any more."
+            author, text = record["author"], record["text"]
+            own = author.lower() == deleter.lower()
+            if not own and not deleter_is_admin:
+                return "You can only delete your own messages."
+            if not own and self.is_host(author):
+                return "You cannot delete the host's messages."
+            del self.messages[msg_id]  # gone for good — it can't be edited or deleted again
+        self.broadcast_feature(FEATURE_EDIT, f"{DELETE_PREFIX}{msg_id}|{deleter}")
+        self._emit("msg_delete", {"msg_id": msg_id, "deleter": deleter})
+        if own:
+            self.log_admin_action(deleter, f'deleted their own message: "{_clip(text)}"')
+        else:
+            self.log_admin_action(deleter, f'deleted {author}\'s message: "{_clip(text)}"')
+        return None
+
+    def set_features(self, sock, features):
+        with self.lock:
+            if sock in self.clients:
+                self.clients[sock]["features"] = set(features)
+
+    def broadcast_feature(self, feature: str, text: str):
+        """Like broadcast(), but only to clients that announced `feature` — so older
+        versions never receive protocol text they'd display as a chat line."""
+        with self.lock:
+            targets = [s for s, info in self.clients.items() if feature in info.get("features", ())]
+        for s in targets:
+            self.send_private(s, text)
+
     # ---- do-not-disturb ----
 
     def set_dnd(self, name, active):
@@ -1257,6 +1383,7 @@ class Hub:
             self.clients[sock] = {
                 "name": name, "ip": ip, "muted_until": 0.0,
                 "muted_by": None, "mute_reason": None, "kicked": False,
+                "features": set(),
             }
 
     def remove_client(self, sock):
@@ -1434,6 +1561,10 @@ class Hub:
         self.disconnect(sock)
 
 
+def _clip(text: str, limit: int = 200) -> str:
+    return text if len(text) <= limit else text[:limit - 1] + "…"
+
+
 # ---- Files ----
 
 IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp")
@@ -1566,6 +1697,13 @@ def _process_guest_message(text, sock, guest_name, hub: Hub, host_name, event_qu
             event_queue.put(("colormap", hub.colormap_snapshot()))
             return
 
+    if text.startswith(FEATURES_PREFIX):
+        hub.set_features(sock, [f for f in text[len(FEATURES_PREFIX):].split(",") if f])
+        # Only a client that announced itself gets our reply — an older one never
+        # does, so it never sees protocol text it can't parse.
+        hub.send_private(sock, FEATURES_PREFIX + ",".join(sorted(HOST_FEATURES)))
+        return
+
     if text.startswith(FINGERPRINT_PREFIX):
         fp = text[len(FINGERPRINT_PREFIX):].strip()
         hub.set_fingerprint(sock, fp)
@@ -1579,6 +1717,18 @@ def _process_guest_message(text, sock, guest_name, hub: Hub, host_name, event_qu
     if hub.is_muted(sock):
         info = hub.get_info(sock)
         hub.send_private(sock, MUTE_NOTICE_PREFIX + f"You are muted by {info['muted_by']} until {format_time(info['muted_until'])}. Reason: {info['mute_reason']}")
+        return
+
+    if text.startswith(EDIT_PREFIX):
+        msg_id, _, new_text = text[len(EDIT_PREFIX):].partition("|")
+        if error := hub.edit_message(msg_id, guest_name, new_text):
+            _guest_notice(hub, sock, error)
+        return
+
+    if text.startswith(DELETE_PREFIX):
+        msg_id = text[len(DELETE_PREFIX):].partition("|")[0]
+        if error := hub.delete_message(msg_id, guest_name, is_admin):
+            _guest_notice(hub, sock, error)
         return
 
     if text.startswith(REACT_PREFIX):
@@ -1603,6 +1753,8 @@ def _process_guest_message(text, sock, guest_name, hub: Hub, host_name, event_qu
         return
 
     msg_id, _, raw_text = text[len(MSG_PREFIX):].partition("|")
+    _, has_name, body = raw_text.partition(": ")
+    hub.record_message(msg_id, guest_name, body if has_name else raw_text)
     _ping_from_guest(hub, sock, guest_name, host_name, raw_text, event_queue)
     event_queue.put(("chat", {"raw": raw_text, "colors": hub.colormap_snapshot(), "msg_id": msg_id}))
     hub.broadcast(text, exclude_sock=sock)
@@ -1701,7 +1853,8 @@ HELP_TEXT = (
     "Commands: /mute <name> <min> [reason], /unmute <name>, /kick <name> [reason], "
     "/ban <name> [min|perm] [reason], /unban <ip>, /slowmode [sec], /admin <name>, /unadmin <name>, "
     "/color <name>, /colors, /list, /clear [lines], /whisper <name> <msg>, /help — "
-    "host only: /ipban <ip> [min|perm] [reason]"
+    "host only: /ipban <ip> [min|perm] [reason]. "
+    "Right-click a message to edit/delete it (admins can delete anyone's)."
 )
 
 PERMANENT_WORDS = ("perm", "indefinite", "0", "infinite")
@@ -1921,7 +2074,7 @@ GUEST_SIMPLE_EVENTS = (
 LEAVE_PATTERN = re.compile(r"^\* (.+?) (?:left the chat|has been kicked|has been IP banned) \*$")
 JOIN_PATTERN = re.compile(r"^\* (.+?) joined the chat \*$")
 
-def guest_recv_loop(sock, fernet, event_queue, local_colors, colors_lock, known_names, host_ip, closing):
+def guest_recv_loop(sock, fernet, event_queue, local_colors, colors_lock, known_names, host_ip, closing, host_features):
     typing_names = set()
     put = event_queue.put
 
@@ -1969,6 +2122,18 @@ def guest_recv_loop(sock, fernet, event_queue, local_colors, colors_lock, known_
             return True
         if text.startswith(FILE_PREFIX):
             handle_incoming_file(text, event_queue)
+            return True
+        if text.startswith(FEATURES_PREFIX):
+            host_features.update(f for f in text[len(FEATURES_PREFIX):].split(",") if f)
+            return True
+        if text.startswith(EDIT_PREFIX):
+            msg_id, _, rest = text[len(EDIT_PREFIX):].partition("|")
+            editor, _, new_text = rest.partition("|")
+            put(("msg_edit", {"msg_id": msg_id, "text": new_text, "editor": editor}))
+            return True
+        if text.startswith(DELETE_PREFIX):
+            msg_id, _, deleter = text[len(DELETE_PREFIX):].partition("|")
+            put(("msg_delete", {"msg_id": msg_id, "deleter": deleter}))
             return True
         if text.startswith(REACT_PREFIX):
             msg_id, _, rest = text[len(REACT_PREFIX):].partition("|")
@@ -2023,6 +2188,7 @@ class HostConnection:
             fernet, name,
             on_typing_change=lambda: event_queue.put(("typing", self.hub.typing_names())),
             on_admin_log=lambda msg: event_queue.put(("system", msg)),
+            on_message_event=lambda kind, payload: event_queue.put((kind, payload)),
         )
 
         self.server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -2075,6 +2241,7 @@ class HostConnection:
 
         msg_id = os.urandom(4).hex()
         full_msg = f"{self.name}: {text}"
+        self.hub.record_message(msg_id, self.name, text)
         self.event_queue.put(("chat", {"raw": full_msg, "colors": self.hub.colormap_snapshot(), "msg_id": msg_id}))
         self.hub.broadcast(f"{MSG_PREFIX}{msg_id}|{full_msg}")
 
@@ -2086,6 +2253,15 @@ class HostConnection:
 
     def send_typing(self, started: bool):
         self.hub.broadcast((TYPING_START_PREFIX if started else TYPING_STOP_PREFIX) + self.name)
+
+    def send_edit(self, msg_id: str, new_text: str):
+        if error := self.hub.edit_message(msg_id, self.name, new_text):
+            self.event_queue.put(("system", error))
+
+    def send_delete(self, msg_id: str):
+        # The host may delete anyone's message (including its own).
+        if error := self.hub.delete_message(msg_id, self.name, deleter_is_admin=True):
+            self.event_queue.put(("system", error))
 
     def send_react(self, msg_id: str, emoji: str):
         self.hub.broadcast(f"{REACT_PREFIX}{msg_id}|{emoji}|{self.name}")
@@ -2129,6 +2305,7 @@ class GuestConnection:
         self.colors_lock = threading.Lock()
         self.closing = threading.Event()
         self.is_admin = False
+        self.host_features = set()  # filled in when the host answers our FEATURES announcement
 
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         try:
@@ -2162,10 +2339,11 @@ class GuestConnection:
     def start(self, unlock_prefix: str = None):
         threading.Thread(
             target=guest_recv_loop,
-            args=(self.sock, self.fernet, self.event_queue, self.local_colors, self.colors_lock, self.known_names, self.host, self.closing),
+            args=(self.sock, self.fernet, self.event_queue, self.local_colors, self.colors_lock, self.known_names, self.host, self.closing, self.host_features),
             daemon=True,
         ).start()
         self._send(FINGERPRINT_PREFIX + get_machine_fingerprint(), report=False)
+        self._send(FEATURES_PREFIX + ",".join(sorted(HOST_FEATURES)), report=False)
         if unlock_prefix:
             self._send(unlock_prefix + "1", report=False)
 
@@ -2181,6 +2359,22 @@ class GuestConnection:
     def _colors_copy(self) -> dict:
         with self.colors_lock:
             return dict(self.local_colors)
+
+    def _host_supports_edit(self) -> bool:
+        if FEATURE_EDIT in self.host_features:
+            return True
+        self.event_queue.put(("system", "Editing and deleting messages isn't available — the host is running an older version."))
+        return False
+
+    def send_edit(self, msg_id: str, new_text: str):
+        # No optimistic local update: the host checks permission and echoes the
+        # edit to everyone (including us), so what we show always matches the room.
+        if self._host_supports_edit():
+            self._send(f"{EDIT_PREFIX}{msg_id}|{new_text}")
+
+    def send_delete(self, msg_id: str):
+        if self._host_supports_edit():
+            self._send(f"{DELETE_PREFIX}{msg_id}")
 
     def send_react(self, msg_id: str, emoji: str):
         self._send(f"{REACT_PREFIX}{msg_id}|{emoji}|{self.name}", report=False)
@@ -2381,6 +2575,8 @@ class ChatApp(tk.Tk):
             "connect_fail": self._on_connect_fail,
             "chat": self._on_chat_event,
             "react": lambda p: self.add_reaction(p["msg_id"], p["emoji"], p.get("sender", "")),
+            "msg_edit": self._on_msg_edit,
+            "msg_delete": self._on_msg_delete,
             "system": self.append_system_line,
             "private": self.append_private_line,
             "roster": self.update_roster,
@@ -2415,6 +2611,8 @@ class ChatApp(tk.Tk):
         self.known_colors = {}
         self.known_tags = set()
         self.message_reactions = {}
+        self._msg_authors = {}         # msg_id -> author name, for "deleted by ..." wording
+        self._my_messages = {}         # msg_id -> current text of messages *I* sent (editable)
         self.typing_last_seen = {}
         self.user_msg_times = {}       # name.lower() -> recent message timestamps (spam ranking)
         self.user_last_msg_time = {}   # name.lower() -> timestamp of their last message (idle ranking)
@@ -2929,6 +3127,8 @@ class ChatApp(tk.Tk):
         self.log.tag_configure("private", foreground=COLOR_PALETTE["yellow"])
         self.log.tag_configure("timestamp", foreground=FG_MUTED, font=(CHAT_FONT[0], 8))
         self.log.tag_configure("reaction_style", foreground=COLOR_PALETTE["yellow"], font=(CHAT_FONT[0], 9))
+        self.log.tag_configure("edited_mark", foreground=FG_MUTED, font=(CHAT_FONT[0], 8, "italic"))
+        self.log.tag_configure("deleted_mark", foreground=FG_MUTED, font=(CHAT_FONT[0], 9, "italic"))
         self.log.tag_configure("align_right", justify="right")
         self.log.tag_configure("align_left", justify="left")
 
@@ -3756,12 +3956,20 @@ class ChatApp(tk.Tk):
             if is_chat:
                 self._record_user_message_time(prefix)
                 self._insert_name(prefix, self.known_colors.get(prefix.lower(), FG_TEXT))
-                self.log.insert("end", ": " + rest)
+                self.log.insert("end", ": ")
+                body_start = self.log.index("end-1c")
+                self.log.insert("end", rest)
 
                 end_index = self.log.index("end-1c")
                 self.log.tag_add("align_right" if mine else "align_left", start_index, end_index)
                 if msg_id:
                     self.log.tag_add(f"msg_{msg_id}", start_index, end_index)
+                    self.log.tag_add(f"body_{msg_id}", body_start, end_index)  # just the text — what edit/delete replace
+                    self._msg_authors[msg_id] = prefix
+                    if len(self._msg_authors) > 3000:
+                        self._msg_authors.pop(next(iter(self._msg_authors)))
+                    if mine:
+                        self._my_messages[msg_id] = rest
                     self.log.mark_set(f"react_mark_{msg_id}", end_index)
                     self.log.mark_gravity(f"react_mark_{msg_id}", "left")
             else:
@@ -3789,12 +3997,99 @@ class ChatApp(tk.Tk):
                 self.show_reaction_menu(event, tag[len("msg_"):])
                 return "break"
 
-    def show_reaction_menu(self, event, msg_id):
+    def _build_message_menu(self, msg_id):
         menu = tk.Menu(self, tearoff=0, bg=BG_PANEL, fg=FG_TEXT)
         for emoji in self.REACTION_CHOICES:
             menu.add_command(label=emoji, command=lambda e=emoji: self.send_reaction(msg_id, e))
+        mine = msg_id in self._my_messages
+        if mine or self.is_admin:  # is_admin is also True for the host
+            menu.add_separator()
+            if mine:
+                menu.add_command(label="Edit message", command=lambda: self.start_edit(msg_id))
+                menu.add_command(label="Delete message", command=lambda: self.start_delete(msg_id))
+            else:
+                menu.add_command(label="Delete message (admin)", command=lambda: self.start_delete(msg_id))
+        return menu
+
+    def show_reaction_menu(self, event, msg_id):
+        menu = self._build_message_menu(msg_id)
         try: menu.tk_popup(event.x_root, event.y_root)
         finally: menu.grab_release()
+
+    # ---- editing / deleting messages ----
+
+    def start_edit(self, msg_id):
+        current = self._my_messages.get(msg_id)
+        if not self.connection or current is None:
+            return
+        new_text = simpledialog.askstring("Edit message", "Edit your message:", initialvalue=current, parent=self)
+        if new_text is None:
+            return
+        new_text = new_text.strip()
+        if not new_text:
+            return messagebox.showinfo("Edit message", "An edited message can't be empty — use Delete instead.", parent=self)
+        if new_text != current:
+            self.connection.send_edit(msg_id, new_text)
+
+    def start_delete(self, msg_id):
+        if not self.connection:
+            return
+        mine = msg_id in self._my_messages
+        prompt = "Delete your message for everyone?" if mine else "Delete this message for everyone?"
+        if messagebox.askyesno("Delete message", prompt, parent=self):
+            self.connection.send_delete(msg_id)
+
+    def _on_msg_edit(self, payload):
+        msg_id, new_text = payload["msg_id"], payload["text"]
+        if msg_id in self._my_messages:
+            self._my_messages[msg_id] = new_text
+        ranges = self.log.tag_ranges(f"body_{msg_id}")
+        if not ranges:
+            return  # not in our log (we joined after it, or it was trimmed away)
+
+        start, end = str(ranges[0]), str(ranges[1])
+        msg_tag, edited_tag = f"msg_{msg_id}", f"edited_{msg_id}"
+        align = "align_right" if msg_id in self._my_messages else "align_left"
+        with self._log_edit():
+            self.log.delete(start, end)
+            self.log.insert(start, new_text, (f"body_{msg_id}", msg_tag, align))
+            body_end = f"{start}+{len(new_text)}c"
+            marker = self.log.tag_ranges(edited_tag)
+            if marker:
+                anchor = str(marker[1])  # already marked "(edited)" by an earlier edit
+            else:
+                label = " (edited)"
+                self.log.insert(body_end, label, ("edited_mark", edited_tag, msg_tag, align))
+                anchor = f"{body_end}+{len(label)}c"
+            # Deleting the old text collapsed the reactions anchor; put it back at the end of the line.
+            self.log.mark_set(f"react_mark_{msg_id}", anchor)
+            self.log.mark_gravity(f"react_mark_{msg_id}", "left")
+
+    def _on_msg_delete(self, payload):
+        msg_id, deleter = payload["msg_id"], payload["deleter"]
+        author = self._msg_authors.get(msg_id)
+        self._my_messages.pop(msg_id, None)
+        self.message_reactions.pop(msg_id, None)
+        ranges = self.log.tag_ranges(f"body_{msg_id}")
+        if not ranges:
+            return
+
+        start, end = str(ranges[0]), str(ranges[1])
+        msg_tag = f"msg_{msg_id}"
+        own = author is None or author.lower() == deleter.lower()
+        note = "[message deleted]" if own else f"[message deleted by {deleter}]"
+        align = "align_right" if (author or "").lower() == self.my_name.lower() else "align_left"
+        with self._log_edit():
+            # Later text first, so `start`/`end` stay valid: reactions, then the "(edited)" label, then the body.
+            for tag in (f"react_text_{msg_id}", f"edited_{msg_id}"):
+                r = self.log.tag_ranges(tag)
+                if r:
+                    self.log.delete(r[0], r[1])
+            self.log.delete(start, end)
+            self.log.insert(start, note, ("deleted_mark", align))
+            self.log.tag_remove(msg_tag, "1.0", "end")  # no more reactions / edit / delete on this line
+            try: self.log.mark_unset(f"react_mark_{msg_id}")
+            except tk.TclError: pass
 
     def send_reaction(self, msg_id, emoji):
         if self.connection:
