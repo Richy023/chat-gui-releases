@@ -1,6 +1,18 @@
 #!/usr/bin/env python3
 """
-chat_gui.py — v1.4.9b — ENCRYPTED instant messenger with a desktop GUI.
+chat_gui.py — v1.4.9c — ENCRYPTED instant messenger with a desktop GUI.
+
+Changes in 1.4.9c:
+- Attachments (files, images, stickers) can be deleted the same way as
+  messages: right-click -> Delete attachment. The sender can delete their
+  own; admins and the host can delete anyone's (except the host's, which
+  only the host can). A deleted attachment collapses to one line
+  ("[attachment deleted]"), the image preview / download card is removed
+  and its memory released. Admin log entries say "attachment".
+- Attachments now carry a message id (new FILE wire format — 1.4.9c and
+  1.4.9b can't exchange files; update everyone). Right-click an attachment
+  also offers "Save As...".
+- The host now drops a message/attachment whose id it has already seen.
 
 Changes in 1.4.9b:
 - Everyone can edit or delete their own messages (right-click a message).
@@ -215,7 +227,7 @@ except ImportError:
 if sys.platform == "darwin":
     ensure_installed("pyobjus", required=False)
 
-VERSION = "1.4.9b"
+VERSION = "1.4.9c"
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -949,6 +961,21 @@ def perform_globalban(fingerprint: str, reason: str) -> str:
 # install time, so the in-app viewer stays complete going forward
 # without needing the whole history re-embedded on every release.
 EMBEDDED_CHANGELOG = [
+    {   "version": "1.4.9c",
+        "date": "2026-10-14",
+        "notes": (
+            "New: delete attachments. Right-click a file, image or sticker and choose "
+            "Delete attachment — it disappears for everyone: the image preview or "
+            "download button is removed and the line just says '[attachment deleted]' "
+            "(or '[attachment deleted by Name]' if an admin removed it). You can delete "
+            "your own; admins and the host can delete anyone's, except the host's own "
+            "attachments, which only the host can delete. The admin log records these "
+            "too, showing who deleted what. Right-click an attachment also gives you "
+            "'Save As...' (replacing the old image-only menu). Deleted and scrolled-off "
+            "attachments now free their memory. Because attachments now carry an id, "
+            "1.4.9c and 1.4.9b can't exchange files — update everyone together."
+        ),
+    },
     {   "version": "1.4.9b",
         "date": "2026-10-13",
         "notes": (
@@ -1285,18 +1312,21 @@ class Hub:
 
     MAX_TRACKED_MESSAGES = 1000
 
-    def record_message(self, msg_id: str, author: str, text: str):
-        """Remembers who sent a message so later edits/deletes can be authorised and
-        logged. An id we already know is never reassigned — otherwise someone could
-        re-send a victim's id and take over their message."""
+    def record_message(self, msg_id: str, author: str, text: str, kind: str = "text") -> bool:
+        """Remembers who sent a message (kind "text") or attachment (kind "file", `text`
+        = its filename) so later edits/deletes can be authorised and logged. Returns
+        False — and the caller should drop the message — if the id is unusable or already
+        known: an id is never reassigned, otherwise someone could re-send a victim's id
+        to take over their message."""
         if not msg_id or len(msg_id) > 32:
-            return
+            return False
         with self.lock:
             if msg_id in self.messages:
-                return
-            self.messages[msg_id] = {"author": author, "text": text}
+                return False
+            self.messages[msg_id] = {"author": author, "text": text, "kind": kind}
             while len(self.messages) > self.MAX_TRACKED_MESSAGES:
                 self.messages.pop(next(iter(self.messages)))
+        return True
 
     def _emit(self, kind: str, payload: dict):
         if self.on_message_event:
@@ -1312,6 +1342,8 @@ class Hub:
             record = self.messages.get(msg_id)
             if record is None:
                 return "That message can't be edited any more."
+            if record.get("kind") == "file":
+                return "Attachments can't be edited — delete it instead."
             if record["author"].lower() != editor.lower():
                 return "You can only edit your own messages."
             old_text = record["text"]
@@ -1331,18 +1363,19 @@ class Hub:
             if record is None:
                 return "That message can't be deleted any more."
             author, text = record["author"], record["text"]
+            noun = "attachment" if record.get("kind") == "file" else "message"
             own = author.lower() == deleter.lower()
             if not own and not deleter_is_admin:
-                return "You can only delete your own messages."
+                return f"You can only delete your own {noun}s."
             if not own and self.is_host(author):
-                return "You cannot delete the host's messages."
+                return f"You cannot delete the host's {noun}s."
             del self.messages[msg_id]  # gone for good — it can't be edited or deleted again
         self.broadcast_feature(FEATURE_EDIT, f"{DELETE_PREFIX}{msg_id}|{deleter}")
         self._emit("msg_delete", {"msg_id": msg_id, "deleter": deleter})
         if own:
-            self.log_admin_action(deleter, f'deleted their own message: "{_clip(text)}"')
+            self.log_admin_action(deleter, f'deleted their own {noun}: "{_clip(text)}"')
         else:
-            self.log_admin_action(deleter, f'deleted {author}\'s message: "{_clip(text)}"')
+            self.log_admin_action(deleter, f'deleted {author}\'s {noun}: "{_clip(text)}"')
         return None
 
     def set_features(self, sock, features):
@@ -1570,17 +1603,17 @@ def _clip(text: str, limit: int = 200) -> str:
 IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp")
 THUMB_SIZE = (260, 260)
 
-def encode_file_message(sender: str, filename: str, data: bytes) -> str:
+def encode_file_message(sender: str, msg_id: str, filename: str, data: bytes) -> str:
     safe_name = filename.replace("|", "_")
-    return FILE_PREFIX + sender + "|" + safe_name + "|" + base64.b64encode(data).decode("ascii")
+    return FILE_PREFIX + "|".join((sender, msg_id, safe_name, base64.b64encode(data).decode("ascii")))
 
-def build_file_message(sender: str, filepath: str) -> str:
+def read_file_for_send(filepath: str):
+    """Returns (filename, bytes), enforcing the size limit."""
     size = os.path.getsize(filepath)
     if size > MAX_FILE_BYTES:
         raise ValueError(f"File is {size / 1024 / 1024:.1f} MB — the limit is {MAX_FILE_BYTES // 1024 // 1024} MB.")
     with open(filepath, "rb") as f:
-        data = f.read()
-    return encode_file_message(sender, os.path.basename(filepath), data)
+        return os.path.basename(filepath), f.read()
 
 def make_thumbnail(filename: str, data: bytes):
     """Decodes + shrinks an image in whatever thread calls this (the network
@@ -1595,15 +1628,22 @@ def make_thumbnail(filename: str, data: bytes):
     except Exception:
         return None
 
-def handle_incoming_file(text: str, event_queue: queue.Queue):
+def handle_incoming_file(text: str, event_queue: queue.Queue, on_parsed=None) -> bool:
+    """Decodes a FILE message and queues it for the UI. `on_parsed(info)` (used by
+    the host) can veto it by returning False. Returns whether it was queued."""
     try:
-        sender, filename, b64data = text[len(FILE_PREFIX):].split("|", 2)
+        sender, msg_id, filename, b64data = text[len(FILE_PREFIX):].split("|", 3)
         raw = base64.b64decode(b64data)
     except Exception:
         event_queue.put(("system", "[received a corrupted file, ignored]"))
-        return
+        return False
     safe_name = os.path.basename(filename) or "unnamed_file"
-    event_queue.put(("file", {"sender": sender, "filename": safe_name, "data": raw, "thumb": make_thumbnail(safe_name, raw)}))
+    info = {"sender": sender, "msg_id": msg_id, "filename": safe_name, "data": raw}
+    if on_parsed is not None and on_parsed(info) is False:
+        return False
+    info["thumb"] = make_thumbnail(safe_name, raw)
+    event_queue.put(("file", info))
+    return True
 
 
 # ---- Guest handling (runs on the host, one thread per guest) ----
@@ -1748,13 +1788,15 @@ def _process_guest_message(text, sock, guest_name, hub: Hub, host_name, event_qu
         return
 
     if is_file:
-        handle_incoming_file(text, event_queue)
-        hub.broadcast(text, exclude_sock=sock)
+        recorded = lambda info: hub.record_message(info["msg_id"], guest_name, info["filename"], kind="file")
+        if handle_incoming_file(text, event_queue, on_parsed=recorded):
+            hub.broadcast(text, exclude_sock=sock)
         return
 
     msg_id, _, raw_text = text[len(MSG_PREFIX):].partition("|")
     _, has_name, body = raw_text.partition(": ")
-    hub.record_message(msg_id, guest_name, body if has_name else raw_text)
+    if not hub.record_message(msg_id, guest_name, body if has_name else raw_text):
+        return  # unusable or already-used id: never relay it (it could shadow someone's message)
     _ping_from_guest(hub, sock, guest_name, host_name, raw_text, event_queue)
     event_queue.put(("chat", {"raw": raw_text, "colors": hub.colormap_snapshot(), "msg_id": msg_id}))
     hub.broadcast(text, exclude_sock=sock)
@@ -1854,7 +1896,7 @@ HELP_TEXT = (
     "/ban <name> [min|perm] [reason], /unban <ip>, /slowmode [sec], /admin <name>, /unadmin <name>, "
     "/color <name>, /colors, /list, /clear [lines], /whisper <name> <msg>, /help — "
     "host only: /ipban <ip> [min|perm] [reason]. "
-    "Right-click a message to edit/delete it (admins can delete anyone's)."
+    "Right-click a message or attachment to edit/delete it (admins can delete anyone's)."
 )
 
 PERMANENT_WORDS = ("perm", "indefinite", "0", "infinite")
@@ -2267,15 +2309,15 @@ class HostConnection:
         self.hub.broadcast(f"{REACT_PREFIX}{msg_id}|{emoji}|{self.name}")
         self.event_queue.put(("react", {"msg_id": msg_id, "emoji": emoji, "sender": self.name}))
 
-    def _share_file(self, msg: str):
-        handle_incoming_file(msg, self.event_queue)
-        self.hub.broadcast(msg)
-
     def send_file(self, filepath: str):
-        self._share_file(build_file_message(self.name, filepath))
+        self.send_file_bytes(*read_file_for_send(filepath))
 
     def send_file_bytes(self, filename: str, data: bytes):
-        self._share_file(encode_file_message(self.name, filename, data))
+        msg_id = os.urandom(4).hex()
+        msg = encode_file_message(self.name, msg_id, filename, data)
+        self.hub.record_message(msg_id, self.name, os.path.basename(filename), kind="file")
+        handle_incoming_file(msg, self.event_queue)
+        self.hub.broadcast(msg)
 
     def close(self):
         self.hub.closed = True
@@ -2423,15 +2465,13 @@ class GuestConnection:
         self.event_queue.put(("system", f"You {verb} Do Not Disturb."))
         self._send(DND_PREFIX + f"{self.name}|{'on' if active else 'off'}", report=False)
 
-    def _share_file(self, msg: str):
-        if self._send(msg):
-            handle_incoming_file(msg, self.event_queue)
-
     def send_file(self, filepath: str):
-        self._share_file(build_file_message(self.name, filepath))
+        self.send_file_bytes(*read_file_for_send(filepath))
 
     def send_file_bytes(self, filename: str, data: bytes):
-        self._share_file(encode_file_message(self.name, filename, data))
+        msg = encode_file_message(self.name, os.urandom(4).hex(), filename, data)
+        if self._send(msg):
+            handle_incoming_file(msg, self.event_queue)  # show our own copy (the host doesn't echo it back)
 
     def close(self):
         self.closing.set()
@@ -2613,6 +2653,7 @@ class ChatApp(tk.Tk):
         self.message_reactions = {}
         self._msg_authors = {}         # msg_id -> author name, for "deleted by ..." wording
         self._my_messages = {}         # msg_id -> current text of messages *I* sent (editable)
+        self._attachments = {}         # msg_id -> {"data", "filename", "photo", "mine"} for files/images in the log
         self.typing_last_seen = {}
         self.user_msg_times = {}       # name.lower() -> recent message timestamps (spam ranking)
         self.user_last_msg_time = {}   # name.lower() -> timestamp of their last message (idle ranking)
@@ -2766,6 +2807,18 @@ class ChatApp(tk.Tk):
         for mark in self.log.mark_names():
             if mark.startswith("react_mark_") and self.log.compare(mark, "==", "1.0"):
                 self.log.mark_unset(mark)
+        self._prune_attachments()
+
+    def _prune_attachments(self):
+        """Forget attachments whose lines are no longer in the log (trimmed or cleared)
+        so their bytes and previews can be freed."""
+        for msg_id in [m for m in self._attachments if not self.log.tag_ranges(f"attach_{m}")]:
+            self._release_attachment(self._attachments.pop(msg_id))
+
+    def _release_attachment(self, attachment):
+        photo = attachment.get("photo")
+        if photo is not None and photo in self.photo_cache:
+            self.photo_cache.remove(photo)
 
     def _set_status(self, text, kind="error"):
         self.status_label.configure(text=text, fg=self.STATUS_COLORS[kind])
@@ -3468,10 +3521,12 @@ class ChatApp(tk.Tk):
         if len(parts) > 1 and parts[1].isdigit():
             with self._log_edit():
                 self.log.delete(self.log.index(f'end-1c - {int(parts[1])} lines'), "end")
+            self._prune_attachments()
         elif messagebox.askyesno("Confirm Clear", "Are you sure you want to completely clear the chat log?"):
-            self.photo_cache = []
             with self._log_edit():
                 self.log.delete("1.0", "end")
+            self.photo_cache = []
+            self._attachments.clear()
             self._hide_jump()
 
     def on_entry_key(self, event=None):
@@ -3898,6 +3953,11 @@ class ChatApp(tk.Tk):
         # Poll quickly while busy, lazily when idle.
         self.after(30 if not self.event_queue.empty() else 70, self.poll_queue)
 
+    def _remember_author(self, msg_id: str, author: str):
+        self._msg_authors[msg_id] = author
+        if len(self._msg_authors) > 3000:
+            self._msg_authors.pop(next(iter(self._msg_authors)))
+
     def _on_chat_event(self, payload):
         self.known_colors.update(payload.get("colors") or {})
         self.append_chat_line(payload["raw"], payload.get("msg_id"))
@@ -3965,9 +4025,7 @@ class ChatApp(tk.Tk):
                 if msg_id:
                     self.log.tag_add(f"msg_{msg_id}", start_index, end_index)
                     self.log.tag_add(f"body_{msg_id}", body_start, end_index)  # just the text — what edit/delete replace
-                    self._msg_authors[msg_id] = prefix
-                    if len(self._msg_authors) > 3000:
-                        self._msg_authors.pop(next(iter(self._msg_authors)))
+                    self._remember_author(msg_id, prefix)
                     if mine:
                         self._my_messages[msg_id] = rest
                     self.log.mark_set(f"react_mark_{msg_id}", end_index)
@@ -3999,16 +4057,22 @@ class ChatApp(tk.Tk):
 
     def _build_message_menu(self, msg_id):
         menu = tk.Menu(self, tearoff=0, bg=BG_PANEL, fg=FG_TEXT)
-        for emoji in self.REACTION_CHOICES:
-            menu.add_command(label=emoji, command=lambda e=emoji: self.send_reaction(msg_id, e))
-        mine = msg_id in self._my_messages
+        attachment = self._attachments.get(msg_id)
+        if attachment is not None:
+            menu.add_command(label="Save As...", command=lambda: self._save_file_to_disk(attachment["data"], attachment["filename"]))
+            mine, noun = attachment["mine"], "attachment"
+        else:
+            for emoji in self.REACTION_CHOICES:
+                menu.add_command(label=emoji, command=lambda e=emoji: self.send_reaction(msg_id, e))
+            mine, noun = msg_id in self._my_messages, "message"
         if mine or self.is_admin:  # is_admin is also True for the host
             menu.add_separator()
             if mine:
-                menu.add_command(label="Edit message", command=lambda: self.start_edit(msg_id))
-                menu.add_command(label="Delete message", command=lambda: self.start_delete(msg_id))
+                if attachment is None:
+                    menu.add_command(label="Edit message", command=lambda: self.start_edit(msg_id))
+                menu.add_command(label=f"Delete {noun}", command=lambda: self.start_delete(msg_id))
             else:
-                menu.add_command(label="Delete message (admin)", command=lambda: self.start_delete(msg_id))
+                menu.add_command(label=f"Delete {noun} (admin)", command=lambda: self.start_delete(msg_id))
         return menu
 
     def show_reaction_menu(self, event, msg_id):
@@ -4034,9 +4098,11 @@ class ChatApp(tk.Tk):
     def start_delete(self, msg_id):
         if not self.connection:
             return
-        mine = msg_id in self._my_messages
-        prompt = "Delete your message for everyone?" if mine else "Delete this message for everyone?"
-        if messagebox.askyesno("Delete message", prompt, parent=self):
+        attachment = self._attachments.get(msg_id)
+        noun = "attachment" if attachment is not None else "message"
+        mine = attachment["mine"] if attachment is not None else msg_id in self._my_messages
+        prompt = f"Delete your {noun} for everyone?" if mine else f"Delete this {noun} for everyone?"
+        if messagebox.askyesno(f"Delete {noun}", prompt, parent=self):
             self.connection.send_delete(msg_id)
 
     def _on_msg_edit(self, payload):
@@ -4065,9 +4131,28 @@ class ChatApp(tk.Tk):
             self.log.mark_set(f"react_mark_{msg_id}", anchor)
             self.log.mark_gravity(f"react_mark_{msg_id}", "left")
 
+    def _delete_attachment_line(self, msg_id, author, deleter, attachment):
+        ranges = self.log.tag_ranges(f"attach_{msg_id}")
+        if ranges:
+            start, end = str(ranges[0]), str(ranges[1])
+            own = author is None or author.lower() == deleter.lower()
+            note = ": [attachment deleted]\n" if own else f": [attachment deleted by {deleter}]\n"
+            align = "align_right" if (author or "").lower() == self.my_name.lower() else "align_left"
+            with self._log_edit():
+                # The range runs from " sent an attachment (...):" to the end of the preview /
+                # download card, so deleting it also destroys the embedded widget.
+                self.log.delete(start, end)
+                self.log.insert(start, note, ("deleted_mark", align))
+                self.log.tag_remove(f"msg_{msg_id}", "1.0", "end")  # no more menu on this line
+        if attachment is not None:
+            self._release_attachment(attachment)
+
     def _on_msg_delete(self, payload):
         msg_id, deleter = payload["msg_id"], payload["deleter"]
         author = self._msg_authors.get(msg_id)
+        attachment = self._attachments.pop(msg_id, None)
+        if attachment is not None or self.log.tag_ranges(f"attach_{msg_id}"):
+            return self._delete_attachment_line(msg_id, author, deleter, attachment)
         self._my_messages.pop(msg_id, None)
         self.message_reactions.pop(msg_id, None)
         ranges = self.log.tag_ranges(f"body_{msg_id}")
@@ -4128,12 +4213,14 @@ class ChatApp(tk.Tk):
 
     def render_incoming_file(self, payload):
         sender, filename, data, thumb = payload["sender"], payload["filename"], payload["data"], payload.get("thumb")
+        msg_id = payload.get("msg_id")
         mine = sender.lower() == self.my_name.lower()
 
         with self._log_append(force_scroll=mine):
             start_index = self.log.index("end-1c")
             self.log.insert("end", f"[{time.strftime('%H:%M')}] ", ("timestamp",))
             self._insert_name(sender, self.known_colors.get(sender.lower(), FG_TEXT))
+            attach_start = self.log.index("end-1c")
             self.log.insert("end", f" sent an attachment ({filename}):\n")
 
             photo = None
@@ -4144,22 +4231,32 @@ class ChatApp(tk.Tk):
             if photo is not None:
                 self.photo_cache.append(photo)
                 self.log.image_create("end", image=photo)
-                img_tag = f"img_{len(self.photo_cache)}"
-                self.log.tag_add(img_tag, self.log.index("end-2c"), self.log.index("end-1c"))
-                for bind in ("<Button-2>", "<Button-3>"):
-                    self.log.tag_bind(img_tag, bind, lambda e, d=data, fn=filename: self._show_image_context_menu(e, d, fn))
             else:
                 embed = tk.Frame(self.log, bg=BG_PANEL, bd=1, relief="solid", padx=12, pady=8)
                 tk.Label(embed, text=f"📁  {filename}", bg=BG_PANEL, fg=FG_TEXT, font=BOLD_FONT).pack(side="left", padx=(0, 14))
                 tk.Label(embed, text=f"({len(data) / 1024:.1f} KB)", bg=BG_PANEL, fg=FG_MUTED, font=CHAT_FONT).pack(side="left", padx=(0, 14))
                 make_button(embed, "Download", lambda d=data, fn=filename: self._save_file_to_disk(d, fn), bg=BTN_GREEN, hover_bg=BTN_GREEN_HOVER, padx=10, pady=4).pack(side="right")
+                if msg_id:  # widgets inside the log don't pass clicks on to it — wire the menu to the card itself
+                    self._bind_menu_recursive(embed, msg_id)
                 self.log.window_create("end", window=embed)
 
             self.log.insert("end", "\n\n")
-            self.log.tag_add("align_right" if mine else "align_left", start_index, self.log.index("end-1c"))
+            end_index = self.log.index("end-1c")
+            self.log.tag_add("align_right" if mine else "align_left", start_index, end_index)
+            if msg_id:
+                self.log.tag_add(f"msg_{msg_id}", start_index, end_index)
+                self.log.tag_add(f"attach_{msg_id}", attach_start, end_index)  # what a delete replaces
+                self._remember_author(msg_id, sender)
+                self._attachments[msg_id] = {"data": data, "filename": filename, "photo": photo, "mine": mine}
 
         if not mine:
             self._note_unread()
+
+    def _bind_menu_recursive(self, widget, msg_id):
+        for bind in ("<Button-2>", "<Button-3>"):
+            widget.bind(bind, lambda e, m=msg_id: self.show_reaction_menu(e, m))
+        for child in widget.winfo_children():
+            self._bind_menu_recursive(child, msg_id)
 
     def _save_file_to_disk(self, data: bytes, filename: str):
         if path := filedialog.asksaveasfilename(initialfile=filename, title="Save file as"):
@@ -4168,12 +4265,6 @@ class ChatApp(tk.Tk):
                 messagebox.showinfo("Saved", f"File saved to:\n{path}")
             except OSError as e:
                 messagebox.showerror("Error", f"Could not save file:\n{e}")
-
-    def _show_image_context_menu(self, event, data: bytes, filename: str):
-        menu = tk.Menu(self, tearoff=0, bg=BG_PANEL, fg=FG_TEXT, activebackground=BTN_NEUTRAL, activeforeground=FG_TEXT)
-        menu.add_command(label="Save Image As...", command=lambda: self._save_file_to_disk(data, filename))
-        try: menu.tk_popup(event.x_root, event.y_root)
-        finally: menu.grab_release()
 
     # ------------------------------------------------------------------
     # Member list + typing indicator
