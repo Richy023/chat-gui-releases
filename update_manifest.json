@@ -1,7 +1,7 @@
 {
-  "version": "1.4.9c",
+  "version": "1.4.9d",
   "url": "https://raw.githubusercontent.com/Richy023/chat-gui-releases/main/chat_gui.py",
-  "sha256": "f24d8225f5c152db9d7c0b9e721d9a24bb476611d02ebf6a1c86a917001b959d",
-  "signature": "izTLrk5Ay5r8GkWy0pQERddoAw/z+to7lVtDcsiBgPB47D9yxiLuk7qmOTycq1lAQ4nk/cLvpdrbKr3d5iSGAw==",
-  "notes": "added editing/deleting files"
+  "sha256": "69c04fd2d4c1ec1966830fd718e516ffaee024eb1f053198ed8dbef2d9835a6f",
+  "signature": "EMQnhFz0m+EHhPkwQRbRUdPhaTbpjl1Nd1Qm4Vnd57PDG8desHbHwulK3r4cBF2eWrF2aIlhPnc49QcGl6LADw==",
+  "notes": "Added new features and bug fixes"
 }

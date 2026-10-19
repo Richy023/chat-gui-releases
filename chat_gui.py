@@ -1,6 +1,33 @@
 #!/usr/bin/env python3
 """
-chat_gui.py — v1.4.9c — ENCRYPTED instant messenger with a desktop GUI.
+chat_gui.py — v1.4.9d — ENCRYPTED instant messenger with a desktop GUI.
+
+Changes in 1.4.9d:
+- Joining: rejoining after leaving while muted no longer fails (the host sent
+  the mute status before the roster, which the joining client rejects), and a
+  join can no longer collide with someone else's message/leave in the same
+  instant. The same device reconnecting replaces its old, possibly dead,
+  session instead of hitting "Nickname already in use"; TCP keepalive makes
+  vanished peers get noticed.
+- Delivery: every connection has its own ordered send queue (Outbox), so one
+  slow/stalled person can't hold up or corrupt anyone else's messages, large
+  files can't interleave with chat on the wire, and control messages overtake
+  queued files. Receiving big files no longer stalls the receive thread
+  (this also removes the lag when deleting attachments). Unexpected receive
+  errors now disconnect cleanly instead of silently freezing your view.
+- Uploads run in the background with an "Uploading and Sending..." label.
+- Whispers are real messages: editable/deletable by their sender, private to
+  the two people involved (admins never see them; only the host is told, in
+  a separate Host Log, when one is edited or deleted), and they can
+  carry files, images and stickers (type /whisper <name>, then click the
+  attach/sticker button). Muted users can't whisper; slowmode applies.
+- Pings go to everyone @mentioned; DND users are reported in one message.
+- Emoji / sticker / suggestion pop-ups are in-window panels, not separate
+  windows (fixes the chat box seizing up until minimise/restore on macOS).
+- Snake: live leaderboard shared across the chat, cleared when the chat
+  restarts; the snake always matches your name colour.
+- Two more secret gradient name colours.
+- Not compatible with 1.4.9c for whispers and attachments — update everyone.
 
 Changes in 1.4.9c:
 - Attachments (files, images, stickers) can be deleted the same way as
@@ -159,6 +186,7 @@ Fixes in 1.4.1:
 import sys
 import os
 import io
+import itertools
 import socket
 import threading
 import queue
@@ -227,7 +255,7 @@ except ImportError:
 if sys.platform == "darwin":
     ensure_installed("pyobjus", required=False)
 
-VERSION = "1.4.9c"
+VERSION = "1.4.9d"
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -331,9 +359,13 @@ MSG_PREFIX = "__MSG__:"
 REACT_PREFIX = "__REACT__:"
 RAINBOW_UNLOCK_PREFIX = "__RAINBOW_UNLOCK__:"
 BLUE_UNLOCK_PREFIX = "__BLUE_UNLOCK__:"
+EMBER_UNLOCK_PREFIX = "__EMBER_UNLOCK__:"
+AURORA_UNLOCK_PREFIX = "__AURORA_UNLOCK__:"
 FINGERPRINT_PREFIX = "__FINGERPRINT__:"
 EDIT_PREFIX = "__EDIT__:"          # guest -> host: "msg_id|new text"; host -> clients: "msg_id|editor|new text"
 DELETE_PREFIX = "__DELETE__:"      # guest -> host: "msg_id";          host -> clients: "msg_id|deleter"
+SNAKE_PREFIX = "__SNAKE__:"        # guest -> host: "score|playing"; host -> clients: "name|best|score|playing"
+WHISPER_PREFIX = "__WHISPER__:"    # guest -> host: "msg_id|target|text"; host -> both parties: "msg_id|from|to|text"
 FEATURES_PREFIX = "__FEATURES__:"  # each side announces optional features it understands
 FEATURE_EDIT = "edit"              # edit/delete of messages (added in 1.4.9b)
 HOST_FEATURES = frozenset({FEATURE_EDIT})
@@ -346,38 +378,38 @@ HOST_FEATURES = frozenset({FEATURE_EDIT})
 # describe the feature there, never the literal codes.
 RAINBOW_SECRET_CODE = ":prism:"
 BLUE_SECRET_CODE = ":glacier:"
+EMBER_SECRET_CODE = ":ember:"
+AURORA_SECRET_CODE = ":aurora:"
 # Stored in place of a hex color for an unlocked user — every place
 # that renders a name checks GRADIENT_PALETTES for its color_value and
 # draws the matching gradient instead of a flat color.
 RAINBOW_SENTINEL = "RAINBOW"
 BLUE_SENTINEL = "BLUE_GRADIENT"
+EMBER_SENTINEL = "EMBER_GRADIENT"
+AURORA_SENTINEL = "AURORA_GRADIENT"
 RAINBOW_PALETTE = ["#FF5555", "#FFA347", "#FFE066", "#57F287", "#00C8C8", "#5B8CFF", "#C77DFF"]
 BLUE_PALETTE = ["#0B2545", "#13315C", "#134074", "#1B5299", "#3E7CB1", "#6D9DC5", "#8FC0E9"]
-GRADIENT_PALETTES = {RAINBOW_SENTINEL: RAINBOW_PALETTE, BLUE_SENTINEL: BLUE_PALETTE}
+EMBER_PALETTE = ["#7A1F1F", "#B3261E", "#E8472A", "#FF7A33", "#FFA94D", "#FFD166", "#FFE9A8"]    # deep red -> gold
+AURORA_PALETTE = ["#2EE59D", "#1FD1B4", "#22B8D6", "#4C8DF0", "#7C6CF2", "#A855F7", "#D946EF"]    # green -> teal -> blue -> violet
+GRADIENT_PALETTES = {
+    RAINBOW_SENTINEL: RAINBOW_PALETTE, BLUE_SENTINEL: BLUE_PALETTE,
+    EMBER_SENTINEL: EMBER_PALETTE, AURORA_SENTINEL: AURORA_PALETTE,
+}
 # code -> (sentinel, unlock prefix to send once connected)
 GRADIENT_UNLOCK_CODES = {
     RAINBOW_SECRET_CODE: (RAINBOW_SENTINEL, RAINBOW_UNLOCK_PREFIX),
     BLUE_SECRET_CODE: (BLUE_SENTINEL, BLUE_UNLOCK_PREFIX),
+    EMBER_SECRET_CODE: (EMBER_SENTINEL, EMBER_UNLOCK_PREFIX),
+    AURORA_SECRET_CODE: (AURORA_SENTINEL, AURORA_UNLOCK_PREFIX),
 }
 
-# ---- Snake minigame (single-player for now) ----
+# ---- Snake minigame (each person plays their own game; the leaderboard is shared live) ----
 SNAKE_KEYBIND = "<Control-Shift-KeyPress-S>"
 SNAKE_COLS = 24
 SNAKE_ROWS = 18
 SNAKE_CELL_PX = 20
 SNAKE_TICK_MS = 130
-SNAKE_HIGHSCORES_FILE = app_path("chat_gui_snake_highscores.json")
 SETTINGS_FILE = app_path("chat_gui_settings.json")
-
-def _load_snake_highscores() -> dict:
-    return load_json(SNAKE_HIGHSCORES_FILE, dict)
-
-def _save_snake_highscore(name: str, score: int):
-    scores = _load_snake_highscores()
-    key = name.lower()
-    if score > scores.get(key, 0):
-        scores[key] = score
-        save_json(SNAKE_HIGHSCORES_FILE, scores)
 
 class SnakeGame:
     """Pure game logic — no Tk, no I/O, fully deterministic given a
@@ -438,10 +470,10 @@ class SnakeGame:
 
 
 class SnakeWindow(tk.Toplevel):
-    """Single-player Snake. Opened via the secret SNAKE_KEYBIND. Not
-    networked — each person plays their own local game — but everyone
-    who plays on this machine ends up on the same local high-score
-    list, so it still works like a shared leaderboard over time."""
+    """Snake, opened with the secret SNAKE_KEYBIND. Everyone plays their own local game,
+    but scores are shared live with the room: the leaderboard shows everyone in the chat
+    who has played (and who's playing right now). It lives only as long as the room —
+    nothing is saved, so it starts empty whenever the chat is restarted."""
 
     ARROW_DIRECTIONS = {
         "Up": (0, -1), "w": (0, -1), "W": (0, -1),
@@ -449,12 +481,13 @@ class SnakeWindow(tk.Toplevel):
         "Left": (-1, 0), "a": (-1, 0), "A": (-1, 0),
         "Right": (1, 0), "d": (1, 0), "D": (1, 0),
     }
+    LEADERBOARD_ROWS = 8
 
     def __init__(self, app, player_name: str, color_value: str):
         super().__init__(app)
         self.app = app
         self.player_name = player_name
-        self.color_value = color_value  # a hex color, or RAINBOW_SENTINEL
+        self.color_value = color_value  # a hex color, or a gradient sentinel
 
         self.title("Snake")
         self.configure(bg=BG_DARK, padx=12, pady=12)
@@ -464,6 +497,7 @@ class SnakeWindow(tk.Toplevel):
         self.game = SnakeGame()
         self._tick_job = None
         self._rainbow_offset = 0
+        self._reported = None  # (score, alive) last sent to the room
 
         canvas_w, canvas_h = SNAKE_COLS * SNAKE_CELL_PX, SNAKE_ROWS * SNAKE_CELL_PX
         self.canvas = tk.Canvas(self, width=canvas_w, height=canvas_h, bg=BG_PANEL, highlightthickness=0)
@@ -475,21 +509,33 @@ class SnakeWindow(tk.Toplevel):
 
         self.leaderboard_frame = tk.Frame(self, bg=BG_DARK)
         self.leaderboard_frame.pack(fill="x", pady=(10, 0))
-        self._render_leaderboard()
 
         for keysym, vec in self.ARROW_DIRECTIONS.items():
             self.bind(f"<KeyPress-{keysym}>", lambda e, v=vec: self.game.set_direction(*v))
         self.bind("<space>", lambda e: self._restart_if_dead())
         self.bind("<Escape>", lambda e: self._on_close())
 
+        self._report()
+        self.refresh_leaderboard()
         self._set_status()
         self.focus_set()
         self._loop()
+
+    def set_color(self, color_value: str):
+        self.color_value = color_value
+
+    def _report(self):
+        """Tell the room our score / whether we're mid-game — only when it changed."""
+        state = (self.game.score, self.game.alive)
+        if state != self._reported:
+            self._reported = state
+            self.app.snake_report(self.game.score, self.game.alive)
 
     def _restart_if_dead(self):
         if not self.game.alive:
             self.game.reset()
             self._rainbow_offset = 0
+            self._report()
             self._set_status()
 
     def _set_status(self):
@@ -501,9 +547,7 @@ class SnakeWindow(tk.Toplevel):
     def _loop(self):
         if self.game.alive:
             self.game.tick()
-            if not self.game.alive:
-                _save_snake_highscore(self.player_name, self.game.score)
-                self._render_leaderboard()
+            self._report()
             self._set_status()
         self._draw()
         self._tick_job = self.after(SNAKE_TICK_MS, self._loop)
@@ -532,22 +576,32 @@ class SnakeWindow(tk.Toplevel):
         if not self.game.alive:
             self.canvas.create_rectangle(0, 0, self.canvas.winfo_reqwidth(), self.canvas.winfo_reqheight(), fill=BG_PANEL, stipple="gray50", outline="")
 
-    def _render_leaderboard(self):
+    def refresh_leaderboard(self):
+        """Redraws from the room's live board (called whenever anyone's score changes)."""
         for w in self.leaderboard_frame.winfo_children(): w.destroy()
-        tk.Label(self.leaderboard_frame, text="High Scores", bg=BG_DARK, fg=FG_MUTED, font=BOLD_FONT).pack(anchor="w")
-        scores = _load_snake_highscores()
-        ranked = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)
-        if not ranked:
+        tk.Label(self.leaderboard_frame, text="Leaderboard — this chat", bg=BG_DARK, fg=FG_MUTED, font=BOLD_FONT).pack(anchor="w")
+        board = [e for e in self.app.snake_board.values() if e["best"] > 0 or e["playing"]]
+        if not board:
             tk.Label(self.leaderboard_frame, text="No scores yet — be the first!", bg=BG_DARK, fg=FG_MUTED, font=CHAT_FONT).pack(anchor="w")
             return
-        for i, (name, score) in enumerate(ranked, 1):
-            tk.Label(self.leaderboard_frame, text=f"{i}. {name} — {score}", bg=BG_DARK, fg=FG_TEXT, font=CHAT_FONT).pack(anchor="w")
+        board.sort(key=lambda e: (-e["best"], e["name"].lower()))
+        for rank, entry in enumerate(board[:self.LEADERBOARD_ROWS], 1):
+            row = tk.Frame(self.leaderboard_frame, bg=BG_DARK)
+            row.pack(fill="x")
+            tk.Label(row, text=f"{rank}.", bg=BG_DARK, fg=FG_MUTED, font=CHAT_FONT, width=3, anchor="e").pack(side="left")
+            tk.Label(row, text=entry["name"], bg=BG_DARK, fg=self.app.snake_name_color(entry["name"]), font=BOLD_FONT).pack(side="left", padx=(4, 0))
+            tk.Label(row, text=f"  best {entry['best']}", bg=BG_DARK, fg=FG_TEXT, font=CHAT_FONT).pack(side="left")
+            if entry["playing"]:
+                tk.Label(row, text=f"   ● playing — {entry['score']}", bg=BG_DARK, fg=COLOR_PALETTE["green"], font=CHAT_FONT).pack(side="left")
+        tk.Label(self.leaderboard_frame, text="Resets when the chat is restarted.", bg=BG_DARK, fg=FG_MUTED, font=(CHAT_FONT[0], 8)).pack(anchor="w", pady=(4, 0))
 
     def _on_close(self):
         if self._tick_job:
             try: self.after_cancel(self._tick_job)
             except Exception: pass
             self._tick_job = None
+        if self.game.alive:
+            self.app.snake_report(self.game.score, False)  # no longer "playing" once the window is gone
         if getattr(self.app, "_snake_win", None) is self:
             self.app._snake_win = None
         self.destroy()
@@ -600,34 +654,183 @@ def generate_room_code(local_ip: str = None) -> str:
     rng = random.SystemRandom()
     return f"{rng.randint(0, 255):03d}{rng.randint(1, 254):03d}"
 
-def send_encrypted(sock: socket.socket, fernet: Fernet, plaintext: str):
+MAX_FRAME_BYTES = 1_200_000_000  # sanity cap on one encrypted frame (a 500MB file is ~0.9GB after two base64 layers)
+
+def encode_frame(fernet: Fernet, plaintext: str) -> bytes:
     token = fernet.encrypt(plaintext.encode("utf-8", errors="surrogatepass"))
-    length = len(token).to_bytes(MSG_LEN_BYTES, "big")
-    sock.sendall(length + token)
+    return len(token).to_bytes(MSG_LEN_BYTES, "big") + token
+
+def send_encrypted(sock: socket.socket, fernet: Fernet, plaintext: str):
+    """Blocking send — only for the handshake, before a connection has an Outbox."""
+    sock.sendall(encode_frame(fernet, plaintext))
 
 def recv_exact(sock: socket.socket, n: int) -> bytes:
-    buf = b""
-    while len(buf) < n:
-        chunk = sock.recv(n - len(buf))
-        if not chunk:
+    # recv_into a preallocated buffer: appending to a bytes object chunk by chunk is
+    # quadratic, which made receiving large files stall the receive thread for seconds.
+    buf = bytearray(n)
+    view = memoryview(buf)
+    got = 0
+    while got < n:
+        received = sock.recv_into(view[got:], min(n - got, 1 << 20))
+        if not received:
             raise ConnectionError("peer closed connection")
-        buf += chunk
-    return buf
+        got += received
+    return bytes(buf)
 
 def recv_message(sock: socket.socket, fernet: Fernet) -> str:
     length = int.from_bytes(recv_exact(sock, MSG_LEN_BYTES), "big")
+    if length > MAX_FRAME_BYTES:
+        raise ConnectionError("corrupt or oversized frame")  # the stream is out of step — don't wait for 4GB that will never come
     token = recv_exact(sock, length)
     return fernet.decrypt(token).decode("utf-8", errors="surrogatepass")
 
-def extract_ping_target(text: str, known_names):
-    mentions = re.findall(r"@(\w+)", text)
-    if not mentions:
-        return None, None
+def enable_keepalive(sock: socket.socket, idle: int = 30, interval: int = 10, count: int = 3):
+    """Have the OS probe idle connections so a peer that vanished (Wi-Fi drop, laptop
+    sleep) is noticed in about a minute instead of lingering as a ghost session."""
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        if hasattr(socket, "SIO_KEEPALIVE_VALS"):  # Windows
+            sock.ioctl(socket.SIO_KEEPALIVE_VALS, (1, idle * 1000, interval * 1000))
+            return
+        if hasattr(socket, "TCP_KEEPIDLE"): sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, idle)
+        elif hasattr(socket, "TCP_KEEPALIVE"): sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPALIVE, idle)  # macOS
+        if hasattr(socket, "TCP_KEEPINTVL"): sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, interval)
+        if hasattr(socket, "TCP_KEEPCNT"): sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, count)
+    except (OSError, ValueError, AttributeError):
+        pass  # keepalive is a nicety — never fail a connection over it
+
+
+class Outbox:
+    """Ordered, non-blocking sender for one socket. Callers just enqueue a frame; a
+    dedicated thread does the (possibly slow) sendall. That means:
+      * a stalled peer can never block anyone else's messages (or the UI);
+      * frames from different threads can never interleave on the wire (which
+        would permanently desync the peer's stream — it'd stop seeing messages);
+      * small control frames overtake queued large (file) frames.
+    `on_sent(ok)` is called once the frame has been written (or dropped)."""
+
+    HARD, CONTROL, AFTER_CONTROL, BULK = -1, 0, 1, 2
+    BULK_THRESHOLD = 64 * 1024
+    MAX_QUEUED_BYTES = 512 * 1024 * 1024  # a peer this far behind is dropped rather than buffered forever
+
+    def __init__(self, sock: socket.socket, on_failed=None):
+        self.sock = sock
+        self.on_failed = on_failed
+        self._queue = queue.PriorityQueue()
+        self._seq = itertools.count()
+        self._lock = threading.Lock()
+        self._queued = 0
+        self._closed = False
+        self._dead = False
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def put(self, frame: bytes, on_sent=None) -> bool:
+        with self._lock:
+            if self._closed:
+                return False
+            overflow = self._queued + len(frame) > self.MAX_QUEUED_BYTES
+            if not overflow:
+                self._queued += len(frame)
+        if overflow:
+            self._fail()
+            return False
+        priority = self.BULK if len(frame) > self.BULK_THRESHOLD else self.CONTROL
+        self._queue.put((priority, next(self._seq), frame, on_sent))
+        return True
+
+    def close(self, after_control: bool = False):
+        """Stop accepting frames. after_control=True still sends queued small frames
+        first (e.g. a kick notice); otherwise everything pending is dropped."""
+        with self._lock:
+            self._closed = True
+        self._queue.put((self.AFTER_CONTROL if after_control else self.HARD, next(self._seq), None, None))
+
+    def join(self, timeout: float):
+        self._thread.join(timeout)
+
+    def _run(self):
+        while True:
+            _, _, frame, on_sent = self._queue.get()
+            if frame is None:  # close sentinel
+                self._shutdown_socket()
+                self._drain()
+                return
+            try:
+                self.sock.sendall(frame)
+            except OSError:
+                self._fail()
+                return
+            with self._lock:
+                self._queued -= len(frame)
+            self._notify(on_sent, True)
+
+    def _fail(self):
+        with self._lock:
+            if self._dead:
+                return
+            self._dead = self._closed = True
+        self._shutdown_socket()
+        self._drain()
+        if self.on_failed:
+            try: self.on_failed()
+            except Exception: traceback.print_exc()
+        self._queue.put((self.HARD, next(self._seq), None, None))  # wake the writer if it's idle
+
+    def _shutdown_socket(self):
+        try: self.sock.shutdown(socket.SHUT_RDWR)
+        except OSError: pass
+
+    def _drain(self):
+        while True:
+            try: _, _, frame, on_sent = self._queue.get_nowait()
+            except queue.Empty: return
+            if frame is not None:
+                self._notify(on_sent, False)
+
+    @staticmethod
+    def _notify(callback, ok: bool):
+        if callback is not None:
+            try: callback(ok)
+            except Exception: traceback.print_exc()
+
+
+def extract_ping_targets(text: str, known_names):
+    """All distinct @mentions in `text` -> (names that exist, mentions that don't)."""
     lower_names = {n.lower(): n for n in known_names}
-    for candidate in mentions:
-        if candidate.lower() in lower_names:
-            return lower_names[candidate.lower()], candidate
-    return None, mentions[0]
+    found, unknown, seen = [], [], set()
+    for mention in re.findall(r"@(\w+)", text):
+        key = mention.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        if key in lower_names: found.append(lower_names[key])
+        else: unknown.append(mention)
+    return found, unknown
+
+def _name_list(names) -> str:
+    names = list(names)
+    return names[0] if len(names) == 1 else ", ".join(names[:-1]) + " and " + names[-1]
+
+def route_pings(hub, sender: str, text: str, reply, on_host_ping):
+    """Pings everyone @mentioned in `text` (not just the first), then tells the sender
+    about anyone who couldn't be pinged — all the DND users in one message."""
+    targets, unknown = extract_ping_targets(text, hub.names() + [hub.host_name])
+    dnd = []
+    for name in targets:
+        if name.lower() == sender.lower():
+            continue
+        if hub.is_dnd(name):
+            dnd.append(name)
+        elif hub.is_host(name):
+            on_host_ping(sender)
+        elif (target_sock := hub.find_socket_by_name(name)) is not None:
+            hub.send_private(target_sock, PING_PREFIX + sender)
+    if dnd:
+        plural = len(dnd) > 1
+        reply(f"{_name_list(dnd)} {'are' if plural else 'is'} on Do Not Disturb — they won't be notified.")
+    if unknown:
+        reply("No one named " + _name_list([f"'{u}'" for u in unknown]) + " is here to ping.")
 
 def format_time(ts: float) -> str:
     if ts == float('inf'):
@@ -961,6 +1164,42 @@ def perform_globalban(fingerprint: str, reason: str) -> str:
 # install time, so the in-app viewer stays complete going forward
 # without needing the whole history re-embedded on every release.
 EMBEDDED_CHANGELOG = [
+    {   "version": "1.4.9d",
+        "date": "2026-10-15",
+        "notes": (
+            "Joining: fixed rejoining after leaving while muted (it failed with an "
+            "'invalid handshake'), and fixed joins occasionally failing if someone else "
+            "sent a message or left at the same instant. If the same device reconnects it "
+            "now simply replaces its old session instead of being refused with 'Nickname "
+            "already in use'; a muted user's name stays reserved for other devices until "
+            "the mute ends. "
+            "Delivery: messages sometimes not reaching certain people is fixed at the root "
+            "— every connection now has its own ordered send queue, so one slow or stalled "
+            "person can no longer hold up or scramble messages for others, and big files "
+            "can no longer interleave with chat on the wire. Receiving large files is much "
+            "faster, which also removes the lag when deleting an attachment. If a receive "
+            "error ever does happen you're now disconnected cleanly instead of silently "
+            "stopping seeing messages. "
+            "Uploads: files, images and stickers send in the background and show "
+            "'Uploading and Sending…' instead of freezing the chat. "
+            "Whispers: now proper messages you can edit or delete (right-click), private "
+            "to you and the recipient — admins never see them, and only the host is told "
+            "(in a separate Host Log, with the old and new text) when one is edited or deleted — and "
+            "they can carry files, images and stickers: type /whisper and their name, then "
+            "click the attach or sticker button. Muted users can't whisper and slowmode "
+            "applies to whispers. "
+            "Pings: @mentioning several people pings all of them, and if some are on Do Not "
+            "Disturb you get a single message listing everyone who is (plus any unknown names). "
+            "Menus: the emoji, sticker and suggestion pop-ups now open inside the window, "
+            "which fixes the chat box seizing up until the window was minimised and reopened. "
+            "Snake: the leaderboard is now live across the whole chat — everyone's best "
+            "score and who's playing right now — and starts empty whenever the chat is "
+            "restarted; the snake now always matches your name colour. "
+            "New: two more secret gradient name colours. "
+            "1.4.9d isn't compatible with 1.4.9c for whispers and attachments, so update "
+            "everyone together."
+        ),
+    },
     {   "version": "1.4.9c",
         "date": "2026-10-14",
         "notes": (
@@ -1252,6 +1491,8 @@ class Hub:
         self.last_msg_time = {}
         self.gradient_users = {}  # name.lower() -> sentinel (RAINBOW_SENTINEL, BLUE_SENTINEL, ...)
         self.messages = {}        # msg_id -> {"author", "text"}; oldest dropped past MAX_TRACKED_MESSAGES
+        self.outboxes = {}        # sock -> Outbox (one writer thread per connected guest)
+        self.snake = {}           # name.lower() -> {"name", "best", "score", "playing"}; lives and dies with the room
 
     # ---- identity helpers ----
 
@@ -1278,6 +1519,10 @@ class Hub:
 
     def free_color(self, name):
         with self.lock:
+            # A same-name session may already have replaced this one (a reconnect) —
+            # don't strip the colour out from under it.
+            if any(info["name"].lower() == name.lower() for info in self.clients.values()):
+                return
             self.colors.pop(name.lower(), None)
 
     def colormap_snapshot(self):
@@ -1312,10 +1557,11 @@ class Hub:
 
     MAX_TRACKED_MESSAGES = 1000
 
-    def record_message(self, msg_id: str, author: str, text: str, kind: str = "text") -> bool:
+    def record_message(self, msg_id: str, author: str, text: str, kind: str = "text", to: str = None) -> bool:
         """Remembers who sent a message (kind "text") or attachment (kind "file", `text`
         = its filename) so later edits/deletes can be authorised and logged. Returns
-        False — and the caller should drop the message — if the id is unusable or already
+        `to` marks a private (whisper) message, which only its two parties may edit,
+        delete or see. Returns False — and the caller should drop the message — if the id is unusable or already
         known: an id is never reassigned, otherwise someone could re-send a victim's id
         to take over their message."""
         if not msg_id or len(msg_id) > 32:
@@ -1323,7 +1569,7 @@ class Hub:
         with self.lock:
             if msg_id in self.messages:
                 return False
-            self.messages[msg_id] = {"author": author, "text": text, "kind": kind}
+            self.messages[msg_id] = {"author": author, "text": text, "kind": kind, "to": to}
             while len(self.messages) > self.MAX_TRACKED_MESSAGES:
                 self.messages.pop(next(iter(self.messages)))
         return True
@@ -1331,6 +1577,19 @@ class Hub:
     def _emit(self, kind: str, payload: dict):
         if self.on_message_event:
             self.on_message_event(kind, payload)
+
+    def _deliver_update(self, to, author: str, wire_text: str, event_kind: str, event_payload: dict):
+        """Edit/delete notices go to everyone for public messages, but only to the two
+        people involved for a whisper."""
+        if to is None:
+            self.broadcast_feature(FEATURE_EDIT, wire_text)
+            self._emit(event_kind, event_payload)
+            return
+        for name in {author.lower(): author, to.lower(): to}.values():
+            if self.is_host(name):
+                self._emit(event_kind, event_payload)
+            elif (sock := self.find_socket_by_name(name)) is not None:
+                self.send_private(sock, wire_text)
 
     def edit_message(self, msg_id: str, editor: str, new_text: str):
         """Authors only. Returns an error message for the requester, or None on
@@ -1346,36 +1605,112 @@ class Hub:
                 return "Attachments can't be edited — delete it instead."
             if record["author"].lower() != editor.lower():
                 return "You can only edit your own messages."
-            old_text = record["text"]
+            old_text, to = record["text"], record.get("to")
             if old_text == new_text:
                 return None
             record["text"] = new_text
-        self.broadcast_feature(FEATURE_EDIT, f"{EDIT_PREFIX}{msg_id}|{editor}|{new_text}")
-        self._emit("msg_edit", {"msg_id": msg_id, "text": new_text, "editor": editor})
-        self.log_admin_action(editor, f'edited their message: "{_clip(old_text)}" → "{_clip(new_text)}"')
+        self._deliver_update(to, editor, f"{EDIT_PREFIX}{msg_id}|{editor}|{new_text}",
+                             "msg_edit", {"msg_id": msg_id, "text": new_text, "editor": editor})
+        if to is None:
+            self.log_admin_action(editor, f'edited their message: "{_clip(old_text)}" → "{_clip(new_text)}"')
+        elif not self.is_host(editor):  # whispers: the host (only) is told what changed — admins never see them
+            self.log_host_only(editor, f'edited a whisper to {to}: "{_clip(old_text)}" → "{_clip(new_text)}"')
         return None
 
     def delete_message(self, msg_id: str, deleter: str, deleter_is_admin: bool):
         """Authors may delete their own; admins (and the host) may delete anyone's
-        except the host's. Returns an error message, or None on success."""
+        public messages except the host's. Whispers: only their sender. Returns an
+        error message, or None on success."""
         with self.lock:
             record = self.messages.get(msg_id)
             if record is None:
                 return "That message can't be deleted any more."
-            author, text = record["author"], record["text"]
-            noun = "attachment" if record.get("kind") == "file" else "message"
+            author, text, to = record["author"], record["text"], record.get("to")
+            noun = "attachment" if record.get("kind") == "file" else ("whisper" if to else "message")
             own = author.lower() == deleter.lower()
+            if to is not None and not own:
+                return f"You can only delete your own {noun}s."
             if not own and not deleter_is_admin:
                 return f"You can only delete your own {noun}s."
             if not own and self.is_host(author):
                 return f"You cannot delete the host's {noun}s."
             del self.messages[msg_id]  # gone for good — it can't be edited or deleted again
-        self.broadcast_feature(FEATURE_EDIT, f"{DELETE_PREFIX}{msg_id}|{deleter}")
-        self._emit("msg_delete", {"msg_id": msg_id, "deleter": deleter})
-        if own:
-            self.log_admin_action(deleter, f'deleted their own {noun}: "{_clip(text)}"')
-        else:
-            self.log_admin_action(deleter, f'deleted {author}\'s {noun}: "{_clip(text)}"')
+        self._deliver_update(to, author, f"{DELETE_PREFIX}{msg_id}|{deleter}",
+                             "msg_delete", {"msg_id": msg_id, "deleter": deleter})
+        if to is None:
+            if own:
+                self.log_admin_action(deleter, f'deleted their own {noun}: "{_clip(text)}"')
+            else:
+                self.log_admin_action(deleter, f'deleted {author}\'s {noun}: "{_clip(text)}"')
+        elif not self.is_host(deleter):  # whispers: host-only log (the sender is the only one who can delete them)
+            what = "an attachment whispered to" if noun == "attachment" else "a whisper to"
+            self.log_host_only(deleter, f'deleted {what} {to}: "{_clip(text)}"')
+        return None
+
+    # ---- snake leaderboard ----
+
+    @staticmethod
+    def _snake_wire(entry: dict) -> str:
+        return f"{SNAKE_PREFIX}{entry['name']}|{entry['best']}|{entry['score']}|{1 if entry['playing'] else 0}"
+
+    def update_snake(self, name: str, score, playing: bool, exclude_sock=None, emit: bool = False):
+        """Records a player's current score (their best is the max seen this session) and
+        tells everyone else."""
+        try: score = max(0, min(int(score), 100_000))
+        except (TypeError, ValueError): return None
+        with self.lock:
+            entry = self.snake.setdefault(name.lower(), {"name": name, "best": 0, "score": 0, "playing": False})
+            entry.update(name=name, score=score, playing=bool(playing))
+            entry["best"] = max(entry["best"], score)
+            snapshot = dict(entry)
+        self.broadcast(self._snake_wire(snapshot), exclude_sock=exclude_sock)
+        if emit:
+            self._emit("snake", snapshot)
+        return snapshot
+
+    def snake_entries(self) -> list:
+        with self.lock:
+            return [dict(e) for e in self.snake.values()]
+
+    def snake_player_left(self, name: str):
+        with self.lock:
+            entry = self.snake.get(name.lower())
+            still_playing = bool(entry and entry["playing"])
+            score = entry["score"] if entry else 0
+        if still_playing:
+            self.update_snake(name, score, False, emit=True)
+
+    # ---- whispers ----
+
+    def resolve_whisper_target(self, sender: str, target_name: str):
+        """-> (canonical name, None) or (None, error message for the sender)."""
+        if target_name.lower() == sender.lower():
+            return None, "You cannot whisper to yourself!"
+        if self.is_host(target_name):
+            return self.host_name, None
+        sock = self.find_socket_by_name(target_name)
+        if sock is None:
+            return None, f"No one named '{target_name}' is connected."
+        return self.get_info(sock).get("name", target_name), None
+
+    def whisper(self, msg_id: str, sender: str, target_name: str, text: str):
+        """Delivers a private message to `target_name` and echoes it to the sender (so
+        the sender sees exactly what was delivered). Returns an error or None."""
+        text = text.strip()
+        if not text:
+            return "Usage: /whisper <name> <message>"
+        target, error = self.resolve_whisper_target(sender, target_name)
+        if error:
+            return error
+        if not self.record_message(msg_id, sender, text, kind="whisper", to=target):
+            return "Couldn't send that whisper."
+        payload = {"msg_id": msg_id, "from": sender, "to": target, "text": text}
+        wire = f"{WHISPER_PREFIX}{msg_id}|{sender}|{target}|{text}"
+        for name in (target, sender):  # recipient first, then the sender's own copy
+            if self.is_host(name):
+                self._emit("whisper", payload)
+            elif (sock := self.find_socket_by_name(name)) is not None:
+                self.send_private(sock, wire)
         return None
 
     def set_features(self, sock, features):
@@ -1386,10 +1721,16 @@ class Hub:
     def broadcast_feature(self, feature: str, text: str):
         """Like broadcast(), but only to clients that announced `feature` — so older
         versions never receive protocol text they'd display as a chat line."""
+        frame = encode_frame(self.fernet, text)
         with self.lock:
-            targets = [s for s, info in self.clients.items() if feature in info.get("features", ())]
+            targets = [s for s, info in self.clients.items() if info["ready"] and feature in info.get("features", ())]
         for s in targets:
-            self.send_private(s, text)
+            self._send_frame(s, frame)
+
+    def log_host_only(self, actor: str, text: str):
+        """A log line only the host sees — deliberately NOT sent to admins, unlike
+        log_admin_action. Used for changes to whispers."""
+        self.on_admin_log(f"🛡️ [Host Log] {actor} {text}")
 
     # ---- do-not-disturb ----
 
@@ -1412,15 +1753,26 @@ class Hub:
     # ---- client table ----
 
     def add_client(self, sock, name, ip):
+        outbox = Outbox(sock, on_failed=lambda: self.disconnect(sock))  # a peer we can't write to is dropped
         with self.lock:
+            self.outboxes[sock] = outbox
             self.clients[sock] = {
                 "name": name, "ip": ip, "muted_until": 0.0,
                 "muted_by": None, "mute_reason": None, "kicked": False,
                 "features": set(),
+                "ready": False,  # becomes True once the roster has gone out — see mark_ready()
             }
+
+    def mark_ready(self, sock):
+        """A joining client must receive the roster before anything else (its handshake
+        rejects any other first reply), so broadcasts skip it until this is called."""
+        with self.lock:
+            if sock in self.clients:
+                self.clients[sock]["ready"] = True
 
     def remove_client(self, sock):
         with self.lock:
+            outbox = self.outboxes.pop(sock, None)
             info = self.clients.pop(sock, None)
             if info and time.time() < info["muted_until"]:
                 self.ghost_mutes[info["name"].lower()] = {
@@ -1428,7 +1780,9 @@ class Hub:
                     "muted_until": info["muted_until"],
                     "muted_by": info["muted_by"], "mute_reason": info["mute_reason"],
                 }
-            return info
+        if outbox is not None:
+            outbox.close()
+        return info
 
     def names(self):
         with self.lock:
@@ -1454,13 +1808,39 @@ class Hub:
     def find_socket_by_ip(self, ip):
         return self._find_socket(lambda info: info.get("ip") == ip)
 
-    def is_name_occupied(self, name):
+    def claim_name(self, name: str, ip: str):
+        """Decides whether `ip` may join as `name`. Returns an error message, or None.
+
+        The same device reconnecting under its own name replaces its old session
+        (which is often a dead connection the host hasn't noticed yet — that's what
+        used to make rejoining fail with "Nickname already in use"). A name held by a
+        different address stays taken, and so does the name of a muted user who left
+        (so a mute can't be shed by switching to someone else's name)."""
         lowered = name.lower()
         with self.lock:
             self._purge_expired()
-            if any(info["name"].lower() == lowered for info in self.clients.values()):
-                return True
-            return lowered in self.ghost_mutes
+            stale = next((s for s, info in self.clients.items() if info["name"].lower() == lowered), None)
+            if stale is None:
+                ghost = self.ghost_mutes.get(lowered)
+                if ghost and ghost.get("ip") != ip:
+                    return "That nickname is reserved while its mute is active."
+                return None
+            if self.clients[stale].get("ip") != ip:
+                return "Nickname already in use."
+            self.clients[stale]["kicked"] = True  # its handler then exits quietly
+
+        self.send_private(stale, KICK_NOTICE_PREFIX + "the server|you signed in again from this device")
+        box = self.outboxes.get(stale)
+        if box is not None:
+            box.close(after_control=True)
+        for attempt in range(2):
+            deadline = time.time() + (0.5 if attempt == 0 else 1.5)
+            while time.time() < deadline and self.find_socket_by_name(name):
+                time.sleep(0.02)
+            if not self.find_socket_by_name(name):
+                return None
+            self.disconnect(stale)  # didn't leave politely (dead connection) — cut it
+        return "Nickname already in use."
 
     def _purge_expired(self):
         """Caller must hold self.lock."""
@@ -1569,13 +1949,26 @@ class Hub:
                 self.clients[sock]["kicked"] = True
 
     def broadcast(self, text, exclude_sock=None):
-        with self.lock: targets = [s for s in self.clients if s is not exclude_sock]
+        frame = encode_frame(self.fernet, text)  # encrypted once, shared by every recipient
+        with self.lock: targets = [s for s, info in self.clients.items() if s is not exclude_sock and info["ready"]]
         for s in targets:
-            self.send_private(s, text)
+            self._send_frame(s, frame)
 
-    def send_private(self, sock, text):
-        try: send_encrypted(sock, self.fernet, text)
-        except OSError: pass
+    def send_private(self, sock, text, on_sent=None) -> bool:
+        return self._send_frame(sock, encode_frame(self.fernet, text), on_sent)
+
+    def _send_frame(self, sock, frame: bytes, on_sent=None) -> bool:
+        outbox = self.outboxes.get(sock)
+        if outbox is not None:
+            return outbox.put(frame, on_sent)
+        try:  # not a registered client (yet) — e.g. replying during the handshake
+            sock.sendall(frame)
+            ok = True
+        except OSError:
+            ok = False
+        if on_sent is not None:
+            on_sent(ok)
+        return ok
 
     def disconnect(self, sock):
         # shutdown() first: closing a socket from another thread does not wake a
@@ -1591,7 +1984,24 @@ class Hub:
         self.send_private(sock, notice)
         self.mark_kicked(sock)
         self.broadcast(announcement, exclude_sock=sock)
-        self.disconnect(sock)
+        outbox = self.outboxes.get(sock)
+        if outbox is not None:
+            outbox.close(after_control=True)  # lets the notice out first, then hangs up
+        else:
+            self.disconnect(sock)
+
+    def shutdown_all(self, timeout: float = 0.5):
+        """Room closing: let each client's pending small frames (the host-disconnect
+        notice) go out, then hang up on everyone."""
+        with self.lock:
+            sockets, outboxes = list(self.clients), list(self.outboxes.values())
+        for box in outboxes:
+            box.close(after_control=True)
+        deadline = time.time() + timeout
+        for box in outboxes:
+            box.join(max(0.0, deadline - time.time()))
+        for s in sockets:
+            self.disconnect(s)
 
 
 def _clip(text: str, limit: int = 200) -> str:
@@ -1603,15 +2013,19 @@ def _clip(text: str, limit: int = 200) -> str:
 IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp")
 THUMB_SIZE = (260, 260)
 
-def encode_file_message(sender: str, msg_id: str, filename: str, data: bytes) -> str:
+def encode_file_message(sender: str, msg_id: str, to: str, filename: str, data: bytes) -> str:
+    """`to` is the whisper recipient, or "" to send to everyone."""
     safe_name = filename.replace("|", "_")
-    return FILE_PREFIX + "|".join((sender, msg_id, safe_name, base64.b64encode(data).decode("ascii")))
+    return FILE_PREFIX + "|".join((sender, msg_id, to, safe_name, base64.b64encode(data).decode("ascii")))
 
-def read_file_for_send(filepath: str):
-    """Returns (filename, bytes), enforcing the size limit."""
+def check_file_size(filepath: str):
     size = os.path.getsize(filepath)
     if size > MAX_FILE_BYTES:
         raise ValueError(f"File is {size / 1024 / 1024:.1f} MB — the limit is {MAX_FILE_BYTES // 1024 // 1024} MB.")
+
+def read_file_for_send(filepath: str):
+    """Returns (filename, bytes), enforcing the size limit."""
+    check_file_size(filepath)
     with open(filepath, "rb") as f:
         return os.path.basename(filepath), f.read()
 
@@ -1628,21 +2042,26 @@ def make_thumbnail(filename: str, data: bytes):
     except Exception:
         return None
 
-def handle_incoming_file(text: str, event_queue: queue.Queue, on_parsed=None) -> bool:
-    """Decodes a FILE message and queues it for the UI. `on_parsed(info)` (used by
-    the host) can veto it by returning False. Returns whether it was queued."""
+def parse_file_message(text: str):
+    """-> {"sender", "msg_id", "to", "filename", "data"}, or None if it's malformed."""
     try:
-        sender, msg_id, filename, b64data = text[len(FILE_PREFIX):].split("|", 3)
+        sender, msg_id, to, filename, b64data = text[len(FILE_PREFIX):].split("|", 4)
         raw = base64.b64decode(b64data)
     except Exception:
+        return None
+    return {"sender": sender, "msg_id": msg_id, "to": to, "filename": os.path.basename(filename) or "unnamed_file", "data": raw}
+
+def queue_file_event(info: dict, event_queue: queue.Queue):
+    event = dict(info)
+    event["thumb"] = make_thumbnail(info["filename"], info["data"])
+    event_queue.put(("file", event))
+
+def handle_incoming_file(text: str, event_queue: queue.Queue) -> bool:
+    info = parse_file_message(text)
+    if info is None:
         event_queue.put(("system", "[received a corrupted file, ignored]"))
         return False
-    safe_name = os.path.basename(filename) or "unnamed_file"
-    info = {"sender": sender, "msg_id": msg_id, "filename": safe_name, "data": raw}
-    if on_parsed is not None and on_parsed(info) is False:
-        return False
-    info["thumb"] = make_thumbnail(safe_name, raw)
-    event_queue.put(("file", info))
+    queue_file_event(info, event_queue)
     return True
 
 
@@ -1670,40 +2089,38 @@ def _handle_guest_command(text, sock, guest_name, is_admin, hub: Hub, host_name,
         else:
             _guest_notice(hub, sock, f"Invalid color. Available: {', '.join(COLOR_PALETTE)}")
 
-    elif cmd_name == "whisper":
-        target_name, _, msg = arg.partition("|")
-        if target_name.lower() == host_name.lower():
-            event_queue.put(("private", f"[Whisper from {guest_name}]: {msg}"))
-            _guest_notice(hub, sock, f"[Whisper to {host_name}]: {msg}")
-            return
-        target_sock = hub.find_socket_by_name(target_name)
-        if target_sock:
-            _guest_notice(hub, target_sock, f"[Whisper from {guest_name}]: {msg}")
-            _guest_notice(hub, sock, f"[Whisper to {target_name}]: {msg}")
-        else:
-            _guest_notice(hub, sock, f"No one named '{target_name}' is connected.")
-
     elif cmd_name == "mod":
         if is_admin:
-            run_mod_command(arg, hub, guest_name, lambda t: _guest_notice(hub, sock, t))
+            if arg.split(" ", 1)[0].lower() in MOD_COMMAND_NAMES:  # only genuine moderation commands
+                run_mod_command(arg, hub, guest_name, lambda t: _guest_notice(hub, sock, t))
         else:
             _guest_notice(hub, sock, "You do not have permission to use moderation commands.")
 
 def _ping_from_guest(hub: Hub, sock, guest_name, host_name, raw_text, event_queue):
-    target_name, raw_mention = extract_ping_target(raw_text, hub.names() + [host_name])
-    if not target_name:
-        if raw_mention:
-            _guest_notice(hub, sock, f"No one named '{raw_mention}' is here to ping.")
-        return
+    route_pings(hub, guest_name, raw_text, lambda t: _guest_notice(hub, sock, t),
+                on_host_ping=lambda who: event_queue.put(("ping", who)))
 
-    if hub.is_dnd(target_name):
-        _guest_notice(hub, sock, f"{target_name} is on Do Not Disturb — they won't be notified.")
-    elif target_name.lower() == host_name.lower():
-        event_queue.put(("ping", guest_name))
+def _handle_guest_file(text, sock, guest_name, hub: Hub, event_queue):
+    """Records and routes a file/image/sticker: to everyone, or privately to one person."""
+    info = parse_file_message(text)
+    if info is None:
+        event_queue.put(("system", "[received a corrupted file, ignored]"))
+        return
+    target = None
+    if info["to"]:
+        target, error = hub.resolve_whisper_target(guest_name, info["to"])
+        if error:
+            _guest_notice(hub, sock, error)
+            return
+    if not hub.record_message(info["msg_id"], guest_name, info["filename"], kind="file", to=target):
+        return  # unusable or already-used id — never relay it
+    if target is None:
+        queue_file_event(info, event_queue)
+        hub.broadcast(text, exclude_sock=sock)
+    elif hub.is_host(target):
+        queue_file_event(info, event_queue)
     else:
-        target_sock = hub.find_socket_by_name(target_name)
-        if target_sock:
-            hub.send_private(target_sock, PING_PREFIX + guest_name)
+        hub.send_private(hub.find_socket_by_name(target), text)
 
 def _process_guest_message(text, sock, guest_name, hub: Hub, host_name, event_queue):
     is_admin = guest_name.lower() in hub.admins
@@ -1719,6 +2136,11 @@ def _process_guest_message(text, sock, guest_name, hub: Hub, host_name, event_qu
         hub.mark_stopped_typing(text[len(TYPING_STOP_PREFIX):])
         hub.broadcast(text, exclude_sock=sock)
         event_queue.put(("typing", hub.typing_names()))
+        return
+
+    if text.startswith(SNAKE_PREFIX):
+        score, _, playing = text[len(SNAKE_PREFIX):].partition("|")
+        hub.update_snake(guest_name, score, playing == "1", exclude_sock=sock, emit=True)
         return
 
     if text.startswith(DND_PREFIX):
@@ -1778,6 +2200,17 @@ def _process_guest_message(text, sock, guest_name, hub: Hub, host_name, event_qu
         event_queue.put(("react", {"msg_id": msg_id, "emoji": emoji, "sender": sender or guest_name}))
         return
 
+    if text.startswith(WHISPER_PREFIX):
+        wait = hub.check_slowmode(guest_name, is_admin)
+        if wait > 0:
+            _guest_notice(hub, sock, f"Slowmode is active! Please wait {wait:.1f} seconds.")
+            return
+        msg_id, _, rest = text[len(WHISPER_PREFIX):].partition("|")
+        target, _, body = rest.partition("|")
+        if error := hub.whisper(msg_id, guest_name, target, body):
+            _guest_notice(hub, sock, error)
+        return
+
     is_file = text.startswith(FILE_PREFIX)
     if not (is_file or text.startswith(MSG_PREFIX)):
         return  # e.g. the "[name left the chat]" courtesy line — nothing to relay
@@ -1788,9 +2221,7 @@ def _process_guest_message(text, sock, guest_name, hub: Hub, host_name, event_qu
         return
 
     if is_file:
-        recorded = lambda info: hub.record_message(info["msg_id"], guest_name, info["filename"], kind="file")
-        if handle_incoming_file(text, event_queue, on_parsed=recorded):
-            hub.broadcast(text, exclude_sock=sock)
+        _handle_guest_file(text, sock, guest_name, hub, event_queue)
         return
 
     msg_id, _, raw_text = text[len(MSG_PREFIX):].partition("|")
@@ -1826,8 +2257,12 @@ def handle_guest_connection(sock, addr, hub: Hub, host_name: str, event_queue: q
 
     guest_name = first[len(HELLO_PREFIX):].strip()[:30] or f"Guest@{addr[0]}"
 
-    if hub.is_name_occupied(guest_name) or hub.is_host(guest_name):
+    if hub.is_host(guest_name):
         hub.send_private(sock, NOTICE_PREFIX + "Nickname already in use.")
+        sock.close()
+        return
+    if error := hub.claim_name(guest_name, addr[0]):
+        hub.send_private(sock, NOTICE_PREFIX + error)
         sock.close()
         return
 
@@ -1846,14 +2281,19 @@ def handle_guest_connection(sock, addr, hub: Hub, host_name: str, event_queue: q
         hub.apply_ghost_ip_mute(sock, addr[0])
         hub.assign_color(guest_name)
 
+        event_queue.put(("system", f"{guest_name} joined from {addr[0]}"))
+        hub.broadcast(f"* {guest_name} joined the chat *", exclude_sock=sock)
+        # The roster MUST be the first thing a joining client receives — its handshake
+        # treats anything else as an invalid reply and gives up. (A rejoining muted user
+        # used to be sent their mute status first, so they could never get back in.)
+        hub.send_private(sock, ROSTER_PREFIX + ",".join([host_name] + hub.names()))
+        hub.send_private(sock, SLOWMODE_PREFIX + str(hub.slowmode_delay))
         if hub.is_muted(sock):
             info = hub.get_info(sock)
             hub.send_private(sock, MUTE_STATUS_PREFIX + f"1:{info['muted_until']}")
-
-        event_queue.put(("system", f"{guest_name} joined from {addr[0]}"))
-        hub.broadcast(f"* {guest_name} joined the chat *", exclude_sock=sock)
-        hub.send_private(sock, ROSTER_PREFIX + ",".join([host_name] + hub.names()))
-        hub.send_private(sock, SLOWMODE_PREFIX + str(hub.slowmode_delay))
+        hub.mark_ready(sock)  # from here on the client receives broadcasts normally
+        for entry in hub.snake_entries():  # catch the joiner up on the live Snake leaderboard
+            hub.send_private(sock, Hub._snake_wire(entry))
         hub.broadcast_colormap()
         event_queue.put(("colormap", hub.colormap_snapshot()))
         event_queue.put(("roster", hub.names()))
@@ -1862,6 +2302,9 @@ def handle_guest_connection(sock, addr, hub: Hub, host_name: str, event_queue: q
             try: text = recv_message(sock, hub.fernet)
             except InvalidToken: continue
             except (OSError, ConnectionError): break
+            except Exception:
+                traceback.print_exc()  # anything else means the stream is unusable
+                break
 
             try:
                 _process_guest_message(text, sock, guest_name, hub, host_name, event_queue)
@@ -1873,6 +2316,7 @@ def handle_guest_connection(sock, addr, hub: Hub, host_name: str, event_queue: q
         try: sock.close()
         except OSError: pass
         if not hub.closed:
+            hub.snake_player_left(guest_name)
             name = info["name"] if info else guest_name
             if not (info and info.get("kicked")):
                 event_queue.put(("system", f"{name} disconnected"))
@@ -1886,6 +2330,7 @@ def host_accept_loop(server: socket.socket, hub: Hub, host_name: str, event_queu
     while True:
         try: conn, addr = server.accept()
         except OSError: break
+        enable_keepalive(conn)
         threading.Thread(target=handle_guest_connection, args=(conn, addr, hub, host_name, event_queue), daemon=True).start()
 
 
@@ -1896,7 +2341,8 @@ HELP_TEXT = (
     "/ban <name> [min|perm] [reason], /unban <ip>, /slowmode [sec], /admin <name>, /unadmin <name>, "
     "/color <name>, /colors, /list, /clear [lines], /whisper <name> <msg>, /help — "
     "host only: /ipban <ip> [min|perm] [reason]. "
-    "Right-click a message or attachment to edit/delete it (admins can delete anyone's)."
+    "Right-click a message or attachment to edit/delete it (admins can delete anyone's, but never whispers). "
+    "To whisper a file or sticker, type /whisper <name> then click the 📎 or 🌠 button."
 )
 
 PERMANENT_WORDS = ("perm", "indefinite", "0", "infinite")
@@ -1945,14 +2391,8 @@ def _cmd_whisper(arg, hub, me, reply):
     parts = arg.split(maxsplit=1)
     if len(parts) < 2:
         return reply("Usage: /whisper <name> <message>")
-    target_name, wmsg = parts
-    if target_name.lower() == me.lower():
-        return reply("You cannot whisper to yourself!")
-    target_sock = hub.find_socket_by_name(target_name)
-    if not target_sock:
-        return reply(f"No one named '{target_name}' is connected.")
-    _guest_notice(hub, target_sock, f"[Whisper from {me}]: {wmsg}")
-    reply(f"[Whisper to {target_name}]: {wmsg}")
+    if error := hub.whisper(os.urandom(4).hex(), me, parts[0], parts[1]):
+        reply(error)
 
 def _cmd_admin(arg, hub, me, reply):
     if not arg: return reply("Usage: /admin <name>")
@@ -2168,6 +2608,19 @@ def guest_recv_loop(sock, fernet, event_queue, local_colors, colors_lock, known_
         if text.startswith(FEATURES_PREFIX):
             host_features.update(f for f in text[len(FEATURES_PREFIX):].split(",") if f)
             return True
+        if text.startswith(SNAKE_PREFIX):
+            try:
+                name, best, score, playing = text[len(SNAKE_PREFIX):].rsplit("|", 3)
+                put(("snake", {"name": name, "best": int(best), "score": int(score), "playing": playing == "1"}))
+            except ValueError:
+                pass
+            return True
+        if text.startswith(WHISPER_PREFIX):
+            msg_id, _, rest = text[len(WHISPER_PREFIX):].partition("|")
+            sender, _, rest = rest.partition("|")
+            to, _, body = rest.partition("|")
+            put(("whisper", {"msg_id": msg_id, "from": sender, "to": to, "text": body}))
+            return True
         if text.startswith(EDIT_PREFIX):
             msg_id, _, rest = text[len(EDIT_PREFIX):].partition("|")
             editor, _, new_text = rest.partition("|")
@@ -2209,6 +2662,13 @@ def guest_recv_loop(sock, fernet, event_queue, local_colors, colors_lock, known_
         except (OSError, ConnectionError):
             if not closing.is_set():  # a deliberate Disconnect isn't an error worth reporting
                 put(("disconnected", "Disconnected from host."))
+            break
+        except Exception:
+            # Anything unexpected here used to end this thread silently — leaving you
+            # connected but unable to see any more messages. Say so instead.
+            traceback.print_exc()
+            if not closing.is_set():
+                put(("disconnected", "Connection error — please reconnect."))
             break
 
         try:
@@ -2272,20 +2732,16 @@ class HostConnection:
             self.event_queue.put(("colormap", self.hub.colormap_snapshot()))
             return
 
-        target_name, raw_mention = extract_ping_target(text, self.hub.names())
-        if target_name:
-            target_sock = self.hub.find_socket_by_name(target_name)
-            if target_sock:
-                if self.hub.is_dnd(target_name): self.event_queue.put(("system", f"{target_name} is on Do Not Disturb — they won't be notified."))
-                else: self.hub.send_private(target_sock, PING_PREFIX + self.name)
-        elif raw_mention:
-            self.event_queue.put(("system", f"No one named '{raw_mention}' is here to ping."))
+        route_pings(self.hub, self.name, text, lambda t: self.event_queue.put(("system", t)), on_host_ping=lambda who: None)
 
         msg_id = os.urandom(4).hex()
         full_msg = f"{self.name}: {text}"
         self.hub.record_message(msg_id, self.name, text)
         self.event_queue.put(("chat", {"raw": full_msg, "colors": self.hub.colormap_snapshot(), "msg_id": msg_id}))
         self.hub.broadcast(f"{MSG_PREFIX}{msg_id}|{full_msg}")
+
+    def send_snake(self, score: int, playing: bool):
+        self.hub.update_snake(self.name, score, playing)
 
     def send_dnd(self, active: bool):
         if self.hub.set_dnd(self.name, active):
@@ -2312,21 +2768,33 @@ class HostConnection:
     def send_file(self, filepath: str):
         self.send_file_bytes(*read_file_for_send(filepath))
 
-    def send_file_bytes(self, filename: str, data: bytes):
-        msg_id = os.urandom(4).hex()
-        msg = encode_file_message(self.name, msg_id, filename, data)
-        self.hub.record_message(msg_id, self.name, os.path.basename(filename), kind="file")
-        handle_incoming_file(msg, self.event_queue)
-        self.hub.broadcast(msg)
+    def send_file_bytes(self, filename: str, data: bytes, on_done=None, to: str = None):
+        """Sends a file/image/sticker to everyone, or privately to `to`. Does the
+        (slow) encoding itself, so run it off the UI thread. `on_done(ok)` fires once
+        it has been queued for sending."""
+        done = on_done or (lambda ok: None)
+        target = ""
+        if to:
+            target, error = self.hub.resolve_whisper_target(self.name, to)
+            if error:
+                self.event_queue.put(("system", error))
+                return done(False)
+        msg_id, safe_name = os.urandom(4).hex(), os.path.basename(filename)
+        msg = encode_file_message(self.name, msg_id, target, safe_name, data)
+        self.hub.record_message(msg_id, self.name, safe_name, kind="file", to=target or None)
+        queue_file_event({"sender": self.name, "msg_id": msg_id, "to": target, "filename": safe_name, "data": data}, self.event_queue)
+        if target:
+            ok = self.hub.send_private(self.hub.find_socket_by_name(target), msg)
+        else:
+            self.hub.broadcast(msg)
+            ok = True
+        done(ok)
 
     def close(self):
         self.hub.closed = True
         self.stop_event.set()
         self.hub.broadcast(HOST_DISCONNECT_PREFIX)
-        with self.hub.lock:
-            sockets = list(self.hub.clients)
-        for s in sockets:
-            self.hub.disconnect(s)
+        self.hub.shutdown_all()
         try: self.server.shutdown(socket.SHUT_RDWR)  # wakes the blocked accept() thread
         except OSError: pass
         try: self.server.close()
@@ -2348,12 +2816,14 @@ class GuestConnection:
         self.closing = threading.Event()
         self.is_admin = False
         self.host_features = set()  # filled in when the host answers our FEATURES announcement
+        self.outbox = None          # created by start(); until then sends are direct (handshake)
 
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         try:
             self.sock.settimeout(5)
             self.sock.connect((host, port))
             self.sock.settimeout(None)
+            enable_keepalive(self.sock)
             self._handshake()
         except BaseException:
             self.sock.close()
@@ -2378,7 +2848,12 @@ class GuestConnection:
         self.known_names = {n.strip() for n in response[len(ROSTER_PREFIX):].split(",") if n.strip()}
         self.initial_roster = sorted(self.known_names)
 
+    def _on_outbox_failed(self):
+        if not self.closing.is_set():
+            self.event_queue.put(("disconnected", "Connection lost."))
+
     def start(self, unlock_prefix: str = None):
+        self.outbox = Outbox(self.sock, on_failed=self._on_outbox_failed)
         threading.Thread(
             target=guest_recv_loop,
             args=(self.sock, self.fernet, self.event_queue, self.local_colors, self.colors_lock, self.known_names, self.host, self.closing, self.host_features),
@@ -2389,14 +2864,25 @@ class GuestConnection:
         if unlock_prefix:
             self._send(unlock_prefix + "1", report=False)
 
-    def _send(self, payload: str, report: bool = True) -> bool:
-        try:
-            send_encrypted(self.sock, self.fernet, payload)
-            return True
-        except OSError:
-            if report and not self.closing.is_set():
-                self.event_queue.put(("disconnected", "Connection lost."))
-            return False
+    def _send(self, payload: str, report: bool = True, on_sent=None) -> bool:
+        """Queues `payload` for the writer thread (returns immediately). `on_sent(ok)`
+        fires once it has actually gone out, or been dropped."""
+        frame = encode_frame(self.fernet, payload)
+        if self.outbox is None:  # handshake phase
+            try:
+                self.sock.sendall(frame)
+                ok = True
+            except OSError:
+                ok = False
+        else:
+            ok = self.outbox.put(frame, on_sent)
+            if ok:
+                return True  # on_sent will be called by the writer
+        if not ok and report and not self.closing.is_set():
+            self.event_queue.put(("disconnected", "Connection lost."))
+        if on_sent is not None:
+            on_sent(ok)
+        return ok
 
     def _colors_copy(self) -> dict:
         with self.colors_lock:
@@ -2444,7 +2930,7 @@ class GuestConnection:
             parts = arg.split(maxsplit=1)
             if len(parts) < 2: return put(("system", "Usage: /whisper <name> <message>"))
             if parts[0].lower() == self.name.lower(): return put(("system", "You cannot whisper to yourself!"))
-            self._send(CMD_PREFIX + f"whisper|{parts[0]}|{parts[1]}")
+            self._send(f"{WHISPER_PREFIX}{os.urandom(4).hex()}|{parts[0]}|{parts[1]}")
             return
 
         if cmd in MOD_COMMAND_NAMES:
@@ -2460,6 +2946,9 @@ class GuestConnection:
     def send_typing(self, started: bool):
         self._send((TYPING_START_PREFIX if started else TYPING_STOP_PREFIX) + self.name, report=False)
 
+    def send_snake(self, score: int, playing: bool):
+        self._send(f"{SNAKE_PREFIX}{score}|{1 if playing else 0}", report=False)
+
     def send_dnd(self, active: bool):
         verb = "turned on" if active else "turned off"
         self.event_queue.put(("system", f"You {verb} Do Not Disturb."))
@@ -2468,14 +2957,22 @@ class GuestConnection:
     def send_file(self, filepath: str):
         self.send_file_bytes(*read_file_for_send(filepath))
 
-    def send_file_bytes(self, filename: str, data: bytes):
-        msg = encode_file_message(self.name, os.urandom(4).hex(), filename, data)
-        if self._send(msg):
-            handle_incoming_file(msg, self.event_queue)  # show our own copy (the host doesn't echo it back)
+    def send_file_bytes(self, filename: str, data: bytes, on_done=None, to: str = None):
+        """Sends a file/image/sticker to everyone, or privately to `to`. Encoding is
+        the slow part, so run this off the UI thread; `on_done(ok)` fires once the
+        bytes have actually gone out."""
+        msg_id, safe_name = os.urandom(4).hex(), os.path.basename(filename)
+        msg = encode_file_message(self.name, msg_id, to or "", safe_name, data)
+        if self._send(msg, on_sent=on_done):
+            # Show our own copy straight away (the host doesn't echo files back).
+            queue_file_event({"sender": self.name, "msg_id": msg_id, "to": to or "", "filename": safe_name, "data": data}, self.event_queue)
 
     def close(self):
         self.closing.set()
         self._send(f"[{self.name} left the chat]", report=False)
+        if self.outbox is not None:
+            self.outbox.close(after_control=True)  # sends the leave notice, then shuts the socket
+            self.outbox.join(0.3)
         # shutdown() so the receive thread (blocked in recv) wakes up and the host
         # actually sees us leave — a bare close() from another thread doesn't.
         try: self.sock.shutdown(socket.SHUT_RDWR)
@@ -2598,7 +3095,7 @@ class ChatApp(tk.Tk):
         # shared UI plumbing
         self._timers = {}              # key -> pending after() id (see _set_timer)
         self._popups = {}              # key -> open Toplevel (see _open_dialog / _toggle_picker)
-        self._picker_closed_at = {}    # key -> when a picker last closed by losing focus
+        self._picker_anchors = {}      # picker name -> the button that opens it
         self.photo_cache = []          # keeps PhotoImages alive — Tk drops them otherwise
         self.suggest_popup = None
         self._snake_win = None
@@ -2615,6 +3112,9 @@ class ChatApp(tk.Tk):
             "connect_fail": self._on_connect_fail,
             "chat": self._on_chat_event,
             "react": lambda p: self.add_reaction(p["msg_id"], p["emoji"], p.get("sender", "")),
+            "whisper": self.append_whisper_line,
+            "snake": self._on_snake_event,
+            "upload_done": self._on_upload_done,
             "msg_edit": self._on_msg_edit,
             "msg_delete": self._on_msg_delete,
             "system": self.append_system_line,
@@ -2641,6 +3141,7 @@ class ChatApp(tk.Tk):
 
         self.bind_all(SNAKE_KEYBIND, self.on_open_snake)
         self.bind("<FocusIn>", self._on_focus_in)
+        self.bind_all("<Button-1>", self._on_global_click, add="+")  # click-away closes the in-window pickers
         self.protocol("WM_DELETE_WINDOW", self.on_close)
         self.after(50, self.poll_queue)
 
@@ -2653,7 +3154,10 @@ class ChatApp(tk.Tk):
         self.message_reactions = {}
         self._msg_authors = {}         # msg_id -> author name, for "deleted by ..." wording
         self._my_messages = {}         # msg_id -> current text of messages *I* sent (editable)
-        self._attachments = {}         # msg_id -> {"data", "filename", "photo", "mine"} for files/images in the log
+        self._attachments = {}         # msg_id -> {"data", "filename", "photo", "mine", "whisper"} for files/images in the log
+        self._whisper_ids = set()      # msg_ids of whisper lines (private: no reactions, no admin delete)
+        self._uploads = 0              # attachments currently being uploaded / sent
+        self.snake_board = {}          # name.lower() -> {"name", "best", "score", "playing"}: the room's live Snake scores
         self.typing_last_seen = {}
         self.user_msg_times = {}       # name.lower() -> recent message timestamps (spam ranking)
         self.user_last_msg_time = {}   # name.lower() -> timestamp of their last message (idle ranking)
@@ -2687,6 +3191,7 @@ class ChatApp(tk.Tk):
             except Exception: pass
 
     def _close_popup(self, name):
+        self._picker_anchors.pop(name, None)
         popup = self._popups.pop(name, None)
         if popup is not None:
             try: popup.destroy()
@@ -2715,30 +3220,42 @@ class ChatApp(tk.Tk):
         return popup
 
     def _toggle_picker(self, name, anchor, build):
-        """A borderless picker that opens just above `anchor`, and closes on
-        Esc, on losing focus, or when its button is clicked again."""
+        """A panel that opens just above `anchor`, inside the main window. (A separate
+        borderless window steals keyboard focus on some platforms and can leave the
+        chat box dead until the app is minimised and restored — here the entry never
+        loses focus.) Closes on Esc, on a click anywhere else, or on its button again."""
         if name in self._popups:
             return self._close_popup(name)
-        # Clicking the anchor button while the picker is open first makes the
-        # picker lose focus (closing it) — don't instantly reopen it.
-        if time.time() - self._picker_closed_at.get(name, 0.0) < 0.25:
-            return
-        popup = tk.Toplevel(self)
-        popup.overrideredirect(True)
-        popup.configure(bg=BG_PANEL, padx=6, pady=6)
+        for other in ("emoji", "stickers"):
+            self._close_popup(other)
+        popup = tk.Frame(self.chat_frame, bg=BG_PANEL, bd=1, relief="solid", padx=6, pady=6)
         self._popups[name] = popup
+        self._picker_anchors[name] = anchor
         build(popup)
         popup.update_idletasks()
-        x = anchor.winfo_rootx()
-        y = max(0, anchor.winfo_rooty() - popup.winfo_reqheight() - 6)
-        popup.geometry(f"+{x}+{y}")
-        popup.bind("<FocusOut>", lambda e: self._picker_lost_focus(name))
-        popup.bind("<Escape>", lambda e: self._close_popup(name))
-        popup.focus_set()
+        frame = self.chat_frame
+        x = anchor.winfo_rootx() - frame.winfo_rootx()
+        x = max(0, min(x, frame.winfo_width() - popup.winfo_reqwidth()))
+        y = max(0, anchor.winfo_rooty() - frame.winfo_rooty() - popup.winfo_reqheight() - 6)
+        popup.place(x=x, y=y)
+        popup.lift()
 
-    def _picker_lost_focus(self, name):
-        self._picker_closed_at[name] = time.time()
-        self._close_popup(name)
+    @staticmethod
+    def _within(widget_path: str, container) -> bool:
+        path = str(container)
+        return widget_path == path or widget_path.startswith(path + ".")
+
+    def _on_global_click(self, event):
+        clicked = str(event.widget)
+        for name in ("emoji", "stickers"):
+            popup = self._popups.get(name)
+            if popup is None:
+                continue
+            anchor = self._picker_anchors.get(name)
+            if not (self._within(clicked, popup) or (anchor is not None and self._within(clicked, anchor))):
+                self._close_popup(name)
+        if self.suggest_popup is not None and not (self._within(clicked, self.suggest_popup) or clicked == str(self.msg_entry)):
+            self.destroy_suggestions()
 
     @contextmanager
     def _log_edit(self):
@@ -3090,6 +3607,7 @@ class ChatApp(tk.Tk):
             self.log.delete("1.0", "end")
         self._hide_jump()
         self.typing_var.set("")
+        self._refresh_upload_label()
         self.dnd_btn.disabled = False
         self._set_dnd_button_style(False)
         self._apply_mute_state(False)
@@ -3145,6 +3663,10 @@ class ChatApp(tk.Tk):
 
     def _teardown_connection(self):
         self._teardown_popups()
+        if self._snake_win is not None:  # the room is gone, so is its leaderboard
+            try: self._snake_win._on_close()
+            except Exception: pass
+            self._snake_win = None
         self._stop_typing_signal()
         if self.connection:
             try: self.connection.close()
@@ -3209,8 +3731,12 @@ class ChatApp(tk.Tk):
         self.typing_var = tk.StringVar(value="")
         tk.Label(self.chat_frame, textvariable=self.typing_var, bg=BG_DARK, fg=FG_MUTED, font=(CHAT_FONT[0], 9, "italic"), anchor="w").pack(fill="x", padx=10)
 
+        self.upload_var = tk.StringVar(value="")
+        self.upload_label = tk.Label(self.chat_frame, textvariable=self.upload_var, bg=BG_DARK, fg=COLOR_PALETTE["yellow"], font=(CHAT_FONT[0], 9, "bold"), anchor="w")  # packed only while uploading
+
         self.mute_status_var = tk.StringVar(value="")
-        tk.Label(self.chat_frame, textvariable=self.mute_status_var, bg=BG_DARK, fg=COLOR_PALETTE["red"], font=(CHAT_FONT[0], 9, "bold"), anchor="w").pack(fill="x", padx=10)
+        self.mute_label = tk.Label(self.chat_frame, textvariable=self.mute_status_var, bg=BG_DARK, fg=COLOR_PALETTE["red"], font=(CHAT_FONT[0], 9, "bold"), anchor="w")
+        self.mute_label.pack(fill="x", padx=10)
 
         self.bottom_bar = tk.Frame(self.chat_frame, bg=BG_DARK)
         self.bottom_bar.pack(fill="x", padx=10, pady=(0, 10))
@@ -3359,15 +3885,7 @@ class ChatApp(tk.Tk):
 
     def render_suggestion_popup(self):
         if not self.suggest_popup:
-            self.suggest_popup = tk.Toplevel(self)
-            self.suggest_popup.wm_overrideredirect(True)
-            self.suggest_popup.configure(bg=BG_PANEL, bd=1, relief="solid")
-            self.suggest_popup.attributes("-topmost", True)
-            # Clicking the popup's own padding should dismiss it and hand focus
-            # straight back to the entry — otherwise losing focus to a
-            # borderless window can leave the entry unresponsive on macOS.
-            self.suggest_popup.bind("<Button-1>", self._on_suggestion_popup_clicked)
-
+            self.suggest_popup = tk.Frame(self.chat_frame, bg=BG_PANEL, bd=1, relief="solid")
             self.suggest_listbox = tk.Listbox(
                 self.suggest_popup, bg=BG_PANEL, fg=FG_TEXT, font=CHAT_FONT,
                 selectbackground=BTN_NEUTRAL, selectforeground="white",
@@ -3382,9 +3900,12 @@ class ChatApp(tk.Tk):
         self.suggest_listbox.configure(height=min(6, len(self.current_suggestions)))
         self.suggest_popup.update_idletasks()
 
+        frame = self.chat_frame
         height = self.suggest_popup.winfo_reqheight()
-        x, y = self.msg_entry.winfo_rootx(), self.msg_entry.winfo_rooty() - height - 5
-        self.suggest_popup.wm_geometry(f"{max(self.msg_entry.winfo_width() // 2, 220)}x{height}+{x}+{y}")
+        x = self.msg_entry.winfo_rootx() - frame.winfo_rootx()
+        y = self.msg_entry.winfo_rooty() - frame.winfo_rooty() - height - 5
+        self.suggest_popup.place(x=x, y=max(0, y), width=max(self.msg_entry.winfo_width() // 2, 220), height=height)
+        self.suggest_popup.lift()
 
     def destroy_suggestions(self):
         if self.suggest_popup:
@@ -3392,11 +3913,6 @@ class ChatApp(tk.Tk):
             except Exception: pass
             self.suggest_popup = None
         self.current_suggestions = []
-
-    def _on_suggestion_popup_clicked(self, event):
-        self.destroy_suggestions()
-        self.msg_entry.focus_set()
-        return "break"
 
     def _on_suggestion_clicked(self, event):
         if not self.current_suggestions:
@@ -3478,6 +3994,11 @@ class ChatApp(tk.Tk):
         return self._history_step(1)
 
     def _on_escape(self, event):
+        open_pickers = [name for name in ("emoji", "stickers") if name in self._popups]
+        for name in open_pickers:
+            self._close_popup(name)
+        if open_pickers:
+            return "break"
         if self.suggest_popup:
             self.destroy_suggestions()
         elif self._history_pos is not None:
@@ -3552,15 +4073,74 @@ class ChatApp(tk.Tk):
             self.connection.send_typing(False)
         self.typing_active, self.last_typing_sent = False, 0.0
 
+    def _attachment_target(self):
+        """-> (ok, whisper_target). If the message box starts with "/whisper <name>", an
+        attachment goes privately to that person; otherwise to everyone."""
+        parts = self.msg_entry.get().split(None, 2)
+        if not parts or parts[0].lower() != "/whisper":
+            return True, None
+        wanted = parts[1].lower() if len(parts) > 1 else ""
+        for name in self.current_roster:
+            if name.lower() == wanted and name.lower() != self.my_name.lower():
+                return True, name
+        messagebox.showinfo("Whisper a file", "To whisper a file, first type /whisper and someone's full name (e.g. /whisper Sam), then use the button again.", parent=self)
+        return False, None
+
+    def _refresh_upload_label(self, filename: str = "", to: str = None):
+        if self._uploads <= 0:
+            self._uploads = 0
+            self.upload_var.set("")
+            self.upload_label.pack_forget()
+            return
+        text = f"⏳ Uploading and Sending… {filename}" if filename else "⏳ Uploading and Sending…"
+        if to: text += f" (whisper to {to})"
+        if self._uploads > 1: text += f"  [{self._uploads} in progress]"
+        self.upload_var.set(text)
+        if not self.upload_label.winfo_manager():
+            self.upload_label.pack(fill="x", padx=10, before=self.mute_label)
+
+    def _start_upload(self, filename: str, loader, to: str = None):
+        """Reading, encoding and sending a big file takes a moment, so it runs on a worker
+        thread — the window stays live and the label above the message box says so."""
+        conn = self.connection
+        if conn is None:
+            return
+        self._uploads += 1
+        self._refresh_upload_label(filename, to)
+
+        def report(ok, name=filename, error=None):
+            self.event_queue.put(("upload_done", {"ok": ok, "filename": name, "error": error}))
+
+        def work():
+            try:
+                name, data = loader()
+                conn.send_file_bytes(name, data, on_done=lambda ok: report(ok, name), to=to)
+            except Exception as e:
+                report(False, filename, str(e))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _on_upload_done(self, payload):
+        self._uploads -= 1
+        self._refresh_upload_label()
+        if payload.get("error"):
+            self.append_system_line(f"Couldn't send {payload['filename']}: {payload['error']}")
+        elif not payload["ok"]:
+            self.append_system_line(f"Couldn't send {payload['filename']}.")
+        else:
+            self._maybe_start_slowmode_cooldown()
+
     def on_attach_file(self):
         if not self.connection: return
+        ok, target = self._attachment_target()
+        if not ok: return
         path = filedialog.askopenfilename(title="Choose a file to send")
         if not path: return
         try:
-            self.connection.send_file(path)
-            self._maybe_start_slowmode_cooldown()
-        except ValueError as e: messagebox.showerror("File too large", str(e))
-        except OSError as e: messagebox.showerror("Couldn't read file", str(e))
+            check_file_size(path)
+        except ValueError as e: return messagebox.showerror("File too large", str(e))
+        except OSError as e: return messagebox.showerror("Couldn't read file", str(e))
+        self._start_upload(os.path.basename(path), lambda: read_file_for_send(path), target)
 
     # ---- Do Not Disturb ----
 
@@ -3781,12 +4361,35 @@ class ChatApp(tk.Tk):
         return "break"
 
     def _snake_color(self) -> str:
-        if isinstance(self.connection, HostConnection):
-            return HOST_COLOR
-        my_color = self.known_colors.get(self.my_name.lower())
-        if my_color in GRADIENT_PALETTES:
-            return my_color
-        return random.choice(list(COLOR_PALETTE.values()))
+        """The snake wears your name's colour — a flat colour or one of the gradients."""
+        fallback = HOST_COLOR if isinstance(self.connection, HostConnection) else FG_TEXT
+        return self.known_colors.get(self.my_name.lower()) or fallback
+
+    def snake_name_color(self, name: str) -> str:
+        color = self.known_colors.get(name.lower(), FG_TEXT)
+        palette = GRADIENT_PALETTES.get(color)
+        if not palette:
+            return color
+        # A flat label can't show a gradient — use its brightest shade so it stays readable on the dark background.
+        luminance = lambda c: 0.299 * int(c[1:3], 16) + 0.587 * int(c[3:5], 16) + 0.114 * int(c[5:7], 16)
+        return max(palette, key=luminance)
+
+    def snake_report(self, score: int, playing: bool):
+        """Called by the Snake window: update our row on the board and tell the room."""
+        entry = self.snake_board.setdefault(self.my_name.lower(), {"name": self.my_name, "best": 0, "score": 0, "playing": False})
+        entry.update(score=score, playing=playing)
+        entry["best"] = max(entry["best"], score)
+        if self.connection is not None:
+            self.connection.send_snake(score, playing)
+        self._refresh_snake()
+
+    def _on_snake_event(self, entry):
+        self.snake_board[entry["name"].lower()] = entry
+        self._refresh_snake()
+
+    def _refresh_snake(self):
+        if self._snake_win is not None:
+            self._snake_win.refresh_leaderboard()
 
     # ------------------------------------------------------------------
     # Stickers + emoji
@@ -3906,6 +4509,8 @@ class ChatApp(tk.Tk):
     def send_sticker(self, name):
         self._close_popup("stickers")
         if not self.connection: return
+        ok, target = self._attachment_target()
+        if not ok: return
 
         if name in self.BUILTIN_STICKERS:
             img_bytes = self._render_builtin_sticker(name)
@@ -3914,8 +4519,8 @@ class ChatApp(tk.Tk):
             if not b64data: return
             img_bytes = base64.b64decode(b64data)
 
-        self.connection.send_file_bytes(f"Sticker_{name}.jpg", img_bytes)
-        self._maybe_start_slowmode_cooldown()
+        filename = f"Sticker_{name}.jpg"
+        self._start_upload(filename, lambda: (filename, img_bytes), target)
 
     def on_emoji_picker(self):
         self._toggle_picker("emoji", self.emoji_btn, self._build_emoji_picker)
@@ -3933,7 +4538,6 @@ class ChatApp(tk.Tk):
     def _insert_emoji(self, emoji_char: str):
         self.msg_entry.insert("insert", emoji_char)
         self._close_popup("emoji")
-        self.msg_entry.focus_set()
         self.on_entry_key()  # so the typing indicator reflects the inserted emoji
 
     # ------------------------------------------------------------------
@@ -3965,6 +4569,9 @@ class ChatApp(tk.Tk):
     def _on_colormap_event(self, colors):
         self.known_colors.update(colors)
         self.update_roster(self.current_roster)
+        if self._snake_win is not None:
+            self._snake_win.set_color(self._snake_color())  # keep the snake matching our name colour
+            self._snake_win.refresh_leaderboard()           # …and the names on the leaderboard
 
     # ------------------------------------------------------------------
     # Chat log rendering
@@ -4038,6 +4645,31 @@ class ChatApp(tk.Tk):
         if not mine:
             self._note_unread()
 
+    def append_whisper_line(self, payload):
+        sender, to, msg_id, body = payload["from"], payload["to"], payload["msg_id"], payload["text"]
+        mine = sender.lower() == self.my_name.lower()
+        label = f"[whisper to {to}] " if mine else f"[whisper from {sender}] "
+        with self._log_append(force_scroll=mine):
+            start_index = self.log.index("end-1c")
+            self.log.insert("end", f"[{time.strftime('%H:%M')}] ", ("timestamp",))
+            self.log.insert("end", label, ("private",))
+            body_start = self.log.index("end-1c")
+            self.log.insert("end", body, ("private",))
+            end_index = self.log.index("end-1c")
+            self.log.tag_add("align_right" if mine else "align_left", start_index, end_index)
+            if msg_id:
+                self.log.tag_add(f"msg_{msg_id}", start_index, end_index)
+                self.log.tag_add(f"body_{msg_id}", body_start, end_index)
+                self._remember_author(msg_id, sender)
+                self._whisper_ids.add(msg_id)
+                if mine:
+                    self._my_messages[msg_id] = body
+                self.log.mark_set(f"react_mark_{msg_id}", end_index)
+                self.log.mark_gravity(f"react_mark_{msg_id}", "left")
+            self.log.insert("end", "\n")
+        if not mine:
+            self._note_unread()
+
     def append_system_line(self, text: str):
         with self._log_append():
             self.log.insert("end", f"* {text}\n", ("system",))
@@ -4056,27 +4688,39 @@ class ChatApp(tk.Tk):
                 return "break"
 
     def _build_message_menu(self, msg_id):
+        """The right-click menu for a message/attachment, or None if there's nothing to offer."""
         menu = tk.Menu(self, tearoff=0, bg=BG_PANEL, fg=FG_TEXT)
         attachment = self._attachments.get(msg_id)
+        private = msg_id in self._whisper_ids or (attachment is not None and attachment["whisper"])
+        entries = 0
         if attachment is not None:
             menu.add_command(label="Save As...", command=lambda: self._save_file_to_disk(attachment["data"], attachment["filename"]))
+            entries += 1
             mine, noun = attachment["mine"], "attachment"
+        elif private:
+            mine, noun = msg_id in self._my_messages, "message"  # whispers can't be reacted to
         else:
             for emoji in self.REACTION_CHOICES:
                 menu.add_command(label=emoji, command=lambda e=emoji: self.send_reaction(msg_id, e))
+                entries += 1
             mine, noun = msg_id in self._my_messages, "message"
-        if mine or self.is_admin:  # is_admin is also True for the host
-            menu.add_separator()
+        admin_may_delete = self.is_admin and not private  # admins never see (or delete) whispers
+        if mine or admin_may_delete:  # is_admin is also True for the host
+            if entries:
+                menu.add_separator()
             if mine:
                 if attachment is None:
                     menu.add_command(label="Edit message", command=lambda: self.start_edit(msg_id))
                 menu.add_command(label=f"Delete {noun}", command=lambda: self.start_delete(msg_id))
             else:
                 menu.add_command(label=f"Delete {noun} (admin)", command=lambda: self.start_delete(msg_id))
-        return menu
+            entries += 1
+        return menu if entries else None
 
     def show_reaction_menu(self, event, msg_id):
         menu = self._build_message_menu(msg_id)
+        if menu is None:
+            return
         try: menu.tk_popup(event.x_root, event.y_root)
         finally: menu.grab_release()
 
@@ -4099,7 +4743,7 @@ class ChatApp(tk.Tk):
         if not self.connection:
             return
         attachment = self._attachments.get(msg_id)
-        noun = "attachment" if attachment is not None else "message"
+        noun = "attachment" if attachment is not None else ("whisper" if msg_id in self._whisper_ids else "message")
         mine = attachment["mine"] if attachment is not None else msg_id in self._my_messages
         prompt = f"Delete your {noun} for everyone?" if mine else f"Delete this {noun} for everyone?"
         if messagebox.askyesno(f"Delete {noun}", prompt, parent=self):
@@ -4118,7 +4762,8 @@ class ChatApp(tk.Tk):
         align = "align_right" if msg_id in self._my_messages else "align_left"
         with self._log_edit():
             self.log.delete(start, end)
-            self.log.insert(start, new_text, (f"body_{msg_id}", msg_tag, align))
+            colour = ("private",) if msg_id in self._whisper_ids else ()
+            self.log.insert(start, new_text, (f"body_{msg_id}", msg_tag, align) + colour)
             body_end = f"{start}+{len(new_text)}c"
             marker = self.log.tag_ranges(edited_tag)
             if marker:
@@ -4221,7 +4866,12 @@ class ChatApp(tk.Tk):
             self.log.insert("end", f"[{time.strftime('%H:%M')}] ", ("timestamp",))
             self._insert_name(sender, self.known_colors.get(sender.lower(), FG_TEXT))
             attach_start = self.log.index("end-1c")
-            self.log.insert("end", f" sent an attachment ({filename}):\n")
+            to = payload.get("to") or ""
+            if to:
+                header = f" whispered an attachment to {to} ({filename}):\n" if mine else f" whispered you an attachment ({filename}):\n"
+            else:
+                header = f" sent an attachment ({filename}):\n"
+            self.log.insert("end", header, ("private",) if to else ())
 
             photo = None
             if thumb is not None and ImageTk is not None:
@@ -4247,7 +4897,7 @@ class ChatApp(tk.Tk):
                 self.log.tag_add(f"msg_{msg_id}", start_index, end_index)
                 self.log.tag_add(f"attach_{msg_id}", attach_start, end_index)  # what a delete replaces
                 self._remember_author(msg_id, sender)
-                self._attachments[msg_id] = {"data": data, "filename": filename, "photo": photo, "mine": mine}
+                self._attachments[msg_id] = {"data": data, "filename": filename, "photo": photo, "mine": mine, "whisper": bool(to)}
 
         if not mine:
             self._note_unread()
