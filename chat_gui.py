@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """
+1.4.10 - updated guest limit
 chat_gui.py — v1.4.9d — ENCRYPTED instant messenger with a desktop GUI.
 
 Changes in 1.4.9d:
@@ -255,7 +256,7 @@ except ImportError:
 if sys.platform == "darwin":
     ensure_installed("pyobjus", required=False)
 
-VERSION = "1.4.9d"
+VERSION = "1.4.10"
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -284,7 +285,7 @@ def save_json(path: str, data, **dump_kwargs) -> bool:
     except OSError:
         return False
 MSG_LEN_BYTES = 4
-MAX_GUESTS = 4
+MAX_GUESTS = 10
 MAX_FILE_BYTES = 500 * 1024 * 1024 # 500MB Limit
 DND_ANNOUNCE_COOLDOWN = 2.0
 SPAM_SUGGESTION_WINDOW = 60.0  # seconds — how far back "recent" message activity counts for /mute /kick /ban suggestion ranking

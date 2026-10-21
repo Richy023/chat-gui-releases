@@ -1,7 +1,7 @@
 {
-  "version": "1.4.9d",
+  "version": "1.4.10",
   "url": "https://raw.githubusercontent.com/Richy023/chat-gui-releases/main/chat_gui.py",
-  "sha256": "69c04fd2d4c1ec1966830fd718e516ffaee024eb1f053198ed8dbef2d9835a6f",
-  "signature": "EMQnhFz0m+EHhPkwQRbRUdPhaTbpjl1Nd1Qm4Vnd57PDG8desHbHwulK3r4cBF2eWrF2aIlhPnc49QcGl6LADw==",
-  "notes": "Added new features and bug fixes"
+  "sha256": "c97152e3a43dd2c75389920457804cd50b6d4597ab6dcfbe9861a50a66c21edc",
+  "signature": "ajwKfbMtPMdcD2UsyeAWwTVxUodnIBQmGw7eLF+ycNQNDS3nz4YI6p2meIWl6qJkwmMBvQ+8v7K6BlLrnvRhCw==",
+  "notes": "Increased guest limit to 10"
 }
