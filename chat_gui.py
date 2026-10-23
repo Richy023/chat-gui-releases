@@ -1,7 +1,35 @@
 #!/usr/bin/env python3
 """
-1.4.10 - updated guest limit
-chat_gui.py — v1.4.9d — ENCRYPTED instant messenger with a desktop GUI.
+chat_gui.py — v1.4.10a — ENCRYPTED instant messenger with a desktop GUI.
+
+Changes in 1.4.10a:
+- Rooms hold up to 15 guests (was 4).
+- Paste an image (a screenshot, or an image copied from anywhere) into the
+  message box with Ctrl+V / Cmd+V: a small preview asks "Send?" and it goes out
+  as a normal attachment (privately if the box starts with /whisper <name>).
+  Copied files from Explorer/Finder can be sent the same way.
+- /nick now tells you how many nickname changes you have left. (The host-only
+  /rename and the two-changes-per-person rule — admins included — came in 1.4.10.)
+- The 1 GB file limit stays: a real 1 GiB transfer was tested end to end.
+
+Changes in 1.4.10:
+- Large files: sending a big file used to disconnect everyone (it went out as one
+  giant message that overflowed every recipient's send queue — anything over
+  ~300 MB). Files are now streamed in 512 KB pieces, paced to the slowest
+  recipient, and written to disk as they arrive, so the limit really is 1 GB,
+  memory stays low, chat stays instant mid-transfer, and a recipient on a bad
+  connection is dropped alone. A sender vanishing mid-transfer leaves no
+  partial file anywhere. Progress shows in the status line; downloads of big
+  files copy in the background.
+- Nicknames: /nick <name> (anyone, twice per chat, no reconnect needed) and
+  host-only /rename <current> <new>. A host rename doesn't use up the person's
+  changes but locks them out of changing it back. Admin status, colours, mutes,
+  whispers, edit rights and Snake scores follow a renamed person. Names can't
+  contain spaces or "|".
+- /warn <name> [reason] (host and admins): the person gets a warning pop-up with
+  a running count; everyone else sees "X has been warned"; the admin log records it.
+- Version strings like 1.4.10 are compared numerically (1.4.10 > 1.4.9d > 1.4.1).
+- Not compatible with 1.4.9d for file transfers — update everyone.
 
 Changes in 1.4.9d:
 - Joining: rejoining after leaving while muted no longer fails (the host sent
@@ -200,6 +228,7 @@ import importlib
 import subprocess
 import json
 import shutil
+import tempfile
 import platform
 import uuid
 import urllib.request
@@ -249,14 +278,14 @@ except ImportError:
 
 ensure_installed("PIL", pip_name="Pillow", required=False)
 try:
-    from PIL import Image, ImageTk, ImageDraw, ImageFont
+    from PIL import Image, ImageTk, ImageDraw, ImageFont, ImageGrab
 except ImportError:
-    Image = ImageTk = ImageDraw = ImageFont = None
+    Image = ImageTk = ImageDraw = ImageFont = ImageGrab = None
 
 if sys.platform == "darwin":
     ensure_installed("pyobjus", required=False)
 
-VERSION = "1.4.10"
+VERSION = "1.4.10a"
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -285,8 +314,12 @@ def save_json(path: str, data, **dump_kwargs) -> bool:
     except OSError:
         return False
 MSG_LEN_BYTES = 4
-MAX_GUESTS = 10
-MAX_FILE_BYTES = 500 * 1024 * 1024 # 500MB Limit
+MAX_GUESTS = 15
+MAX_FILE_BYTES = 1024 * 1024 * 1024   # 1 GB — files are streamed in chunks, so this really is the limit
+FILE_CHUNK_BYTES = 512 * 1024          # raw bytes per chunk (each chunk is its own encrypted frame)
+INLINE_FILE_BYTES = 16 * 1024 * 1024   # received files up to this size are held in memory (instant preview/save); bigger ones live in a temp file
+TRANSFER_WINDOW_BYTES = 8 * 1024 * 1024  # a sender pauses while this much is already queued for a recipient
+TRANSFER_STALL_SECONDS = 60            # a recipient that hasn't drained anything for this long is dropped (just them)
 DND_ANNOUNCE_COOLDOWN = 2.0
 SPAM_SUGGESTION_WINDOW = 60.0  # seconds — how far back "recent" message activity counts for /mute /kick /ban suggestion ranking
 
@@ -347,7 +380,10 @@ MUTE_STATUS_PREFIX = "__MUTE_STATUS__:"
 NOTICE_PREFIX = "__NOTICE__:"
 ROSTER_PREFIX = "__ROSTER__:"
 COLORMAP_PREFIX = "__COLORMAP__:"
-FILE_PREFIX = "__FILE__:"
+FILE_PREFIX = "__FILE__:"            # start of a transfer: "sender|msg_id|to|filename|size"
+FILECHUNK_PREFIX = "__FCHUNK__:"     # "msg_id|index|base64 bytes"
+FILEEND_PREFIX = "__FEND__:"         # "msg_id"
+FILEABORT_PREFIX = "__FABORT__:"     # "msg_id|reason" — the transfer is dead, discard what you have
 DND_PREFIX = "__DND__:"
 CMD_PREFIX = "__CMD__:"
 HOST_DISCONNECT_PREFIX = "__HOST_DISCONNECT__"
@@ -365,6 +401,9 @@ AURORA_UNLOCK_PREFIX = "__AURORA_UNLOCK__:"
 FINGERPRINT_PREFIX = "__FINGERPRINT__:"
 EDIT_PREFIX = "__EDIT__:"          # guest -> host: "msg_id|new text"; host -> clients: "msg_id|editor|new text"
 DELETE_PREFIX = "__DELETE__:"      # guest -> host: "msg_id";          host -> clients: "msg_id|deleter"
+NICK_PREFIX = "__NICK__:"            # guest -> host: "new nickname"
+RENAME_PREFIX = "__RENAME__:"        # host -> everyone: "old|new|renamed_by"
+WARN_PREFIX = "__WARN__:"            # host -> the warned person: "by|warning_number|reason"
 SNAKE_PREFIX = "__SNAKE__:"        # guest -> host: "score|playing"; host -> clients: "name|best|score|playing"
 WHISPER_PREFIX = "__WHISPER__:"    # guest -> host: "msg_id|target|text"; host -> both parties: "msg_id|from|to|text"
 FEATURES_PREFIX = "__FEATURES__:"  # each side announces optional features it understands
@@ -655,7 +694,7 @@ def generate_room_code(local_ip: str = None) -> str:
     rng = random.SystemRandom()
     return f"{rng.randint(0, 255):03d}{rng.randint(1, 254):03d}"
 
-MAX_FRAME_BYTES = 1_200_000_000  # sanity cap on one encrypted frame (a 500MB file is ~0.9GB after two base64 layers)
+MAX_FRAME_BYTES = 8 * 1024 * 1024  # sanity cap on one encrypted frame — real frames are far smaller (a file chunk is ~0.9MB)
 
 def encode_frame(fernet: Fernet, plaintext: str) -> bytes:
     token = fernet.encrypt(plaintext.encode("utf-8", errors="surrogatepass"))
@@ -707,26 +746,27 @@ class Outbox:
       * a stalled peer can never block anyone else's messages (or the UI);
       * frames from different threads can never interleave on the wire (which
         would permanently desync the peer's stream — it'd stop seeing messages);
-      * small control frames overtake queued large (file) frames.
+      * small control frames (chat) overtake queued bulk frames (file chunks) —
+        while bulk frames always stay in order among themselves.
     `on_sent(ok)` is called once the frame has been written (or dropped)."""
 
     HARD, CONTROL, AFTER_CONTROL, BULK = -1, 0, 1, 2
     BULK_THRESHOLD = 64 * 1024
-    MAX_QUEUED_BYTES = 512 * 1024 * 1024  # a peer this far behind is dropped rather than buffered forever
+    MAX_QUEUED_BYTES = 256 * 1024 * 1024  # backstop only: transfers are paced by wait_below(), so normally a few MB
 
     def __init__(self, sock: socket.socket, on_failed=None):
         self.sock = sock
         self.on_failed = on_failed
         self._queue = queue.PriorityQueue()
         self._seq = itertools.count()
-        self._lock = threading.Lock()
+        self._lock = threading.Condition()
         self._queued = 0
         self._closed = False
         self._dead = False
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
 
-    def put(self, frame: bytes, on_sent=None) -> bool:
+    def put(self, frame: bytes, on_sent=None, bulk: bool = False) -> bool:
         with self._lock:
             if self._closed:
                 return False
@@ -736,15 +776,28 @@ class Outbox:
         if overflow:
             self._fail()
             return False
-        priority = self.BULK if len(frame) > self.BULK_THRESHOLD else self.CONTROL
+        priority = self.BULK if (bulk or len(frame) > self.BULK_THRESHOLD) else self.CONTROL
         self._queue.put((priority, next(self._seq), frame, on_sent))
         return True
+
+    def wait_below(self, limit: int, timeout: float) -> bool:
+        """Back-pressure for senders: block until at most `limit` bytes are queued.
+        False if it's still above after `timeout` seconds, or the connection is gone."""
+        deadline = time.monotonic() + timeout
+        with self._lock:
+            while self._queued > limit and not self._closed:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self._lock.wait(remaining)
+            return not self._closed
 
     def close(self, after_control: bool = False):
         """Stop accepting frames. after_control=True still sends queued small frames
         first (e.g. a kick notice); otherwise everything pending is dropped."""
         with self._lock:
             self._closed = True
+            self._lock.notify_all()
         self._queue.put((self.AFTER_CONTROL if after_control else self.HARD, next(self._seq), None, None))
 
     def join(self, timeout: float):
@@ -764,6 +817,7 @@ class Outbox:
                 return
             with self._lock:
                 self._queued -= len(frame)
+                self._lock.notify_all()
             self._notify(on_sent, True)
 
     def _fail(self):
@@ -771,6 +825,7 @@ class Outbox:
             if self._dead:
                 return
             self._dead = self._closed = True
+            self._lock.notify_all()
         self._shutdown_socket()
         self._drain()
         if self.on_failed:
@@ -808,6 +863,15 @@ def extract_ping_targets(text: str, known_names):
         if key in lower_names: found.append(lower_names[key])
         else: unknown.append(mention)
     return found, unknown
+
+def nickname_error(name: str):
+    """Why `name` can't be a nickname, or None if it's fine. (The wire format uses '|' as a
+    separator, so it can't appear in a name.)"""
+    if not name: return "A nickname can't be empty."
+    if len(name) > 30: return "A nickname can be at most 30 characters."
+    if any(ch.isspace() for ch in name): return "A nickname can't contain spaces."
+    if "|" in name or any(ord(ch) < 32 for ch in name): return "A nickname can't contain that character."
+    return None
 
 def _name_list(names) -> str:
     names = list(names)
@@ -1165,6 +1229,48 @@ def perform_globalban(fingerprint: str, reason: str) -> str:
 # install time, so the in-app viewer stays complete going forward
 # without needing the whole history re-embedded on every release.
 EMBEDDED_CHANGELOG = [
+    {   "version": "1.4.10a",
+        "date": "2026-10-22",
+        "notes": (
+            "Rooms now hold up to 15 guests (it was 4). "
+            "New: paste images. Press Ctrl+V (Cmd+V on a Mac) with an image on your clipboard — "
+            "a screenshot, or an image copied from a browser or editor — and a small preview "
+            "asks whether to send it. It goes out like any attachment, so it can be deleted "
+            "afterwards, and if the message box starts with /whisper and a name it's sent "
+            "privately to that person. Files copied in Explorer or Finder can be pasted and "
+            "sent the same way. Normal text pasting is unchanged. "
+            "Nicknames: /nick now tells you how many changes you have left (everyone, admins "
+            "included, gets two per chat; only the host can use /rename for inappropriate names). "
+            "The 1 GB file limit stays — a real 1 GiB file was sent end to end and arrived intact."
+        ),
+    },
+    {   "version": "1.4.10",
+        "date": "2026-10-21",
+        "notes": (
+            "Large files: fixed sending a big file disconnecting everyone. Files used to go "
+            "out as one giant message that overflowed everyone's send queue (anything over "
+            "roughly 300 MB), and the old limit could never really work. Files now stream in "
+            "small pieces, paced to the slowest person, and are written to disk as they "
+            "arrive — so the limit is a genuine 1 GB, memory use stays low, chat stays "
+            "instant while a file is going, someone on a bad connection is only dropped "
+            "themselves (never the whole room), and if the sender disappears halfway nothing "
+            "is left behind on anyone's computer. You'll see 'Uploading and Sending… 40%' "
+            "and 'Receiving…' progress, and downloading a big file now copies in the "
+            "background instead of freezing the window. "
+            "Nicknames: type /nick <new name> to change your own name — up to twice per chat, "
+            "no need to disconnect. The host has /rename <current name> <new name> for "
+            "inappropriate names; that doesn't use up the person's own changes, but they can't "
+            "change it back. Admin status, colours, mutes, whispers, the right to edit your own "
+            "messages and your Snake score all follow you to the new name. Names can't contain "
+            "spaces or the | character. "
+            "New: /warn <name> [reason] for the host and admins. The person gets a warning "
+            "pop-up with a running warning count, everyone else sees '<name> has been warned', "
+            "and the admin log records who warned whom and why. "
+            "Version numbers like 1.4.10 are compared numerically, so 1.4.10 is correctly newer "
+            "than 1.4.9d and 1.4.1. "
+            "1.4.10 isn't compatible with 1.4.9d for file transfers, so update everyone together."
+        ),
+    },
     {   "version": "1.4.9d",
         "date": "2026-10-15",
         "notes": (
@@ -1493,6 +1599,10 @@ class Hub:
         self.gradient_users = {}  # name.lower() -> sentinel (RAINBOW_SENTINEL, BLUE_SENTINEL, ...)
         self.messages = {}        # msg_id -> {"author", "text"}; oldest dropped past MAX_TRACKED_MESSAGES
         self.outboxes = {}        # sock -> Outbox (one writer thread per connected guest)
+        self.transfers = {}       # msg_id -> in-flight file transfer (see _handle_guest_file)
+        self.warnings = {}        # name.lower() -> how many times they've been warned this session
+        self.host_nick = {"nick_changes": 0, "nick_locked": False}  # same bookkeeping the guests keep in their client info
+        self.local_files = None   # the host's own FileAssembler (set by HostConnection)
         self.snake = {}           # name.lower() -> {"name", "best", "score", "playing"}; lives and dies with the room
 
     # ---- identity helpers ----
@@ -1648,6 +1758,90 @@ class Hub:
             self.log_host_only(deleter, f'deleted {what} {to}: "{_clip(text)}"')
         return None
 
+    # ---- nicknames ----
+
+    MAX_SELF_RENAMES = 2
+
+    def rename(self, old: str, new: str, by: str):
+        """Changes `old`'s nickname to `new`; `by` is whoever asked. Anyone may rename
+        themselves up to MAX_SELF_RENAMES times per chat; the host may rename anyone (that
+        doesn't use up their changes, but locks them out of changing it back). Returns an
+        error message, or None on success."""
+        error = nickname_error(new)
+        if error:
+            return error
+        old_key, new_key = old.lower(), new.lower()
+        self_rename = by.lower() == old_key
+        with self.lock:
+            self._purge_expired()
+            if new_key != old_key and (new_key == self.host_name.lower() or new_key in self.ghost_mutes
+                                       or any(i["name"].lower() == new_key for i in self.clients.values())):
+                return "That nickname is already taken."
+            is_host = self.is_host(old)
+            if is_host:
+                state, canonical_old = self.host_nick, self.host_name
+            else:
+                sock = next((s for s, i in self.clients.items() if i["name"].lower() == old_key), None)
+                if sock is None:
+                    return f"No one named '{old}' is connected."
+                state, canonical_old = self.clients[sock], self.clients[sock]["name"]
+            if self_rename:
+                if state["nick_locked"]:
+                    return "Your nickname was changed by the host, so it can't be changed again."
+                if state["nick_changes"] >= self.MAX_SELF_RENAMES:
+                    return f"You've already changed your nickname {self.MAX_SELF_RENAMES} times in this chat."
+                state["nick_changes"] += 1
+            else:
+                state["nick_locked"] = True  # a host rename sticks
+            if is_host: self.host_name = new
+            else: state["name"] = new
+
+            # Everything keyed by name follows the person.
+            for table in (self.colors, self.gradient_users, self.last_dnd_announce, self.last_msg_time, self.warnings):
+                if old_key in table:
+                    table[new_key] = table.pop(old_key)
+            for group in (self.admins, self.color_changed_once, self.dnd):
+                if old_key in group:
+                    group.discard(old_key)
+                    group.add(new_key)
+            self.typing.pop(canonical_old, None)
+            entry = self.snake.pop(old_key, None)
+            if entry is not None:
+                entry["name"] = new
+                self.snake[new_key] = entry
+            for record in self.messages.values():  # so they can still edit/delete what they wrote
+                if record["author"].lower() == old_key: record["author"] = new
+                if record.get("to") and record["to"].lower() == old_key: record["to"] = new
+            for transfer in self.transfers.values():
+                if transfer["to"] and transfer["to"].lower() == old_key: transfer["to"] = new
+
+        self.broadcast(f"{RENAME_PREFIX}{canonical_old}|{new}|{by}")
+        self.broadcast_colormap()
+        self._emit("rename", {"old": canonical_old, "new": new, "by": by})
+        if self_rename:
+            left = self.MAX_SELF_RENAMES - state["nick_changes"]
+            note = (f"You have {left} nickname change{'s' if left != 1 else ''} left in this chat."
+                    if left > 0 else "That was your last nickname change in this chat.")
+            if is_host: self._emit("system", note)
+            else: self.send_private(sock, NOTICE_PREFIX + note)
+        return None
+
+    def warn(self, name: str, by: str, reason: str):
+        """Sends `name` a formal warning (with a running count). Returns an error or None."""
+        if self.is_host(name):
+            return "You cannot warn the host."
+        sock = self.find_socket_by_name(name)
+        if sock is None:
+            return f"No one named '{name}' is connected."
+        canonical = self.get_info(sock).get("name", name)
+        reason = reason.strip() or "no reason given"
+        with self.lock:
+            count = self.warnings[canonical.lower()] = self.warnings.get(canonical.lower(), 0) + 1
+        self.send_private(sock, f"{WARN_PREFIX}{by}|{count}|{reason}")
+        self.broadcast(f"* {canonical} has been warned *", exclude_sock=sock)
+        self.log_admin_action(by, f"warned {canonical} (warning #{count}). Reason: {reason}")
+        return None
+
     # ---- snake leaderboard ----
 
     @staticmethod
@@ -1762,6 +1956,7 @@ class Hub:
                 "muted_by": None, "mute_reason": None, "kicked": False,
                 "features": set(),
                 "ready": False,  # becomes True once the roster has gone out — see mark_ready()
+                "nick_changes": 0, "nick_locked": False,
             }
 
     def mark_ready(self, sock):
@@ -1958,10 +2153,10 @@ class Hub:
     def send_private(self, sock, text, on_sent=None) -> bool:
         return self._send_frame(sock, encode_frame(self.fernet, text), on_sent)
 
-    def _send_frame(self, sock, frame: bytes, on_sent=None) -> bool:
+    def _send_frame(self, sock, frame: bytes, on_sent=None, bulk: bool = False) -> bool:
         outbox = self.outboxes.get(sock)
         if outbox is not None:
-            return outbox.put(frame, on_sent)
+            return outbox.put(frame, on_sent, bulk)
         try:  # not a registered client (yet) — e.g. replying during the handshake
             sock.sendall(frame)
             ok = True
@@ -1970,6 +2165,49 @@ class Hub:
         if on_sent is not None:
             on_sent(ok)
         return ok
+
+    # ---- file transfers ----
+
+    def transfer_targets(self, to, exclude_sock=None) -> list:
+        """Sockets a transfer's frames go to: everyone (to=None) or one person. The
+        host's own copy is handled separately via local_files."""
+        if to is None:
+            with self.lock:
+                return [s for s, info in self.clients.items() if info["ready"] and s is not exclude_sock]
+        if self.is_host(to):
+            return []
+        sock = self.find_socket_by_name(to)
+        return [sock] if sock is not None and sock is not exclude_sock else []
+
+    def relay_frame(self, frame: bytes, targets: list):
+        """Queue a transfer frame for each target, then wait for their queues to drain
+        below the window. This paces the sender to the slowest recipient without ever
+        buffering a whole file; a recipient that makes no progress for a minute is
+        dropped — only them, never the whole room."""
+        for s in targets:
+            self._send_frame(s, frame, bulk=True)
+        for s in targets:
+            box = self.outboxes.get(s)
+            if box is not None and not box.wait_below(TRANSFER_WINDOW_BYTES, TRANSFER_STALL_SECONDS):
+                self.disconnect(s)
+
+    def abort_transfer(self, msg_id: str, reason: str = ""):
+        with self.lock:
+            tr = self.transfers.pop(msg_id, None)
+            self.messages.pop(msg_id, None)
+        if tr is None:
+            return
+        frame = encode_frame(self.fernet, f"{FILEABORT_PREFIX}{msg_id}|{reason}")
+        self.relay_frame(frame, self.transfer_targets(tr["to"], exclude_sock=tr["sock"]))
+        if tr["local"] and self.local_files is not None:
+            self.local_files.abort(msg_id)
+        if reason:
+            self.send_private(tr["sock"], NOTICE_PREFIX + f"Sending {tr['filename']} failed: {reason}")
+
+    def abort_transfers_of(self, sock):
+        """The sender went away mid-transfer: tell everyone to discard the partial file."""
+        for msg_id in [m for m, tr in list(self.transfers.items()) if tr["sock"] is sock]:
+            self.abort_transfer(msg_id, "")
 
     def disconnect(self, sock):
         # shutdown() first: closing a socket from another thread does not wake a
@@ -2014,21 +2252,18 @@ def _clip(text: str, limit: int = 200) -> str:
 IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp")
 THUMB_SIZE = (260, 260)
 
-def encode_file_message(sender: str, msg_id: str, to: str, filename: str, data: bytes) -> str:
-    """`to` is the whisper recipient, or "" to send to everyone."""
-    safe_name = filename.replace("|", "_")
-    return FILE_PREFIX + "|".join((sender, msg_id, to, safe_name, base64.b64encode(data).decode("ascii")))
+def format_size(n: int) -> str:
+    for unit, factor in (("GB", 1 << 30), ("MB", 1 << 20), ("KB", 1 << 10)):
+        if n >= factor:
+            return f"{n / factor:.1f} {unit}"
+    return f"{n} B"
 
 def check_file_size(filepath: str):
     size = os.path.getsize(filepath)
     if size > MAX_FILE_BYTES:
-        raise ValueError(f"File is {size / 1024 / 1024:.1f} MB — the limit is {MAX_FILE_BYTES // 1024 // 1024} MB.")
-
-def read_file_for_send(filepath: str):
-    """Returns (filename, bytes), enforcing the size limit."""
-    check_file_size(filepath)
-    with open(filepath, "rb") as f:
-        return os.path.basename(filepath), f.read()
+        if format_size(size) == format_size(MAX_FILE_BYTES):  # just over — say so precisely
+            raise ValueError(f"File is {size:,} bytes — the limit is {MAX_FILE_BYTES:,} bytes.")
+        raise ValueError(f"File is {format_size(size)} — the limit is {format_size(MAX_FILE_BYTES)}.")
 
 def make_thumbnail(filename: str, data: bytes):
     """Decodes + shrinks an image in whatever thread calls this (the network
@@ -2043,27 +2278,172 @@ def make_thumbnail(filename: str, data: bytes):
     except Exception:
         return None
 
-def parse_file_message(text: str):
-    """-> {"sender", "msg_id", "to", "filename", "data"}, or None if it's malformed."""
+def encode_file_start(sender: str, msg_id: str, to: str, filename: str, size: int) -> str:
+    """`to` is the whisper recipient, or "" to send to everyone."""
+    return FILE_PREFIX + "|".join((sender, msg_id, to, filename.replace("|", "_"), str(size)))
+
+def parse_file_start(text: str):
+    """-> {"sender", "msg_id", "to", "filename", "size"}, or None if it's malformed."""
     try:
-        sender, msg_id, to, filename, b64data = text[len(FILE_PREFIX):].split("|", 4)
-        raw = base64.b64decode(b64data)
-    except Exception:
+        sender, msg_id, to, filename, size = text[len(FILE_PREFIX):].split("|", 4)
+        size = int(size)
+    except ValueError:
         return None
-    return {"sender": sender, "msg_id": msg_id, "to": to, "filename": os.path.basename(filename) or "unnamed_file", "data": raw}
+    if size < 0 or not msg_id:
+        return None
+    return {"sender": sender, "msg_id": msg_id, "to": to, "filename": os.path.basename(filename) or "unnamed_file", "size": size}
 
-def queue_file_event(info: dict, event_queue: queue.Queue):
-    event = dict(info)
-    event["thumb"] = make_thumbnail(info["filename"], info["data"])
-    event_queue.put(("file", event))
+def iter_file_texts(sender: str, msg_id: str, to: str, filename: str, size: int, chunks):
+    """The wire messages for one file: START, one per chunk, END."""
+    yield encode_file_start(sender, msg_id, to, filename, size)
+    for index, chunk in enumerate(chunks):
+        yield f"{FILECHUNK_PREFIX}{msg_id}|{index}|{base64.b64encode(chunk).decode('ascii')}"
+    yield FILEEND_PREFIX + msg_id
 
-def handle_incoming_file(text: str, event_queue: queue.Queue) -> bool:
-    info = parse_file_message(text)
-    if info is None:
-        event_queue.put(("system", "[received a corrupted file, ignored]"))
-        return False
-    queue_file_event(info, event_queue)
-    return True
+def chunks_from_bytes(data: bytes):
+    view = memoryview(data)
+    for offset in range(0, len(data), FILE_CHUNK_BYTES):
+        yield view[offset:offset + FILE_CHUNK_BYTES]
+
+def chunks_from_path(path: str):
+    with open(path, "rb") as f:
+        while chunk := f.read(FILE_CHUNK_BYTES):
+            yield chunk
+
+def with_progress(chunks, size: int, on_progress):
+    sent = 0
+    for chunk in chunks:
+        sent += len(chunk)
+        if on_progress is not None:
+            on_progress(sent, size)
+        yield chunk
+
+def local_file_event(sender, msg_id, to, filename, size, data=None, path=None) -> dict:
+    """The event for showing a file we sent ourselves (the host never echoes it back)."""
+    return {"sender": sender, "msg_id": msg_id, "to": to, "filename": filename, "size": size,
+            "data": data, "path": path, "temp": False,
+            "thumb": make_thumbnail(filename, data) if data is not None else None}
+
+
+class FileAssembler:
+    """Receives file transfers (START / CHUNK / END frames) for one client and turns them
+    into "file" events. Files up to INLINE_FILE_BYTES are assembled in memory; bigger ones
+    are written to a temp file as they arrive, so a 1 GB file never has to fit in RAM."""
+
+    PROGRESS_MIN_BYTES = 2 * 1024 * 1024  # don't bother reporting progress for small files
+    PROGRESS_STEP = 0.02
+
+    def __init__(self, event_queue: queue.Queue):
+        self.event_queue = event_queue
+        self._lock = threading.Lock()
+        self._transfers = {}
+        self._dir = None
+
+    def _say(self, text: str):
+        self.event_queue.put(("system", text))
+
+    def start(self, info: dict) -> bool:
+        size, name = info["size"], info["filename"]
+        if not 0 <= size <= MAX_FILE_BYTES:
+            self._say(f"Ignored {name}: it's larger than the {format_size(MAX_FILE_BYTES)} limit.")
+            return False
+        state = {"info": info, "size": size, "got": 0, "next": 0, "buf": None, "fh": None, "path": None, "last_pct": -1.0}
+        if size <= INLINE_FILE_BYTES:
+            state["buf"] = bytearray()
+        else:
+            try:
+                if self._dir is None:
+                    self._dir = tempfile.mkdtemp(prefix="chat_gui_files_")
+                if shutil.disk_usage(self._dir).free < size + 64 * 1024 * 1024:
+                    raise OSError("not enough free disk space")
+                safe_id = re.sub(r"[^0-9A-Za-z_-]", "_", info["msg_id"])[:32]
+                state["path"] = os.path.join(self._dir, safe_id + ".part")
+                state["fh"] = open(state["path"], "wb")
+            except OSError as e:
+                self._say(f"Can't receive {name}: {e}")
+                return False
+        with self._lock:
+            self._transfers[info["msg_id"]] = state
+        self._progress(state, force=True)
+        return True
+
+    def chunk(self, msg_id: str, index: int, b64: str):
+        with self._lock:
+            state = self._transfers.get(msg_id)
+        if state is None:
+            return
+        try:
+            if index != state["next"]:
+                raise ValueError("chunks arrived out of order")
+            raw = base64.b64decode(b64)
+            state["got"] += len(raw)
+            if state["got"] > state["size"]:
+                raise ValueError("more data than announced")
+            if state["buf"] is not None: state["buf"] += raw
+            else: state["fh"].write(raw)
+            state["next"] += 1
+        except (ValueError, OSError) as e:
+            self.abort(msg_id)
+            self._say(f"Receiving {state['info']['filename']} failed: {e}")
+            return
+        self._progress(state)
+
+    def finish(self, msg_id: str):
+        with self._lock:
+            state = self._transfers.pop(msg_id, None)
+        if state is None:
+            return
+        info = state["info"]
+        if state["got"] != state["size"]:
+            self._discard(state)
+            self._say(f"Receiving {info['filename']} failed: the file arrived incomplete.")
+            return
+        event = dict(info, data=None, path=None, temp=False, thumb=None)
+        if state["buf"] is not None:
+            event["data"] = bytes(state["buf"])
+            event["thumb"] = make_thumbnail(info["filename"], event["data"])
+        else:
+            state["fh"].close()
+            event["path"], event["temp"] = state["path"], True
+        self._done(info)
+        self.event_queue.put(("file", event))
+
+    def abort(self, msg_id: str):
+        with self._lock:
+            state = self._transfers.pop(msg_id, None)
+        if state is not None:
+            self._discard(state)
+            self._done(state["info"])
+
+    def _discard(self, state: dict):
+        if state["fh"] is not None:
+            try: state["fh"].close()
+            except OSError: pass
+        if state["path"]:
+            try: os.remove(state["path"])
+            except OSError: pass
+
+    def _progress(self, state: dict, force: bool = False):
+        if state["size"] < self.PROGRESS_MIN_BYTES:
+            return
+        pct = state["got"] / state["size"]
+        if force or pct - state["last_pct"] >= self.PROGRESS_STEP:
+            state["last_pct"] = pct
+            info = state["info"]
+            self.event_queue.put(("transfer_progress", {"msg_id": info["msg_id"], "filename": info["filename"], "sender": info["sender"], "pct": pct, "done": False}))
+
+    def _done(self, info: dict):
+        if info["size"] >= self.PROGRESS_MIN_BYTES:
+            self.event_queue.put(("transfer_progress", {"msg_id": info["msg_id"], "done": True}))
+
+    def close(self):
+        with self._lock:
+            states, self._transfers = list(self._transfers.values()), {}
+        for state in states:
+            self._discard(state)
+        if self._dir is not None:
+            shutil.rmtree(self._dir, ignore_errors=True)
+            self._dir = None
 
 
 # ---- Guest handling (runs on the host, one thread per guest) ----
@@ -2102,10 +2482,13 @@ def _ping_from_guest(hub: Hub, sock, guest_name, host_name, raw_text, event_queu
                 on_host_ping=lambda who: event_queue.put(("ping", who)))
 
 def _handle_guest_file(text, sock, guest_name, hub: Hub, event_queue):
-    """Records and routes a file/image/sticker: to everyone, or privately to one person."""
-    info = parse_file_message(text)
+    """START of a file/image/sticker from a guest: vet it, record it, and open the relay."""
+    info = parse_file_start(text)
     if info is None:
         event_queue.put(("system", "[received a corrupted file, ignored]"))
+        return
+    if info["size"] > MAX_FILE_BYTES:
+        _guest_notice(hub, sock, f"{info['filename']} is {format_size(info['size'])} — the limit is {format_size(MAX_FILE_BYTES)}.")
         return
     target = None
     if info["to"]:
@@ -2115,16 +2498,62 @@ def _handle_guest_file(text, sock, guest_name, hub: Hub, event_queue):
             return
     if not hub.record_message(info["msg_id"], guest_name, info["filename"], kind="file", to=target):
         return  # unusable or already-used id — never relay it
-    if target is None:
-        queue_file_event(info, event_queue)
-        hub.broadcast(text, exclude_sock=sock)
-    elif hub.is_host(target):
-        queue_file_event(info, event_queue)
-    else:
-        hub.send_private(hub.find_socket_by_name(target), text)
+    local = target is None or hub.is_host(target)
+    info.update(sender=guest_name, to=target or "")  # never trust the sender's claims about who they are
+    hub.transfers[info["msg_id"]] = {"sock": sock, "to": target, "local": local, "filename": info["filename"],
+                                     "expected": info["size"], "got": 0, "next": 0}
+    if local and hub.local_files is not None:
+        hub.local_files.start(info)
+    start = encode_file_start(guest_name, info["msg_id"], target or "", info["filename"], info["size"])
+    hub.relay_frame(encode_frame(hub.fernet, start), hub.transfer_targets(target, exclude_sock=sock))
+
+def _handle_guest_chunk(text, sock, hub: Hub):
+    try:
+        msg_id, index, b64 = text[len(FILECHUNK_PREFIX):].split("|", 2)
+        index = int(index)
+    except ValueError:
+        return
+    tr = hub.transfers.get(msg_id)
+    if tr is None or tr["sock"] is not sock:
+        return  # unknown transfer, or someone else's
+    if index != tr["next"]:
+        return hub.abort_transfer(msg_id, "the file's pieces arrived out of order")
+    tr["next"] += 1
+    tr["got"] += len(b64) // 4 * 3 - b64[-2:].count("=")
+    if tr["got"] > tr["expected"]:
+        return hub.abort_transfer(msg_id, "more data arrived than the file announced")
+    if tr["local"] and hub.local_files is not None:
+        hub.local_files.chunk(msg_id, index, b64)
+    hub.relay_frame(encode_frame(hub.fernet, text), hub.transfer_targets(tr["to"], exclude_sock=sock))
+
+def _handle_guest_file_end(text, sock, hub: Hub):
+    msg_id = text[len(FILEEND_PREFIX):].strip()
+    tr = hub.transfers.get(msg_id)
+    if tr is None or tr["sock"] is not sock:
+        return
+    if tr["got"] != tr["expected"]:
+        return hub.abort_transfer(msg_id, "the file arrived incomplete")
+    with hub.lock:
+        hub.transfers.pop(msg_id, None)
+    if tr["local"] and hub.local_files is not None:
+        hub.local_files.finish(msg_id)
+    hub.relay_frame(encode_frame(hub.fernet, FILEEND_PREFIX + msg_id), hub.transfer_targets(tr["to"], exclude_sock=sock))
 
 def _process_guest_message(text, sock, guest_name, hub: Hub, host_name, event_queue):
     is_admin = guest_name.lower() in hub.admins
+
+    # Pieces of a transfer that's already underway (vetted at its START) — these keep flowing even
+    # if the sender is muted mid-upload.
+    if text.startswith(FILECHUNK_PREFIX):
+        return _handle_guest_chunk(text, sock, hub)
+    if text.startswith(FILEEND_PREFIX):
+        return _handle_guest_file_end(text, sock, hub)
+    if text.startswith(FILEABORT_PREFIX):
+        msg_id = text[len(FILEABORT_PREFIX):].partition("|")[0]
+        tr = hub.transfers.get(msg_id)
+        if tr is not None and tr["sock"] is sock:
+            hub.abort_transfer(msg_id, "")
+        return
 
     if text.startswith(TYPING_START_PREFIX):
         if not hub.is_muted(sock):
@@ -2137,6 +2566,11 @@ def _process_guest_message(text, sock, guest_name, hub: Hub, host_name, event_qu
         hub.mark_stopped_typing(text[len(TYPING_STOP_PREFIX):])
         hub.broadcast(text, exclude_sock=sock)
         event_queue.put(("typing", hub.typing_names()))
+        return
+
+    if text.startswith(NICK_PREFIX):
+        if error := hub.rename(guest_name, text[len(NICK_PREFIX):].strip(), by=guest_name):
+            _guest_notice(hub, sock, error)
         return
 
     if text.startswith(SNAKE_PREFIX):
@@ -2258,6 +2692,10 @@ def handle_guest_connection(sock, addr, hub: Hub, host_name: str, event_queue: q
 
     guest_name = first[len(HELLO_PREFIX):].strip()[:30] or f"Guest@{addr[0]}"
 
+    if error := nickname_error(guest_name):
+        hub.send_private(sock, NOTICE_PREFIX + error)
+        sock.close()
+        return
     if hub.is_host(guest_name):
         hub.send_private(sock, NOTICE_PREFIX + "Nickname already in use.")
         sock.close()
@@ -2287,7 +2725,7 @@ def handle_guest_connection(sock, addr, hub: Hub, host_name: str, event_queue: q
         # The roster MUST be the first thing a joining client receives — its handshake
         # treats anything else as an invalid reply and gives up. (A rejoining muted user
         # used to be sent their mute status first, so they could never get back in.)
-        hub.send_private(sock, ROSTER_PREFIX + ",".join([host_name] + hub.names()))
+        hub.send_private(sock, ROSTER_PREFIX + ",".join([hub.host_name] + hub.names()))
         hub.send_private(sock, SLOWMODE_PREFIX + str(hub.slowmode_delay))
         if hub.is_muted(sock):
             info = hub.get_info(sock)
@@ -2308,11 +2746,15 @@ def handle_guest_connection(sock, addr, hub: Hub, host_name: str, event_queue: q
                 break
 
             try:
-                _process_guest_message(text, sock, guest_name, hub, host_name, event_queue)
+                # Use their *current* nickname — they may have renamed since joining.
+                current_name = hub.get_info(sock).get("name", guest_name)
+                _process_guest_message(text, sock, current_name, hub, host_name, event_queue)
             except Exception:
                 traceback.print_exc()  # one bad message must never end the guest's session
     finally:
+        hub.abort_transfers_of(sock)  # a half-sent file must not linger on anyone's screen
         info = hub.remove_client(sock)
+        guest_name = info["name"] if info else guest_name  # as they were last known (they may have renamed)
         hub.free_color(guest_name)
         try: sock.close()
         except OSError: pass
@@ -2340,8 +2782,10 @@ def host_accept_loop(server: socket.socket, hub: Hub, host_name: str, event_queu
 HELP_TEXT = (
     "Commands: /mute <name> <min> [reason], /unmute <name>, /kick <name> [reason], "
     "/ban <name> [min|perm] [reason], /unban <ip>, /slowmode [sec], /admin <name>, /unadmin <name>, "
-    "/color <name>, /colors, /list, /clear [lines], /whisper <name> <msg>, /help — "
-    "host only: /ipban <ip> [min|perm] [reason]. "
+    "/warn <name> [reason], /color <name>, /colors, /list, /clear [lines], /whisper <name> <msg>, "
+    "/nick <new name> (you can change yours twice per chat), /help — "
+    "host only: /ipban <ip> [min|perm] [reason], /rename <current name> <new name>. "
+    "Paste an image with Ctrl+V (Cmd+V on Mac) to send it. "
     "Right-click a message or attachment to edit/delete it (admins can delete anyone's, but never whispers). "
     "To whisper a file or sticker, type /whisper <name> then click the 📎 or 🌠 button."
 )
@@ -2394,6 +2838,38 @@ def _cmd_whisper(arg, hub, me, reply):
         return reply("Usage: /whisper <name> <message>")
     if error := hub.whisper(os.urandom(4).hex(), me, parts[0], parts[1]):
         reply(error)
+
+def _cmd_nick(arg, hub, me, reply):
+    if not arg:
+        return reply("Usage: /nick <new name>")
+    if error := hub.rename(me, arg, by=me):
+        reply(error)
+
+def _cmd_rename(arg, hub, me, reply):
+    if not hub.is_host(me):
+        return reply("Only the host can use /rename.")
+    parts = arg.split()
+    if len(parts) != 2:
+        return reply("Usage: /rename <current name> <new name>")
+    old, new = parts
+    if hub.is_host(old):
+        return reply("Use /nick to change your own name.")
+    sock = hub.find_socket_by_name(old)
+    if sock is None:
+        return reply(f"No one named '{old}' is connected.")
+    canonical = hub.get_info(sock)["name"]
+    if error := hub.rename(canonical, new, by=me):
+        return reply(error)
+    hub.log_admin_action(me, f"renamed {canonical} to {new}.")
+    reply(f"Renamed {canonical} to {new}.")
+
+def _cmd_warn(arg, hub, me, reply):
+    parts = arg.split(maxsplit=1)
+    if not parts:
+        return reply("Usage: /warn <name> [reason]")
+    if error := hub.warn(parts[0], me, parts[1] if len(parts) > 1 else ""):
+        return reply(error)
+    reply(f"Warned {parts[0]}.")
 
 def _cmd_admin(arg, hub, me, reply):
     if not arg: return reply("Usage: /admin <name>")
@@ -2528,9 +3004,10 @@ COMMAND_HANDLERS = {
     "/whisper": _cmd_whisper, "/admin": _cmd_admin, "/unadmin": _cmd_unadmin,
     "/slowmode": _cmd_slowmode, "/ban": _cmd_ban, "/ipban": _cmd_ipban, "/unban": _cmd_unban,
     "/mute": _cmd_mute, "/unmute": _cmd_unmute, "/kick": _cmd_kick,
+    "/nick": _cmd_nick, "/rename": _cmd_rename, "/warn": _cmd_warn,
 }
 # Commands a guest may only send if the host has made them an admin.
-MOD_COMMAND_NAMES = frozenset({"/mute", "/unmute", "/kick", "/ban", "/unban", "/ipban", "/slowmode", "/admin", "/unadmin"})
+MOD_COMMAND_NAMES = frozenset({"/mute", "/unmute", "/kick", "/ban", "/unban", "/ipban", "/slowmode", "/admin", "/unadmin", "/warn", "/rename"})
 
 def run_mod_command(msg: str, hub: Hub, my_name: str, reply_func) -> bool:
     """Runs a slash command against the hub. Returns False if `msg` isn't one
@@ -2557,7 +3034,7 @@ GUEST_SIMPLE_EVENTS = (
 LEAVE_PATTERN = re.compile(r"^\* (.+?) (?:left the chat|has been kicked|has been IP banned) \*$")
 JOIN_PATTERN = re.compile(r"^\* (.+?) joined the chat \*$")
 
-def guest_recv_loop(sock, fernet, event_queue, local_colors, colors_lock, known_names, host_ip, closing, host_features):
+def guest_recv_loop(sock, fernet, event_queue, local_colors, colors_lock, known_names, host_ip, closing, host_features, assembler):
     typing_names = set()
     put = event_queue.put
 
@@ -2604,10 +3081,44 @@ def guest_recv_loop(sock, fernet, event_queue, local_colors, colors_lock, known_
             put(("colormap", dict(new_map)))
             return True
         if text.startswith(FILE_PREFIX):
-            handle_incoming_file(text, event_queue)
+            info = parse_file_start(text)
+            if info is None: put(("system", "[received a corrupted file, ignored]"))
+            else: assembler.start(info)
+            return True
+        if text.startswith(FILECHUNK_PREFIX):
+            try:
+                msg_id, index, b64 = text[len(FILECHUNK_PREFIX):].split("|", 2)
+                assembler.chunk(msg_id, int(index), b64)
+            except ValueError:
+                pass
+            return True
+        if text.startswith(FILEEND_PREFIX):
+            assembler.finish(text[len(FILEEND_PREFIX):].strip())
+            return True
+        if text.startswith(FILEABORT_PREFIX):
+            msg_id, _, reason = text[len(FILEABORT_PREFIX):].partition("|")
+            assembler.abort(msg_id)
+            if reason:
+                put(("system", f"A file transfer was cancelled: {reason}"))
             return True
         if text.startswith(FEATURES_PREFIX):
             host_features.update(f for f in text[len(FEATURES_PREFIX):].split(",") if f)
+            return True
+        if text.startswith(RENAME_PREFIX):
+            try:
+                old, new, by = text[len(RENAME_PREFIX):].split("|", 2)
+            except ValueError:
+                return True
+            known_names.discard(old)
+            known_names.add(new)
+            put(("rename", {"old": old, "new": new, "by": by}))
+            return True
+        if text.startswith(WARN_PREFIX):
+            try:
+                by, count, reason = text[len(WARN_PREFIX):].split("|", 2)
+                put(("warned", {"by": by, "count": int(count), "reason": reason}))
+            except ValueError:
+                pass
             return True
         if text.startswith(SNAKE_PREFIX):
             try:
@@ -2693,6 +3204,8 @@ class HostConnection:
             on_admin_log=lambda msg: event_queue.put(("system", msg)),
             on_message_event=lambda kind, payload: event_queue.put((kind, payload)),
         )
+        self.local_files = FileAssembler(event_queue)  # the host's own copy of files addressed to it
+        self.hub.local_files = self.local_files
 
         self.server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -2729,6 +3242,7 @@ class HostConnection:
 
     def send_chat(self, text: str):
         if run_mod_command(text, self.hub, self.name, lambda t: self.event_queue.put(("system", t))):
+            self.name = self.hub.host_name  # /nick may have renamed us
             # Commands like /color change shared state; refresh our own view now.
             self.event_queue.put(("colormap", self.hub.colormap_snapshot()))
             return
@@ -2766,36 +3280,49 @@ class HostConnection:
         self.hub.broadcast(f"{REACT_PREFIX}{msg_id}|{emoji}|{self.name}")
         self.event_queue.put(("react", {"msg_id": msg_id, "emoji": emoji, "sender": self.name}))
 
-    def send_file(self, filepath: str):
-        self.send_file_bytes(*read_file_for_send(filepath))
+    def send_file(self, filepath: str, on_done=None, to: str = None, on_progress=None):
+        """Sends a file to everyone, or privately to `to`. Streams big files from disk;
+        blocks until done (paced by recipients), so run it off the UI thread."""
+        check_file_size(filepath)
+        size, name = os.path.getsize(filepath), os.path.basename(filepath)
+        if size <= INLINE_FILE_BYTES:
+            with open(filepath, "rb") as f:
+                return self.send_file_bytes(name, f.read(), on_done, to, on_progress)
+        self._send_file(name, size, chunks_from_path(filepath), None, filepath, to, on_done, on_progress)
 
-    def send_file_bytes(self, filename: str, data: bytes, on_done=None, to: str = None):
-        """Sends a file/image/sticker to everyone, or privately to `to`. Does the
-        (slow) encoding itself, so run it off the UI thread. `on_done(ok)` fires once
-        it has been queued for sending."""
+    def send_file_bytes(self, filename: str, data: bytes, on_done=None, to: str = None, on_progress=None):
+        self._send_file(os.path.basename(filename), len(data), chunks_from_bytes(data), data, None, to, on_done, on_progress)
+
+    def _send_file(self, filename, size, chunks, data, path, to, on_done, on_progress):
         done = on_done or (lambda ok: None)
+        if size > MAX_FILE_BYTES:
+            self.event_queue.put(("system", f"{filename} is {format_size(size)} — the limit is {format_size(MAX_FILE_BYTES)}."))
+            return done(False)
         target = ""
         if to:
             target, error = self.hub.resolve_whisper_target(self.name, to)
             if error:
                 self.event_queue.put(("system", error))
                 return done(False)
-        msg_id, safe_name = os.urandom(4).hex(), os.path.basename(filename)
-        msg = encode_file_message(self.name, msg_id, target, safe_name, data)
-        self.hub.record_message(msg_id, self.name, safe_name, kind="file", to=target or None)
-        queue_file_event({"sender": self.name, "msg_id": msg_id, "to": target, "filename": safe_name, "data": data}, self.event_queue)
-        if target:
-            ok = self.hub.send_private(self.hub.find_socket_by_name(target), msg)
-        else:
-            self.hub.broadcast(msg)
-            ok = True
-        done(ok)
+        msg_id = os.urandom(4).hex()
+        self.hub.record_message(msg_id, self.name, filename, kind="file", to=target or None)
+        try:
+            for text in iter_file_texts(self.name, msg_id, target, filename, size, with_progress(chunks, size, on_progress)):
+                self.hub.relay_frame(encode_frame(self.hub.fernet, text), self.hub.transfer_targets(target or None))
+        except Exception as e:
+            self.hub.messages.pop(msg_id, None)
+            self.hub.relay_frame(encode_frame(self.hub.fernet, f"{FILEABORT_PREFIX}{msg_id}|the sender hit an error"), self.hub.transfer_targets(target or None))
+            self.event_queue.put(("system", f"Couldn't send {filename}: {e}"))
+            return done(False)
+        self.event_queue.put(("file", local_file_event(self.name, msg_id, target, filename, size, data, path)))
+        done(True)
 
     def close(self):
         self.hub.closed = True
         self.stop_event.set()
         self.hub.broadcast(HOST_DISCONNECT_PREFIX)
         self.hub.shutdown_all()
+        self.local_files.close()
         try: self.server.shutdown(socket.SHUT_RDWR)  # wakes the blocked accept() thread
         except OSError: pass
         try: self.server.close()
@@ -2818,6 +3345,7 @@ class GuestConnection:
         self.is_admin = False
         self.host_features = set()  # filled in when the host answers our FEATURES announcement
         self.outbox = None          # created by start(); until then sends are direct (handshake)
+        self.assembler = FileAssembler(event_queue)  # receives files sent to us
 
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         try:
@@ -2857,7 +3385,7 @@ class GuestConnection:
         self.outbox = Outbox(self.sock, on_failed=self._on_outbox_failed)
         threading.Thread(
             target=guest_recv_loop,
-            args=(self.sock, self.fernet, self.event_queue, self.local_colors, self.colors_lock, self.known_names, self.host, self.closing, self.host_features),
+            args=(self.sock, self.fernet, self.event_queue, self.local_colors, self.colors_lock, self.known_names, self.host, self.closing, self.host_features, self.assembler),
             daemon=True,
         ).start()
         self._send(FINGERPRINT_PREFIX + get_machine_fingerprint(), report=False)
@@ -2927,6 +3455,11 @@ class GuestConnection:
             self._send(CMD_PREFIX + f"color|{arg.strip()}")
             return
 
+        if cmd == "/nick":
+            if not arg.strip(): return put(("system", "Usage: /nick <new name>"))
+            self._send(NICK_PREFIX + arg.strip())
+            return
+
         if cmd == "/whisper":
             parts = arg.split(maxsplit=1)
             if len(parts) < 2: return put(("system", "Usage: /whisper <name> <message>"))
@@ -2955,18 +3488,44 @@ class GuestConnection:
         self.event_queue.put(("system", f"You {verb} Do Not Disturb."))
         self._send(DND_PREFIX + f"{self.name}|{'on' if active else 'off'}", report=False)
 
-    def send_file(self, filepath: str):
-        self.send_file_bytes(*read_file_for_send(filepath))
+    def send_file(self, filepath: str, on_done=None, to: str = None, on_progress=None):
+        """Sends a file to everyone, or privately to `to`. Streams big files from disk;
+        blocks until the last piece is queued (paced by the connection), so run it off
+        the UI thread. `on_done(ok)` fires once the final piece has actually gone out."""
+        check_file_size(filepath)
+        size, name = os.path.getsize(filepath), os.path.basename(filepath)
+        if size <= INLINE_FILE_BYTES:
+            with open(filepath, "rb") as f:
+                return self.send_file_bytes(name, f.read(), on_done, to, on_progress)
+        self._send_file(name, size, chunks_from_path(filepath), None, filepath, to, on_done, on_progress)
 
-    def send_file_bytes(self, filename: str, data: bytes, on_done=None, to: str = None):
-        """Sends a file/image/sticker to everyone, or privately to `to`. Encoding is
-        the slow part, so run this off the UI thread; `on_done(ok)` fires once the
-        bytes have actually gone out."""
-        msg_id, safe_name = os.urandom(4).hex(), os.path.basename(filename)
-        msg = encode_file_message(self.name, msg_id, to or "", safe_name, data)
-        if self._send(msg, on_sent=on_done):
-            # Show our own copy straight away (the host doesn't echo files back).
-            queue_file_event({"sender": self.name, "msg_id": msg_id, "to": to or "", "filename": safe_name, "data": data}, self.event_queue)
+    def send_file_bytes(self, filename: str, data: bytes, on_done=None, to: str = None, on_progress=None):
+        self._send_file(os.path.basename(filename), len(data), chunks_from_bytes(data), data, None, to, on_done, on_progress)
+
+    def _send_file(self, filename, size, chunks, data, path, to, on_done, on_progress):
+        done = on_done or (lambda ok: None)
+        if size > MAX_FILE_BYTES:
+            self.event_queue.put(("system", f"{filename} is {format_size(size)} — the limit is {format_size(MAX_FILE_BYTES)}."))
+            return done(False)
+        outbox = self.outbox
+        if outbox is None:
+            return done(False)
+        msg_id = os.urandom(4).hex()
+        try:
+            for text in iter_file_texts(self.name, msg_id, to or "", filename, size, with_progress(chunks, size, on_progress)):
+                # Wait until the writer has drained (so memory stays bounded and the chat stays
+                # responsive), then queue the next piece. Frames of one file are never reordered.
+                if not outbox.wait_below(TRANSFER_WINDOW_BYTES, TRANSFER_STALL_SECONDS):
+                    raise ConnectionError("the connection stalled")
+                last = text.startswith(FILEEND_PREFIX)
+                if not outbox.put(encode_frame(self.fernet, text), on_sent=done if last else None, bulk=True):
+                    raise ConnectionError("the connection was lost")
+        except Exception as e:
+            outbox.put(encode_frame(self.fernet, f"{FILEABORT_PREFIX}{msg_id}|the sender hit an error"), bulk=True)
+            self.event_queue.put(("system", f"Couldn't send {filename}: {e}"))
+            return done(False)
+        # Show our own copy straight away (the host doesn't echo files back to their sender).
+        self.event_queue.put(("file", local_file_event(self.name, msg_id, to or "", filename, size, data, path)))
 
     def close(self):
         self.closing.set()
@@ -2980,6 +3539,7 @@ class GuestConnection:
         except OSError: pass
         try: self.sock.close()
         except OSError: pass
+        self.assembler.close()
 
 
 def make_button(parent, text, command, bg, fg="white", font=BOLD_FONT, padx=14, pady=6, hover_bg=None):
@@ -3060,10 +3620,10 @@ def resolve_join_target(room_code: str, manual_target: str = None):
 class ChatApp(tk.Tk):
     BUILTIN_STICKERS = {"GG": "#57F287", "RIP": "#ED4245", "HELLO": "#5B8CFF", "WOW": "#FEE75C", "BRUH": "#FFA347"}
     REACTION_CHOICES = ("😀", "😂", "❤️", "👍", "🔥", "😢", "😡")
-    BASE_COMMANDS = ("/color", "/colors", "/list", "/clear", "/whisper", "/help")
-    ADMIN_COMMANDS = ("/mute", "/unmute", "/kick", "/ban", "/unban", "/slowmode", "/admin", "/unadmin")
-    PLAYER_ARG_COMMANDS = frozenset({"/mute", "/unmute", "/kick", "/ban", "/whisper", "/admin", "/unadmin"})
-    ACTIVITY_RANKED_COMMANDS = frozenset({"/mute", "/kick", "/ban"})
+    BASE_COMMANDS = ("/color", "/colors", "/list", "/clear", "/whisper", "/nick", "/help")
+    ADMIN_COMMANDS = ("/mute", "/unmute", "/kick", "/ban", "/unban", "/warn", "/slowmode", "/admin", "/unadmin")
+    PLAYER_ARG_COMMANDS = frozenset({"/mute", "/unmute", "/kick", "/ban", "/warn", "/rename", "/whisper", "/admin", "/unadmin"})
+    ACTIVITY_RANKED_COMMANDS = frozenset({"/mute", "/kick", "/ban", "/warn"})
     # Keys that never change the text, so they shouldn't refresh suggestions or typing state.
     NON_EDIT_KEYSYMS = frozenset({
         "Tab", "ISO_Left_Tab", "Up", "Down", "Return", "KP_Enter", "Escape", "Caps_Lock",
@@ -3101,6 +3661,7 @@ class ChatApp(tk.Tk):
         self.suggest_popup = None
         self._snake_win = None
         self._rainbow_instance_seq = 0
+        self._job_seq = 0
         self._jump_visible = False
         self.sent_history, self._history_pos, self._history_draft = [], None, ""
         self._active_dnd_bind = None
@@ -3114,8 +3675,12 @@ class ChatApp(tk.Tk):
             "chat": self._on_chat_event,
             "react": lambda p: self.add_reaction(p["msg_id"], p["emoji"], p.get("sender", "")),
             "whisper": self.append_whisper_line,
+            "rename": self._on_rename,
+            "warned": self._on_warned,
             "snake": self._on_snake_event,
             "upload_done": self._on_upload_done,
+            "upload_progress": self._on_upload_progress,
+            "transfer_progress": self._on_transfer_progress,
             "msg_edit": self._on_msg_edit,
             "msg_delete": self._on_msg_delete,
             "system": self.append_system_line,
@@ -3157,7 +3722,9 @@ class ChatApp(tk.Tk):
         self._my_messages = {}         # msg_id -> current text of messages *I* sent (editable)
         self._attachments = {}         # msg_id -> {"data", "filename", "photo", "mine", "whisper"} for files/images in the log
         self._whisper_ids = set()      # msg_ids of whisper lines (private: no reactions, no admin delete)
-        self._uploads = 0              # attachments currently being uploaded / sent
+        self._room_code = ""
+        self._upload_jobs = {}         # job id -> {"name", "to", "pct"} for files we're sending
+        self._incoming = {}            # msg_id -> {"filename", "sender", "pct"} for big files arriving
         self.snake_board = {}          # name.lower() -> {"name", "best", "score", "playing"}: the room's live Snake scores
         self.typing_last_seen = {}
         self.user_msg_times = {}       # name.lower() -> recent message timestamps (spam ranking)
@@ -3337,6 +3904,10 @@ class ChatApp(tk.Tk):
         photo = attachment.get("photo")
         if photo is not None and photo in self.photo_cache:
             self.photo_cache.remove(photo)
+        if attachment.get("temp") and attachment.get("path"):  # big files received to disk — free the space
+            try: os.remove(attachment["path"])
+            except OSError: pass
+            attachment["path"] = None
 
     def _set_status(self, text, kind="error"):
         self.status_label.configure(text=text, fg=self.STATUS_COLORS[kind])
@@ -3416,7 +3987,7 @@ class ChatApp(tk.Tk):
 
         card.grid_columnconfigure(1, weight=1)
 
-        self.name_entry = field(2, "Display name", validate_cmd=(self.register(lambda p: " " not in p and len(p) <= 30), "%P"))
+        self.name_entry = field(2, "Display name", validate_cmd=(self.register(lambda p: " " not in p and "|" not in p and len(p) <= 30), "%P"))
         saved_name = self.settings.get("name")
         if isinstance(saved_name, str) and saved_name:
             self.name_entry.insert(0, saved_name[:30])
@@ -3528,7 +4099,7 @@ class ChatApp(tk.Tk):
 
     def _validate_connect_inputs(self, name, room_code, key):
         if not name: return "Enter a display name."
-        if " " in name: return "Display name cannot contain spaces."
+        if error := nickname_error(name): return error
         if not (len(room_code) == 6 and room_code.isdigit() and 0 <= int(room_code[:3]) <= 255 and 0 <= int(room_code[3:]) <= 255):
             return "Room Code must be 6 digits (from the host's screen)."
         if not key: return "Enter the shared key password."
@@ -3623,7 +4194,8 @@ class ChatApp(tk.Tk):
         self._reset_session_state()
         self.known_colors = {name.lower(): HOST_COLOR if mode == "host" else FG_TEXT}
         self.update_roster([name])
-        self.title_label.configure(text=f"{'Hosting as' if mode == 'host' else 'Connected as'} {name} — Room {room_code}")
+        self._room_code = room_code
+        self._update_room_label()
         self.connect_frame.pack_forget()
         self.chat_frame.pack(fill="both", expand=True)
         self.msg_entry.focus_set()
@@ -3636,6 +4208,52 @@ class ChatApp(tk.Tk):
             )
         else:
             self.append_system_line(f"You joined Room {room_code} as {name}. Type /help for commands.")
+
+    def _update_room_label(self):
+        verb = "Hosting as" if isinstance(self.connection, HostConnection) else "Connected as"
+        self.title_label.configure(text=f"{verb} {self.my_name} — Room {self._room_code}")
+
+    def _on_rename(self, payload):
+        """Somebody's nickname changed (their own choice, or the host's). Everything on screen
+        that's keyed by name follows."""
+        old, new, by = payload["old"], payload["new"], payload["by"]
+        old_key, new_key = old.lower(), new.lower()
+        if old_key == self.my_name.lower():
+            self.my_name = new
+            if self.connection is not None:
+                self.connection.name = new
+            self._update_room_label()
+            self._save_settings()
+        if old_key in self.known_colors:
+            self.known_colors[new_key] = self.known_colors.pop(old_key)
+        for key, author in list(self._msg_authors.items()):
+            if author.lower() == old_key:
+                self._msg_authors[key] = new
+        entry = self.snake_board.pop(old_key, None)
+        if entry is not None:
+            entry["name"] = new
+            self.snake_board[new_key] = entry
+            self._refresh_snake()
+        self.typing_last_seen.pop(old, None)
+        self.update_roster([new if n.lower() == old_key else n for n in self.current_roster])
+        if by.lower() == old_key:
+            self.append_system_line(f"{old} is now known as {new}")
+        else:
+            self.append_system_line(f"{old} was renamed to {new} by {by}")
+
+    def _on_warned(self, payload):
+        by, count, reason = payload["by"], payload["count"], payload["reason"]
+        self.append_private_line(f"⚠ Warning #{count} from {by}: {reason}")
+        self.bell()
+        name = f"warning_{time.time_ns()}"
+        popup = self._open_dialog(name, "⚠ Warning", padx=24, pady=20)
+        if popup is None:
+            return
+        tk.Label(popup, text="⚠  You have been warned", bg=BG_PANEL, fg=COLOR_PALETTE["red"], font=(CHAT_FONT[0], 14, "bold")).pack(anchor="w")
+        tk.Label(popup, text=f"By {by}   ·   warning #{count}", bg=BG_PANEL, fg=FG_MUTED, font=CHAT_FONT).pack(anchor="w", pady=(6, 10))
+        tk.Label(popup, text=reason, bg=BG_PANEL, fg=FG_TEXT, font=CHAT_FONT, wraplength=380, justify="left").pack(anchor="w")
+        make_button(popup, "OK", lambda: self._close_popup(name), bg=BTN_NEUTRAL, hover_bg=BTN_NEUTRAL_HOVER, padx=18, pady=5).pack(anchor="e", pady=(16, 0))
+        popup.lift()
 
     def _return_to_connect_screen(self, message, kind):
         self._teardown_connection()
@@ -3759,6 +4377,7 @@ class ChatApp(tk.Tk):
         self.msg_entry.bind("<Up>", self._on_up_arrow)
         self.msg_entry.bind("<Down>", self._on_down_arrow)
         self.msg_entry.bind("<Escape>", self._on_escape)
+        self.msg_entry.bind("<<Paste>>", self._on_paste)  # Ctrl+V, Cmd+V and the right-click Paste all arrive as this
         self.msg_entry.bind("<FocusOut>", lambda e: self.after(150, self.destroy_suggestions))
 
         self.send_btn = make_button(self.bottom_bar, "Send", self.on_send, bg=COLOR_PALETTE["blue"], hover_bg=BTN_BLUE_HOVER, padx=16, pady=6)
@@ -3862,7 +4481,7 @@ class ChatApp(tk.Tk):
                 is_host = isinstance(self.connection, HostConnection)
                 commands = list(self.BASE_COMMANDS)
                 if self.is_admin: commands.extend(self.ADMIN_COMMANDS)
-                if is_host: commands.append("/ipban")
+                if is_host: commands.extend(("/ipban", "/rename"))
                 suggestions = [c for c in commands if c.startswith(base_cmd)]
             elif len(words) == 2:
                 arg = words[1].lower()
@@ -4074,6 +4693,82 @@ class ChatApp(tk.Tk):
             self.connection.send_typing(False)
         self.typing_active, self.last_typing_sent = False, 0.0
 
+    def _on_paste(self, event=None):
+        """Text pastes exactly as before. If the clipboard holds an image (or copied files)
+        instead, offer to send it as an attachment."""
+        if str(self.msg_entry["state"]) == "disabled":
+            return "break"
+        try:
+            self.clipboard_get()
+            return None  # there's text on the clipboard — let the normal paste happen
+        except tk.TclError:
+            pass
+        if ImageGrab is None or not self.connection:
+            return None
+        try:
+            clip = ImageGrab.grabclipboard()
+        except Exception:
+            return None  # not supported on this system (e.g. Linux without xclip / wl-paste)
+        if clip is None:
+            return None
+        ok, target = self._attachment_target()
+        if not ok:
+            return "break"
+        if isinstance(clip, (list, tuple)):
+            self._offer_pasted_files(clip, target)
+        else:
+            self._offer_pasted_image(clip, target)
+        return "break"
+
+    def _offer_pasted_image(self, image, target):
+        popup = self._open_dialog("paste", "Send pasted image?", padx=18, pady=16)
+        if popup is None:
+            return
+        try:
+            if image.mode not in ("RGB", "RGBA", "L", "LA", "P"):
+                image = image.convert("RGBA")
+            buf = io.BytesIO()
+            image.save(buf, format="PNG")
+            png = buf.getvalue()
+            preview = image.copy()
+            preview.thumbnail((380, 280))
+            popup.photo = ImageTk.PhotoImage(preview)  # keep a reference alive
+        except Exception as e:
+            self._close_popup("paste")
+            return messagebox.showerror("Paste", f"Couldn't read that image: {e}", parent=self)
+        name = time.strftime("pasted_image_%H%M%S.png")
+
+        def send():
+            self._close_popup("paste")
+            self._start_upload(name, lambda: (name, png), target)
+            self.msg_entry.focus_set()
+
+        tk.Label(popup, image=popup.photo, bg=BG_PANEL).pack()
+        where = f"Whisper to {target}" if target else "Send to everyone"
+        tk.Label(popup, text=f"{where}   ·   {format_size(len(png))}", bg=BG_PANEL, fg=FG_MUTED, font=CHAT_FONT).pack(pady=(8, 10))
+        row = tk.Frame(popup, bg=BG_PANEL)
+        row.pack(anchor="e")
+        make_button(row, "Cancel", lambda: (self._close_popup("paste"), self.msg_entry.focus_set()), bg=BTN_NEUTRAL, hover_bg=BTN_NEUTRAL_HOVER, padx=14, pady=5).pack(side="left", padx=(0, 8))
+        make_button(row, "Send", send, bg=BTN_GREEN, hover_bg=BTN_GREEN_HOVER, padx=18, pady=5).pack(side="left")
+        popup.bind("<Return>", lambda e: send())
+        popup.focus_set()
+
+    def _offer_pasted_files(self, paths, target):
+        files = [p for p in paths if isinstance(p, str) and os.path.isfile(p)][:5]
+        if not files:
+            return
+        listing = "\n".join(f"  •  {os.path.basename(p)}  ({format_size(os.path.getsize(p))})" for p in files)
+        where = f"Whisper to {target}" if target else "Send to everyone"
+        if not messagebox.askyesno("Send pasted files?", f"{where}:\n\n{listing}", parent=self):
+            return
+        for path in files:
+            try:
+                check_file_size(path)
+            except (ValueError, OSError) as e:
+                messagebox.showerror("Couldn't send", f"{os.path.basename(path)}: {e}", parent=self)
+                continue
+            self._start_upload(os.path.basename(path), to=target, path=path)
+
     def _attachment_target(self):
         """-> (ok, whisper_target). If the message box starts with "/whisper <name>", an
         attachment goes privately to that person; otherwise to everyone."""
@@ -4087,42 +4782,80 @@ class ChatApp(tk.Tk):
         messagebox.showinfo("Whisper a file", "To whisper a file, first type /whisper and someone's full name (e.g. /whisper Sam), then use the button again.", parent=self)
         return False, None
 
-    def _refresh_upload_label(self, filename: str = "", to: str = None):
-        if self._uploads <= 0:
-            self._uploads = 0
+    def _refresh_upload_label(self):
+        """One status line above the message box for files going out and coming in."""
+        parts = []
+        jobs = list(self._upload_jobs.values())
+        if jobs:
+            job = jobs[0]
+            text = f"⏳ Uploading and Sending… {job['name']}"
+            if job.get("to"): text += f" (whisper to {job['to']})"
+            if job.get("pct") is not None: text += f" {job['pct']:.0f}%"
+            if len(jobs) > 1: text += f"  [{len(jobs)} in progress]"
+            parts.append(text)
+        if self._incoming:
+            item = next(iter(self._incoming.values()))
+            text = f"⬇ Receiving {item['filename']} from {item['sender']}… {item['pct']:.0f}%"
+            if len(self._incoming) > 1: text += f"  [{len(self._incoming)} incoming]"
+            parts.append(text)
+        if not parts:
             self.upload_var.set("")
             self.upload_label.pack_forget()
             return
-        text = f"⏳ Uploading and Sending… {filename}" if filename else "⏳ Uploading and Sending…"
-        if to: text += f" (whisper to {to})"
-        if self._uploads > 1: text += f"  [{self._uploads} in progress]"
-        self.upload_var.set(text)
+        self.upload_var.set("   ".join(parts))
         if not self.upload_label.winfo_manager():
             self.upload_label.pack(fill="x", padx=10, before=self.mute_label)
 
-    def _start_upload(self, filename: str, loader, to: str = None):
-        """Reading, encoding and sending a big file takes a moment, so it runs on a worker
-        thread — the window stays live and the label above the message box says so."""
+    def _start_upload(self, filename: str, loader=None, to: str = None, path: str = None):
+        """Sending a file — reading it, encrypting it, and pacing it to the connection — runs
+        on a worker thread, so the window stays live and the label above the message box
+        shows progress. Pass `path` to stream a file from disk (any size up to the limit),
+        or `loader` returning (filename, bytes) for something already in memory."""
         conn = self.connection
         if conn is None:
             return
-        self._uploads += 1
-        self._refresh_upload_label(filename, to)
+        self._job_seq += 1
+        job = self._job_seq
+        self._upload_jobs[job] = {"name": filename, "to": to, "pct": None}
+        self._refresh_upload_label()
+        last_pct = [-100.0]
 
         def report(ok, name=filename, error=None):
-            self.event_queue.put(("upload_done", {"ok": ok, "filename": name, "error": error}))
+            self.event_queue.put(("upload_done", {"job": job, "ok": ok, "filename": name, "error": error}))
+
+        def progress(sent, size):
+            pct = sent * 100.0 / size if size else 100.0
+            if pct - last_pct[0] >= 2 or sent >= size:
+                last_pct[0] = pct
+                self.event_queue.put(("upload_progress", {"job": job, "pct": pct}))
 
         def work():
             try:
-                name, data = loader()
-                conn.send_file_bytes(name, data, on_done=lambda ok: report(ok, name), to=to)
+                if path is not None:
+                    conn.send_file(path, on_done=lambda ok: report(ok), to=to, on_progress=progress)
+                else:
+                    name, data = loader()
+                    conn.send_file_bytes(name, data, on_done=lambda ok: report(ok, name), to=to, on_progress=progress)
             except Exception as e:
                 report(False, filename, str(e))
 
         threading.Thread(target=work, daemon=True).start()
 
+    def _on_upload_progress(self, payload):
+        job = self._upload_jobs.get(payload["job"])
+        if job is not None:
+            job["pct"] = payload["pct"]
+            self._refresh_upload_label()
+
+    def _on_transfer_progress(self, payload):
+        if payload.get("done"):
+            self._incoming.pop(payload["msg_id"], None)
+        else:
+            self._incoming[payload["msg_id"]] = {"filename": payload["filename"], "sender": payload["sender"], "pct": payload["pct"] * 100}
+        self._refresh_upload_label()
+
     def _on_upload_done(self, payload):
-        self._uploads -= 1
+        self._upload_jobs.pop(payload.get("job"), None)
         self._refresh_upload_label()
         if payload.get("error"):
             self.append_system_line(f"Couldn't send {payload['filename']}: {payload['error']}")
@@ -4141,7 +4874,7 @@ class ChatApp(tk.Tk):
             check_file_size(path)
         except ValueError as e: return messagebox.showerror("File too large", str(e))
         except OSError as e: return messagebox.showerror("Couldn't read file", str(e))
-        self._start_upload(os.path.basename(path), lambda: read_file_for_send(path), target)
+        self._start_upload(os.path.basename(path), to=target, path=path)
 
     # ---- Do Not Disturb ----
 
@@ -4695,7 +5428,7 @@ class ChatApp(tk.Tk):
         private = msg_id in self._whisper_ids or (attachment is not None and attachment["whisper"])
         entries = 0
         if attachment is not None:
-            menu.add_command(label="Save As...", command=lambda: self._save_file_to_disk(attachment["data"], attachment["filename"]))
+            menu.add_command(label="Save As...", command=lambda: self._save_attachment(attachment))
             entries += 1
             mine, noun = attachment["mine"], "attachment"
         elif private:
@@ -4858,9 +5591,14 @@ class ChatApp(tk.Tk):
     # ---- attachments ----
 
     def render_incoming_file(self, payload):
-        sender, filename, data, thumb = payload["sender"], payload["filename"], payload["data"], payload.get("thumb")
+        sender, filename, thumb = payload["sender"], payload["filename"], payload.get("thumb")
+        data, path = payload.get("data"), payload.get("path")
+        size = payload.get("size") or (len(data) if data is not None else 0)
         msg_id = payload.get("msg_id")
         mine = sender.lower() == self.my_name.lower()
+        # `data` is held in memory for files up to INLINE_FILE_BYTES; larger ones live in a file at `path`.
+        attachment = {"data": data, "path": path, "temp": bool(payload.get("temp")), "filename": filename, "size": size,
+                      "photo": None, "mine": mine, "whisper": bool(payload.get("to"))}
 
         with self._log_append(force_scroll=mine):
             start_index = self.log.index("end-1c")
@@ -4878,6 +5616,7 @@ class ChatApp(tk.Tk):
             if thumb is not None and ImageTk is not None:
                 try: photo = ImageTk.PhotoImage(thumb)
                 except Exception: photo = None
+            attachment["photo"] = photo
 
             if photo is not None:
                 self.photo_cache.append(photo)
@@ -4885,8 +5624,8 @@ class ChatApp(tk.Tk):
             else:
                 embed = tk.Frame(self.log, bg=BG_PANEL, bd=1, relief="solid", padx=12, pady=8)
                 tk.Label(embed, text=f"📁  {filename}", bg=BG_PANEL, fg=FG_TEXT, font=BOLD_FONT).pack(side="left", padx=(0, 14))
-                tk.Label(embed, text=f"({len(data) / 1024:.1f} KB)", bg=BG_PANEL, fg=FG_MUTED, font=CHAT_FONT).pack(side="left", padx=(0, 14))
-                make_button(embed, "Download", lambda d=data, fn=filename: self._save_file_to_disk(d, fn), bg=BTN_GREEN, hover_bg=BTN_GREEN_HOVER, padx=10, pady=4).pack(side="right")
+                tk.Label(embed, text=f"({format_size(size)})", bg=BG_PANEL, fg=FG_MUTED, font=CHAT_FONT).pack(side="left", padx=(0, 14))
+                make_button(embed, "Download", lambda: self._save_attachment(attachment), bg=BTN_GREEN, hover_bg=BTN_GREEN_HOVER, padx=10, pady=4).pack(side="right")
                 if msg_id:  # widgets inside the log don't pass clicks on to it — wire the menu to the card itself
                     self._bind_menu_recursive(embed, msg_id)
                 self.log.window_create("end", window=embed)
@@ -4898,10 +5637,30 @@ class ChatApp(tk.Tk):
                 self.log.tag_add(f"msg_{msg_id}", start_index, end_index)
                 self.log.tag_add(f"attach_{msg_id}", attach_start, end_index)  # what a delete replaces
                 self._remember_author(msg_id, sender)
-                self._attachments[msg_id] = {"data": data, "filename": filename, "photo": photo, "mine": mine, "whisper": bool(to)}
+                self._attachments[msg_id] = attachment
 
         if not mine:
             self._note_unread()
+
+    def _save_attachment(self, attachment):
+        if attachment["data"] is not None:
+            return self._save_file_to_disk(attachment["data"], attachment["filename"])
+        source = attachment.get("path")
+        if not source or not os.path.exists(source):
+            return messagebox.showerror("Error", "That file is no longer available.")
+        dest = filedialog.asksaveasfilename(initialfile=attachment["filename"], title="Save file as")
+        if not dest:
+            return
+        self.append_system_line(f"Saving {attachment['filename']} ({format_size(attachment['size'])})…")
+        threading.Thread(target=self._copy_file_worker, args=(source, dest), daemon=True).start()
+
+    def _copy_file_worker(self, source: str, dest: str):
+        """Copying a multi-hundred-MB file takes a while — never on the UI thread."""
+        try:
+            shutil.copyfile(source, dest)
+            self.event_queue.put(("system", f"Saved to {dest}"))
+        except OSError as e:
+            self.event_queue.put(("system", f"Couldn't save the file: {e}"))
 
     def _bind_menu_recursive(self, widget, msg_id):
         for bind in ("<Button-2>", "<Button-3>"):
