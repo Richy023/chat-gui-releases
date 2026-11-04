@@ -1,6 +1,24 @@
 #!/usr/bin/env python3
 """
-chat_gui.py — v1.4.10a — ENCRYPTED instant messenger with a desktop GUI.
+chat_gui.py — v1.4.10b — ENCRYPTED instant messenger with a desktop GUI.
+
+Changes in 1.4.10b:
+- Appeals: a banned person sees an APPEAL BAN button on the home screen (a short,
+  light-hearted questionnaire); the warning pop-up has an Appeal button too. Both
+  land in the admin channel (host + admins), one appeal per ban / per warning.
+- Reports: right-click a message or attachment -> Report. The admin channel gets the
+  text, author, reporter and reason. (Whisper reports go to the host only.)
+- Reply: right-click -> Reply shows a quote above your message; click it to jump back.
+- Cancel button for uploads. Big-file receivers are never kicked for being slow (they're
+  skipped for that file and told); old clients that can't take files get a notice instead
+  of a flood of unreadable chunks.
+- Mutes and temporary bans now show the date (and "(1 year)") — a one-year mute used to
+  display only a clock time. File sizes use the same units as this computer's file manager.
+- Fixed: status lines above the message box squashing the chat bar into a sliver.
+- Fixes: the host now stamps the sender's name on every message/typing/DND/reaction (a
+  modified client could impersonate anyone), whispers can't be reacted to, silent
+  half-open connections time out, stale upload events no longer leak into the next chat,
+  "X is typing" ghosts after someone leaves/renames, 4,000-character message limit.
 
 Changes in 1.4.10a:
 - Rooms hold up to 15 guests (was 4).
@@ -285,7 +303,7 @@ except ImportError:
 if sys.platform == "darwin":
     ensure_installed("pyobjus", required=False)
 
-VERSION = "1.4.10a"
+VERSION = "1.4.10b"
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -315,11 +333,12 @@ def save_json(path: str, data, **dump_kwargs) -> bool:
         return False
 MSG_LEN_BYTES = 4
 MAX_GUESTS = 15
+MAX_MESSAGE_CHARS = 4000  # one chat message / whisper / edit — a multi-megabyte paste would otherwise freeze everyone's window
 MAX_FILE_BYTES = 1024 * 1024 * 1024   # 1 GB — files are streamed in chunks, so this really is the limit
 FILE_CHUNK_BYTES = 512 * 1024          # raw bytes per chunk (each chunk is its own encrypted frame)
 INLINE_FILE_BYTES = 16 * 1024 * 1024   # received files up to this size are held in memory (instant preview/save); bigger ones live in a temp file
-TRANSFER_WINDOW_BYTES = 8 * 1024 * 1024  # a sender pauses while this much is already queued for a recipient
-TRANSFER_STALL_SECONDS = 60            # a recipient that hasn't drained anything for this long is dropped (just them)
+TRANSFER_WINDOW_BYTES = 16 * 1024 * 1024  # a sender pauses while this much is already queued for a recipient
+TRANSFER_STALL_SECONDS = 120           # a recipient that can't drain their queue for this long is skipped for that one file (they stay connected)
 DND_ANNOUNCE_COOLDOWN = 2.0
 SPAM_SUGGESTION_WINDOW = 60.0  # seconds — how far back "recent" message activity counts for /mute /kick /ban suggestion ranking
 
@@ -401,6 +420,10 @@ AURORA_UNLOCK_PREFIX = "__AURORA_UNLOCK__:"
 FINGERPRINT_PREFIX = "__FINGERPRINT__:"
 EDIT_PREFIX = "__EDIT__:"          # guest -> host: "msg_id|new text"; host -> clients: "msg_id|editor|new text"
 DELETE_PREFIX = "__DELETE__:"      # guest -> host: "msg_id";          host -> clients: "msg_id|deleter"
+REPORT_PREFIX = "__REPORT__:"        # guest -> host: "msg_id|reason"
+REPLYTO_PREFIX = "__REPLYTO__:"      # guest -> host: "msg_id|target_msg_id" (sent right after the reply itself)
+REPLY_PREFIX = "__REPLY__:"          # host -> clients: "msg_id|target_msg_id|author|snippet"
+APPEAL_PREFIX = "__APPEAL__:"        # a JSON appeal for a ban (first frame of a fresh connection) or a warning (when connected)
 NICK_PREFIX = "__NICK__:"            # guest -> host: "new nickname"
 RENAME_PREFIX = "__RENAME__:"        # host -> everyone: "old|new|renamed_by"
 WARN_PREFIX = "__WARN__:"            # host -> the warned person: "by|warning_number|reason"
@@ -408,7 +431,9 @@ SNAKE_PREFIX = "__SNAKE__:"        # guest -> host: "score|playing"; host -> cli
 WHISPER_PREFIX = "__WHISPER__:"    # guest -> host: "msg_id|target|text"; host -> both parties: "msg_id|from|to|text"
 FEATURES_PREFIX = "__FEATURES__:"  # each side announces optional features it understands
 FEATURE_EDIT = "edit"              # edit/delete of messages (added in 1.4.9b)
-HOST_FEATURES = frozenset({FEATURE_EDIT})
+FEATURE_FILES = "files"            # chunked file transfers (1.4.10b+) — older clients would show every chunk as a chat line
+FEATURE_REPLY = "reply"            # reply-to-message quotes (1.4.10b+)
+HOST_FEATURES = frozenset({FEATURE_EDIT, FEATURE_FILES, FEATURE_REPLY})
 
 # ---- Secret gradient unlocks ----
 # Typed into the "Host IP" field on the join screen instead of an actual
@@ -780,6 +805,10 @@ class Outbox:
         self._queue.put((priority, next(self._seq), frame, on_sent))
         return True
 
+    @property
+    def closed(self) -> bool:
+        return self._closed
+
     def wait_below(self, limit: int, timeout: float) -> bool:
         """Back-pressure for senders: block until at most `limit` bytes are queued.
         False if it's still above after `timeout` seconds, or the connection is gone."""
@@ -864,6 +893,55 @@ def extract_ping_targets(text: str, known_names):
         else: unknown.append(mention)
     return found, unknown
 
+BAN_APPEAL_QUESTIONS = (
+    ("text", "Why do you think you were banned?"),
+    ("text", "What happened, from your side of the story?"),
+    ("choice", "Which of these best describes the situation?",
+     ("I made an honest mistake", "I got carried away", "It wasn't me — my cat walked on the keyboard",
+      "Someone else started it", "It was all a big misunderstanding")),
+    ("scale", "How sorry are you? (1 = barely, 10 = I'll bring cookies)"),
+    ("text", "What will you do differently next time?"),
+    ("text", "Anything else the admins should know? (Jokes optional, but appreciated.)"),
+)
+WARN_APPEAL_QUESTIONS = (
+    ("text", "Why do you think this warning was unfair — or was it fair?"),
+    ("text", "What happened, from your side of the story?"),
+    ("choice", "Which of these best describes the situation?",
+     ("I made an honest mistake", "I got carried away", "It wasn't me — my cat walked on the keyboard",
+      "Someone else started it", "It was all a big misunderstanding")),
+    ("text", "What will you do differently next time?"),
+    ("text", "Anything else the admins should know?"),
+)
+
+def parse_appeal(payload: str):
+    """Reads an appeal off the wire (JSON), keeping only sane, size-limited text. None if unusable."""
+    try:
+        data = json.loads(payload)
+        answers = [[str(q)[:200], str(a)[:600]] for q, a in data["answers"][:8]]
+    except (ValueError, TypeError, KeyError):
+        return None
+    return {"kind": str(data.get("kind", "")), "number": data.get("number"), "answers": answers}
+
+def format_appeal(heading: str, who: str, details: str, answers: list) -> str:
+    lines = [f"📨 [{heading}] {who} {details}"]
+    lines += [f"     • {q}  —  {a or '(no answer)'}" for q, a in answers]
+    return "\n".join(lines)
+
+def send_ban_appeal(host_ip: str, port: int, fernet, payload: dict) -> str:
+    """A banned person can't join, so the appeal goes over a fresh connection that opens with the
+    appeal instead of a hello. Returns the host's reply; raises ConnectionError if it's unreachable."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.settimeout(8)
+    try:
+        sock.connect((host_ip, port))
+        send_encrypted(sock, fernet, APPEAL_PREFIX + json.dumps(payload))
+        reply = recv_message(sock, fernet)
+    except (OSError, ConnectionError, InvalidToken):
+        raise ConnectionError("Couldn't reach the host right now — they may be offline. Try again once they're back.")
+    finally:
+        sock.close()
+    return reply[len(NOTICE_PREFIX):] if reply.startswith(NOTICE_PREFIX) else reply
+
 def nickname_error(name: str):
     """Why `name` can't be a nickname, or None if it's fine. (The wire format uses '|' as a
     separator, so it can't appear in a name.)"""
@@ -898,9 +976,36 @@ def route_pings(hub, sender: str, text: str, reply, on_host_ping):
         reply("No one named " + _name_list([f"'{u}'" for u in unknown]) + " is here to ping.")
 
 def format_time(ts: float) -> str:
+    """A moment in local time. Today it's just the clock; any other day includes the date
+    (and the year if it isn't this year) — a bare clock time made a one-year mute look like
+    it ended the moment it began."""
     if ts == float('inf'):
         return "permanently"
-    return time.strftime("%H:%M:%S", time.localtime(ts))
+    when, now = time.localtime(ts), time.localtime()
+    if (when.tm_year, when.tm_yday) == (now.tm_year, now.tm_yday):
+        return time.strftime("%H:%M:%S", when)
+    fmt = "%a %d %b %Y, %H:%M" if when.tm_year != now.tm_year else "%a %d %b, %H:%M"
+    return time.strftime(fmt, when)
+
+def format_duration(seconds: float) -> str:
+    seconds = max(0, seconds)
+    if seconds < 30: return "under a minute"
+    minutes = max(1, int(round(seconds / 60)))  # nearest minute, so a 60-minute ban doesn't read "59 min" a second later
+    if minutes < 60: return f"{minutes} min"
+    hours, mins = divmod(minutes, 60)
+    if hours < 24: return f"{hours} h {mins} min" if mins else f"{hours} h"
+    days, hrs = divmod(hours, 24)
+    if days < 7: return f"{days} day{'s' if days != 1 else ''}" + (f" {hrs} h" if hrs else "")
+    if days < 60: return f"{days} days"
+    if days < 365: return f"about {round(days / 30.44)} months"
+    years = days / 365.25
+    return "1 year" if abs(years - 1) < 0.02 else f"{years:.1f} years"
+
+def format_until(ts: float) -> str:
+    """'Fri 23 Oct 2027, 14:05 (1 year)' — when something ends, and how long that is from now."""
+    if ts == float('inf'):
+        return "permanently"
+    return f"{format_time(ts)} ({format_duration(ts - time.time())})"
 
 def notify_ping(pinger_name: str, root=None):
     if _plyer_notification is not None:
@@ -1229,6 +1334,42 @@ def perform_globalban(fingerprint: str, reason: str) -> str:
 # install time, so the in-app viewer stays complete going forward
 # without needing the whole history re-embedded on every release.
 EMBEDDED_CHANGELOG = [
+    {   "version": "1.4.10b",
+        "date": "2026-10-23",
+        "notes": (
+            "Appeals: if you're banned, the home screen now shows an APPEAL BAN button with a short, "
+            "light-hearted questionnaire; the host and admins see it in the admin channel (one appeal "
+            "per ban, and only if the host is online). Warnings got an Appeal button in the warning "
+            "pop-up too, which works the same way. "
+            "Reports: right-click a message or attachment and choose Report — the admin channel gets "
+            "the message, who wrote it, who reported it and why. Reports on a whisper go to the host "
+            "only, so a private message is never shown to admins. "
+            "Reply: right-click a message and choose Reply — your message shows a small quote of what "
+            "it answers, and clicking the quote jumps back to the original. "
+            "Uploads: there's now a ✕ Cancel button on the 'Uploading and Sending…' line, which stops "
+            "a send straight away (recipients are told it was cancelled and nothing is left behind). "
+            "Large files: fixed people being kicked while receiving a big file — a recipient on a slow "
+            "connection is no longer disconnected; they're skipped for that one file and told why, and "
+            "stay in the chat. Anyone on an older version that can't receive files now just gets a "
+            "one-line notice instead of being flooded with unreadable data (the likely cause of the "
+            "freezes/kicks with a 350 MB file). "
+            "Dates: mutes and temporary bans now show the full date and how long that is — "
+            "e.g. 'Fri 23 Oct 2027, 14:05 (1 year)' — instead of only a clock time. "
+            "File sizes now use the same units as your computer's file manager, so a file reads the same "
+            "in the chat as it does on disk (Finder counts in thousands, Windows Explorer in 1024s — "
+            "that was the mismatch). "
+            "Layout: fixed the message box and its buttons being squashed very thin when status lines "
+            "such as 'Uploading and Sending…', a mute notice or 'someone is typing' appeared above it. "
+            "Bug fixes: the host now stamps the real sender on every message, typing indicator, Do Not "
+            "Disturb change and reaction (a modified app could previously post as someone else, "
+            "including the host); whispers can't be reacted to; a person who left (or renamed) while "
+            "typing no longer keeps haunting everyone's 'is typing…' line; messages are limited to "
+            "4,000 characters so one giant paste can't freeze everybody's window; connections that "
+            "never say hello now time out instead of piling up; a half-received file whose id was "
+            "reused no longer leaks a file handle; warning reasons are tidied and length-limited; "
+            "and leftover upload messages from a chat you left no longer pop up in the next one."
+        ),
+    },
     {   "version": "1.4.10a",
         "date": "2026-10-22",
         "notes": (
@@ -1601,6 +1742,9 @@ class Hub:
         self.outboxes = {}        # sock -> Outbox (one writer thread per connected guest)
         self.transfers = {}       # msg_id -> in-flight file transfer (see _handle_guest_file)
         self.warnings = {}        # name.lower() -> how many times they've been warned this session
+        self.reports = set()      # (reporter.lower(), msg_id) — one report per person per message
+        self.warn_log = {}        # (name.lower(), warning number) -> {"by", "reason", "appealed"}
+        self.report_times = {}    # reporter.lower() -> recent report timestamps (rate limit)
         self.host_nick = {"nick_changes": 0, "nick_locked": False}  # same bookkeeping the guests keep in their client info
         self.local_files = None   # the host's own FileAssembler (set by HostConnection)
         self.snake = {}           # name.lower() -> {"name", "best", "score", "playing"}; lives and dies with the room
@@ -1708,6 +1852,8 @@ class Hub:
         new_text = new_text.strip()
         if not new_text:
             return "An edited message can't be empty — delete it instead."
+        if len(new_text) > MAX_MESSAGE_CHARS:
+            return f"That message is too long (the limit is {MAX_MESSAGE_CHARS:,} characters)."
         with self.lock:
             record = self.messages.get(msg_id)
             if record is None:
@@ -1757,6 +1903,85 @@ class Hub:
             what = "an attachment whispered to" if noun == "attachment" else "a whisper to"
             self.log_host_only(deleter, f'deleted {what} {to}: "{_clip(text)}"')
         return None
+
+    # ---- appeals ----
+
+    def mark_ban_appealed(self, ip: str) -> bool:
+        """One appeal per ban. False if that address isn't banned or already appealed."""
+        with self.lock:
+            self._purge_expired()
+            ban = self.banned_ips.get(ip)
+            if ban is None or ban.get("appealed"):
+                return False
+            ban["appealed"] = True
+            return True
+
+    def mark_warning_appealed(self, name: str, number) -> dict:
+        """Returns the warning's record the first time it's appealed, else None."""
+        with self.lock:
+            record = self.warn_log.get((name.lower(), number))
+            if record is None or record["appealed"]:
+                return None
+            record["appealed"] = True
+            return dict(record)
+
+    # ---- replies ----
+
+    def make_reply(self, msg_id: str, replier: str, target_id: str):
+        """Checks that `replier` wrote `msg_id` and that `target_id` is a public message, and
+        returns what clients need to draw the quote (or None). The text quoted is the host's own
+        record, never what the replier's app claims it was."""
+        with self.lock:
+            mine, target = self.messages.get(msg_id), self.messages.get(target_id)
+        if mine is None or mine["author"].lower() != replier.lower() or mine.get("to"):
+            return None
+        if target is None or target.get("to"):
+            return None  # whispers can't be quoted, and the message may have been deleted
+        snippet = f"[attachment] {target['text']}" if target.get("kind") == "file" else target["text"]
+        return {"msg_id": msg_id, "to": target_id, "author": target["author"], "snippet": " ".join(snippet.split())[:80]}
+
+    def broadcast_reply(self, payload: dict, exclude_sock=None):
+        self.broadcast_feature(FEATURE_REPLY, f"{REPLY_PREFIX}{payload['msg_id']}|{payload['to']}|{payload['author']}|{payload['snippet']}", exclude_sock)
+
+    # ---- reports ----
+
+    def admin_broadcast(self, text: str):
+        """A line for the whole admin channel: the host's screen plus every admin."""
+        self.on_admin_log(text)
+        frame = encode_frame(self.fernet, ADMIN_LOG_PREFIX + text)
+        with self.lock:
+            targets = [s for s, info in self.clients.items() if info["ready"] and info["name"].lower() in self.admins]
+        for s in targets:
+            self._send_frame(s, frame)
+
+    def report_message(self, msg_id: str, reporter: str, reason: str):
+        """-> (error or None, confirmation text). Public messages and attachments go to the whole
+        admin channel; a whisper (which only its recipient may report) goes to the host alone."""
+        reason = " ".join(reason.split())[:200] or "no reason given"
+        now = time.time()
+        with self.lock:
+            record = self.messages.get(msg_id)
+            if record is None:
+                return "That message can't be reported any more.", ""
+            if record["author"].lower() == reporter.lower():
+                return "You can't report your own message.", ""
+            to = record.get("to")
+            if to is not None and to.lower() != reporter.lower():
+                return "You can only report whispers that were sent to you.", ""
+            if (reporter.lower(), msg_id) in self.reports:
+                return "You've already reported that.", ""
+            recent = [t for t in self.report_times.get(reporter.lower(), []) if now - t < 60]
+            if len(recent) >= 5:
+                return "You're sending a lot of reports — please wait a minute.", ""
+            self.report_times[reporter.lower()] = recent + [now]
+            self.reports.add((reporter.lower(), msg_id))
+            author, text, kind = record["author"], record["text"], record.get("kind")
+        what = f'attachment "{_clip(text)}"' if kind == "file" else f'message "{_clip(text)}"'
+        if to is None:
+            self.admin_broadcast(f"🚩 [Report] {reporter} reported {author}'s {what} — reason: {reason}")
+            return None, "Thanks — your report was sent to the admins."
+        self.on_admin_log(f"🚩 [Whisper Report — host only] {reporter} reported a whisper from {author}: {what} — reason: {reason}")
+        return None, "Thanks — your report was sent to the host."
 
     # ---- nicknames ----
 
@@ -1809,6 +2034,8 @@ class Hub:
             if entry is not None:
                 entry["name"] = new
                 self.snake[new_key] = entry
+            for key in [k for k in self.warn_log if k[0] == old_key]:
+                self.warn_log[(new_key, key[1])] = self.warn_log.pop(key)
             for record in self.messages.values():  # so they can still edit/delete what they wrote
                 if record["author"].lower() == old_key: record["author"] = new
                 if record.get("to") and record["to"].lower() == old_key: record["to"] = new
@@ -1834,9 +2061,10 @@ class Hub:
         if sock is None:
             return f"No one named '{name}' is connected."
         canonical = self.get_info(sock).get("name", name)
-        reason = reason.strip() or "no reason given"
+        reason = " ".join(reason.split())[:300] or "no reason given"
         with self.lock:
             count = self.warnings[canonical.lower()] = self.warnings.get(canonical.lower(), 0) + 1
+            self.warn_log[(canonical.lower(), count)] = {"by": by, "reason": reason, "appealed": False}
         self.send_private(sock, f"{WARN_PREFIX}{by}|{count}|{reason}")
         self.broadcast(f"* {canonical} has been warned *", exclude_sock=sock)
         self.log_admin_action(by, f"warned {canonical} (warning #{count}). Reason: {reason}")
@@ -1894,6 +2122,8 @@ class Hub:
         text = text.strip()
         if not text:
             return "Usage: /whisper <name> <message>"
+        if len(text) > MAX_MESSAGE_CHARS:
+            return f"That whisper is too long (the limit is {MAX_MESSAGE_CHARS:,} characters)."
         target, error = self.resolve_whisper_target(sender, target_name)
         if error:
             return error
@@ -1913,12 +2143,12 @@ class Hub:
             if sock in self.clients:
                 self.clients[sock]["features"] = set(features)
 
-    def broadcast_feature(self, feature: str, text: str):
+    def broadcast_feature(self, feature: str, text: str, exclude_sock=None):
         """Like broadcast(), but only to clients that announced `feature` — so older
         versions never receive protocol text they'd display as a chat line."""
         frame = encode_frame(self.fernet, text)
         with self.lock:
-            targets = [s for s, info in self.clients.items() if info["ready"] and feature in info.get("features", ())]
+            targets = [s for s, info in self.clients.items() if info["ready"] and s is not exclude_sock and feature in info.get("features", ())]
         for s in targets:
             self._send_frame(s, frame)
 
@@ -2168,46 +2398,80 @@ class Hub:
 
     # ---- file transfers ----
 
-    def transfer_targets(self, to, exclude_sock=None) -> list:
-        """Sockets a transfer's frames go to: everyone (to=None) or one person. The
-        host's own copy is handled separately via local_files."""
-        if to is None:
-            with self.lock:
-                return [s for s, info in self.clients.items() if info["ready"] and s is not exclude_sock]
-        if self.is_host(to):
-            return []
-        sock = self.find_socket_by_name(to)
-        return [sock] if sock is not None and sock is not exclude_sock else []
+    def transfer_targets(self, to, exclude_sock=None, skipped=None) -> list:
+        """Sockets a transfer's frames go to: everyone (to=None) or one person — only those whose
+        app understands chunked files, and not anyone already skipped for this transfer. The host's
+        own copy is handled separately via local_files."""
+        skipped = skipped or ()
+        with self.lock:
+            if to is None:
+                pool = [(s, info) for s, info in self.clients.items() if info["ready"]]
+            elif self.is_host(to):
+                return []
+            else:
+                pool = [(s, info) for s, info in self.clients.items() if info["name"].lower() == to.lower()]
+            return [s for s, info in pool if s is not exclude_sock and s not in skipped and FEATURE_FILES in info["features"]]
 
-    def relay_frame(self, frame: bytes, targets: list):
-        """Queue a transfer frame for each target, then wait for their queues to drain
-        below the window. This paces the sender to the slowest recipient without ever
-        buffering a whole file; a recipient that makes no progress for a minute is
-        dropped — only them, never the whole room."""
+    def legacy_targets(self, to, exclude_sock=None) -> list:
+        """Recipients whose app is too old for chunked files (they get a one-line notice instead)."""
+        with self.lock:
+            if to is None:
+                pool = [(s, info) for s, info in self.clients.items() if info["ready"]]
+            elif self.is_host(to):
+                return []
+            else:
+                pool = [(s, info) for s, info in self.clients.items() if info["name"].lower() == to.lower()]
+            return [s for s, info in pool if s is not exclude_sock and FEATURE_FILES not in info["features"]]
+
+    def announce_unreceivable(self, sender: str, filename: str, size: int, to=None, exclude_sock=None):
+        for s in self.legacy_targets(to, exclude_sock):
+            self.send_private(s, NOTICE_PREFIX + f"{sender} shared {filename} ({format_size(size)}), but your version can't receive files — please update chat_gui.")
+
+    def relay_frame(self, frame: bytes, targets: list, cancel=None, skipped=None, abort_frame: bytes = None):
+        """Queue a transfer frame for each target, then wait for their queues to drain below
+        the window. That paces the sender to the slowest recipient without ever buffering a
+        whole file. A recipient who can't keep up for TRANSFER_STALL_SECONDS is skipped for
+        the rest of *this file* (they're sent `abort_frame`, and stay connected) — a slow
+        connection must never get someone kicked from the room."""
         for s in targets:
             self._send_frame(s, frame, bulk=True)
         for s in targets:
             box = self.outboxes.get(s)
-            if box is not None and not box.wait_below(TRANSFER_WINDOW_BYTES, TRANSFER_STALL_SECONDS):
-                self.disconnect(s)
+            if box is None:
+                continue
+            waited = 0.0
+            while not box.wait_below(TRANSFER_WINDOW_BYTES, 0.5):
+                if box.closed:
+                    break
+                if cancel is not None and cancel.is_set():
+                    return
+                waited += 0.5
+                if waited >= TRANSFER_STALL_SECONDS:
+                    if skipped is not None:
+                        skipped.add(s)
+                    if abort_frame is not None:
+                        self._send_frame(s, abort_frame, bulk=True)
+                    break
 
-    def abort_transfer(self, msg_id: str, reason: str = ""):
+    def abort_transfer(self, msg_id: str, reason: str = "", notify_author: bool = True):
         with self.lock:
             tr = self.transfers.pop(msg_id, None)
             self.messages.pop(msg_id, None)
         if tr is None:
             return
         frame = encode_frame(self.fernet, f"{FILEABORT_PREFIX}{msg_id}|{reason}")
-        self.relay_frame(frame, self.transfer_targets(tr["to"], exclude_sock=tr["sock"]))
+        self.relay_frame(frame, self.transfer_targets(tr["to"], exclude_sock=tr["sock"], skipped=tr["skipped"]))
         if tr["local"] and self.local_files is not None:
-            self.local_files.abort(msg_id)
-        if reason:
+            info = self.local_files.abort(msg_id)
+            if info is not None and reason:
+                self._emit("system", abort_message(info, reason))
+        if reason and notify_author:
             self.send_private(tr["sock"], NOTICE_PREFIX + f"Sending {tr['filename']} failed: {reason}")
 
     def abort_transfers_of(self, sock):
         """The sender went away mid-transfer: tell everyone to discard the partial file."""
         for msg_id in [m for m, tr in list(self.transfers.items()) if tr["sock"] is sock]:
-            self.abort_transfer(msg_id, "")
+            self.abort_transfer(msg_id, "the sender disconnected", notify_author=False)
 
     def disconnect(self, sock):
         # shutdown() first: closing a socket from another thread does not wake a
@@ -2252,8 +2516,15 @@ def _clip(text: str, limit: int = 200) -> str:
 IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp")
 THUMB_SIZE = (260, 260)
 
+# Sizes are shown in the units this computer's file manager uses, so a file reads the same in
+# the chat as it does on disk: Windows Explorer counts in 1024s, macOS Finder (and most Linux
+# file managers) in 1000s. (A 350 MB file in Finder is 333 "MB" by Explorer's maths.)
+SIZE_BASE = 1024 if sys.platform == "win32" else 1000
+FILE_LIMIT_TEXT = "1 GB"
+
 def format_size(n: int) -> str:
-    for unit, factor in (("GB", 1 << 30), ("MB", 1 << 20), ("KB", 1 << 10)):
+    for unit, power in (("GB", 3), ("MB", 2), ("KB", 1)):
+        factor = SIZE_BASE ** power
         if n >= factor:
             return f"{n / factor:.1f} {unit}"
     return f"{n} B"
@@ -2261,9 +2532,7 @@ def format_size(n: int) -> str:
 def check_file_size(filepath: str):
     size = os.path.getsize(filepath)
     if size > MAX_FILE_BYTES:
-        if format_size(size) == format_size(MAX_FILE_BYTES):  # just over — say so precisely
-            raise ValueError(f"File is {size:,} bytes — the limit is {MAX_FILE_BYTES:,} bytes.")
-        raise ValueError(f"File is {format_size(size)} — the limit is {format_size(MAX_FILE_BYTES)}.")
+        raise ValueError(f"File is {format_size(size)} — the limit is {FILE_LIMIT_TEXT}.")
 
 def make_thumbnail(filename: str, data: bytes):
     """Decodes + shrinks an image in whatever thread calls this (the network
@@ -2325,6 +2594,24 @@ def local_file_event(sender, msg_id, to, filename, size, data=None, path=None) -
             "thumb": make_thumbnail(filename, data) if data is not None else None}
 
 
+class BannedError(PermissionError):
+    """The host refused us because we're banned (carries what the appeal form needs to show)."""
+    def __init__(self, message: str, until_str: str, reason: str):
+        super().__init__(message)
+        self.until_str, self.reason = until_str, reason
+
+
+class UploadCancelled(Exception):
+    """Raised inside a send loop when the user presses Cancel."""
+
+
+def abort_message(info: dict, reason: str) -> str:
+    """What to tell the user when a transfer they were receiving ends early."""
+    if reason.startswith("cancelled"):
+        return f"{info['sender']} cancelled sending {info['filename']}."
+    return f"{info['filename']} from {info['sender']} didn't finish: {reason or 'the transfer was interrupted'}."
+
+
 class FileAssembler:
     """Receives file transfers (START / CHUNK / END frames) for one client and turns them
     into "file" events. Files up to INLINE_FILE_BYTES are assembled in memory; bigger ones
@@ -2345,8 +2632,12 @@ class FileAssembler:
     def start(self, info: dict) -> bool:
         size, name = info["size"], info["filename"]
         if not 0 <= size <= MAX_FILE_BYTES:
-            self._say(f"Ignored {name}: it's larger than the {format_size(MAX_FILE_BYTES)} limit.")
+            self._say(f"Ignored {name}: it's larger than the {FILE_LIMIT_TEXT} limit.")
             return False
+        with self._lock:
+            previous = self._transfers.pop(info["msg_id"], None)
+        if previous is not None:  # same id again: drop the old half-received copy rather than leak its file
+            self._discard(previous)
         state = {"info": info, "size": size, "got": 0, "next": 0, "buf": None, "fh": None, "path": None, "last_pct": -1.0}
         if size <= INLINE_FILE_BYTES:
             state["buf"] = bytearray()
@@ -2409,11 +2700,14 @@ class FileAssembler:
         self.event_queue.put(("file", event))
 
     def abort(self, msg_id: str):
+        """Discards a half-received file. Returns its info (None if we weren't receiving it)."""
         with self._lock:
             state = self._transfers.pop(msg_id, None)
-        if state is not None:
-            self._discard(state)
-            self._done(state["info"])
+        if state is None:
+            return None
+        self._discard(state)
+        self._done(state["info"])
+        return state["info"]
 
     def _discard(self, state: dict):
         if state["fh"] is not None:
@@ -2488,7 +2782,7 @@ def _handle_guest_file(text, sock, guest_name, hub: Hub, event_queue):
         event_queue.put(("system", "[received a corrupted file, ignored]"))
         return
     if info["size"] > MAX_FILE_BYTES:
-        _guest_notice(hub, sock, f"{info['filename']} is {format_size(info['size'])} — the limit is {format_size(MAX_FILE_BYTES)}.")
+        _guest_notice(hub, sock, f"{info['filename']} is {format_size(info['size'])} — the limit is {FILE_LIMIT_TEXT}.")
         return
     target = None
     if info["to"]:
@@ -2496,16 +2790,22 @@ def _handle_guest_file(text, sock, guest_name, hub: Hub, event_queue):
         if error:
             _guest_notice(hub, sock, error)
             return
+        if not hub.is_host(target) and hub.legacy_targets(target):
+            _guest_notice(hub, sock, f"{target}'s version of chat_gui is too old to receive files — ask them to update.")
+            return
     if not hub.record_message(info["msg_id"], guest_name, info["filename"], kind="file", to=target):
         return  # unusable or already-used id — never relay it
     local = target is None or hub.is_host(target)
     info.update(sender=guest_name, to=target or "")  # never trust the sender's claims about who they are
+    abort_frame = encode_frame(hub.fernet, f"{FILEABORT_PREFIX}{info['msg_id']}|your connection couldn't keep up with this file")
     hub.transfers[info["msg_id"]] = {"sock": sock, "to": target, "local": local, "filename": info["filename"],
-                                     "expected": info["size"], "got": 0, "next": 0}
+                                     "expected": info["size"], "got": 0, "next": 0, "skipped": set(), "abort_frame": abort_frame}
     if local and hub.local_files is not None:
         hub.local_files.start(info)
+    hub.announce_unreceivable(guest_name, info["filename"], info["size"], target, exclude_sock=sock)
     start = encode_file_start(guest_name, info["msg_id"], target or "", info["filename"], info["size"])
-    hub.relay_frame(encode_frame(hub.fernet, start), hub.transfer_targets(target, exclude_sock=sock))
+    tr = hub.transfers[info["msg_id"]]
+    hub.relay_frame(encode_frame(hub.fernet, start), hub.transfer_targets(target, exclude_sock=sock), skipped=tr["skipped"], abort_frame=abort_frame)
 
 def _handle_guest_chunk(text, sock, hub: Hub):
     try:
@@ -2524,7 +2824,8 @@ def _handle_guest_chunk(text, sock, hub: Hub):
         return hub.abort_transfer(msg_id, "more data arrived than the file announced")
     if tr["local"] and hub.local_files is not None:
         hub.local_files.chunk(msg_id, index, b64)
-    hub.relay_frame(encode_frame(hub.fernet, text), hub.transfer_targets(tr["to"], exclude_sock=sock))
+    hub.relay_frame(encode_frame(hub.fernet, text), hub.transfer_targets(tr["to"], exclude_sock=sock, skipped=tr["skipped"]),
+                    skipped=tr["skipped"], abort_frame=tr["abort_frame"])
 
 def _handle_guest_file_end(text, sock, hub: Hub):
     msg_id = text[len(FILEEND_PREFIX):].strip()
@@ -2537,7 +2838,8 @@ def _handle_guest_file_end(text, sock, hub: Hub):
         hub.transfers.pop(msg_id, None)
     if tr["local"] and hub.local_files is not None:
         hub.local_files.finish(msg_id)
-    hub.relay_frame(encode_frame(hub.fernet, FILEEND_PREFIX + msg_id), hub.transfer_targets(tr["to"], exclude_sock=sock))
+    hub.relay_frame(encode_frame(hub.fernet, FILEEND_PREFIX + msg_id), hub.transfer_targets(tr["to"], exclude_sock=sock, skipped=tr["skipped"]),
+                    skipped=tr["skipped"], abort_frame=tr["abort_frame"])
 
 def _process_guest_message(text, sock, guest_name, hub: Hub, host_name, event_queue):
     is_admin = guest_name.lower() in hub.admins
@@ -2550,22 +2852,40 @@ def _process_guest_message(text, sock, guest_name, hub: Hub, host_name, event_qu
         return _handle_guest_file_end(text, sock, hub)
     if text.startswith(FILEABORT_PREFIX):
         msg_id = text[len(FILEABORT_PREFIX):].partition("|")[0]
+        reason = text[len(FILEABORT_PREFIX):].partition("|")[2][:100] or "cancelled by the sender"
         tr = hub.transfers.get(msg_id)
         if tr is not None and tr["sock"] is sock:
-            hub.abort_transfer(msg_id, "")
+            hub.abort_transfer(msg_id, reason if reason.startswith("cancelled") else "cancelled by the sender", notify_author=False)
         return
 
     if text.startswith(TYPING_START_PREFIX):
         if not hub.is_muted(sock):
-            hub.mark_typing(text[len(TYPING_START_PREFIX):])
-            hub.broadcast(text, exclude_sock=sock)
+            hub.mark_typing(guest_name)  # never the name the client claims — anyone could show "X is typing"
+            hub.broadcast(TYPING_START_PREFIX + guest_name, exclude_sock=sock)
             event_queue.put(("typing", hub.typing_names()))
         return
 
     if text.startswith(TYPING_STOP_PREFIX):
-        hub.mark_stopped_typing(text[len(TYPING_STOP_PREFIX):])
-        hub.broadcast(text, exclude_sock=sock)
+        hub.mark_stopped_typing(guest_name)
+        hub.broadcast(TYPING_STOP_PREFIX + guest_name, exclude_sock=sock)
         event_queue.put(("typing", hub.typing_names()))
+        return
+
+    if text.startswith(APPEAL_PREFIX):  # a warning appeal — allowed even while muted
+        _handle_warning_appeal(text[len(APPEAL_PREFIX):], sock, guest_name, hub)
+        return
+
+    if text.startswith(REPORT_PREFIX):  # allowed even while muted — it's a safety tool
+        msg_id, _, reason = text[len(REPORT_PREFIX):].partition("|")
+        error, note = hub.report_message(msg_id, guest_name, reason)
+        _guest_notice(hub, sock, error or note)
+        return
+
+    if text.startswith(REPLYTO_PREFIX):
+        msg_id, _, target_id = text[len(REPLYTO_PREFIX):].partition("|")
+        if payload := hub.make_reply(msg_id, guest_name, target_id):
+            hub.broadcast_reply(payload, exclude_sock=sock)
+            event_queue.put(("reply", payload))
         return
 
     if text.startswith(NICK_PREFIX):
@@ -2579,7 +2899,8 @@ def _process_guest_message(text, sock, guest_name, hub: Hub, host_name, event_qu
         return
 
     if text.startswith(DND_PREFIX):
-        dname, _, state = text[len(DND_PREFIX):].partition("|")
+        _, _, state = text[len(DND_PREFIX):].partition("|")
+        dname = guest_name  # a guest can only change their own Do Not Disturb
         active = state == "on"
         if hub.set_dnd(dname, active):
             verb = "turned on" if active else "turned off"
@@ -2613,7 +2934,7 @@ def _process_guest_message(text, sock, guest_name, hub: Hub, host_name, event_qu
 
     if hub.is_muted(sock):
         info = hub.get_info(sock)
-        hub.send_private(sock, MUTE_NOTICE_PREFIX + f"You are muted by {info['muted_by']} until {format_time(info['muted_until'])}. Reason: {info['mute_reason']}")
+        hub.send_private(sock, MUTE_NOTICE_PREFIX + f"You are muted by {info['muted_by']} until {format_until(info['muted_until'])}. Reason: {info['mute_reason']}")
         return
 
     if text.startswith(EDIT_PREFIX):
@@ -2629,10 +2950,13 @@ def _process_guest_message(text, sock, guest_name, hub: Hub, host_name, event_qu
         return
 
     if text.startswith(REACT_PREFIX):
-        hub.broadcast(text, exclude_sock=sock)
         msg_id, _, rest = text[len(REACT_PREFIX):].partition("|")
-        emoji, _, sender = rest.partition("|")
-        event_queue.put(("react", {"msg_id": msg_id, "emoji": emoji, "sender": sender or guest_name}))
+        emoji = rest.partition("|")[0]
+        record = hub.messages.get(msg_id)
+        if record is not None and record.get("to"):
+            return  # whispers can't be reacted to — and a reaction would tell the whole room about one
+        hub.broadcast(f"{REACT_PREFIX}{msg_id}|{emoji}|{guest_name}", exclude_sock=sock)  # reactions are always from the real sender
+        event_queue.put(("react", {"msg_id": msg_id, "emoji": emoji, "sender": guest_name}))
         return
 
     if text.startswith(WHISPER_PREFIX):
@@ -2660,29 +2984,74 @@ def _process_guest_message(text, sock, guest_name, hub: Hub, host_name, event_qu
         return
 
     msg_id, _, raw_text = text[len(MSG_PREFIX):].partition("|")
-    _, has_name, body = raw_text.partition(": ")
-    if not hub.record_message(msg_id, guest_name, body if has_name else raw_text):
+    body = raw_text.partition(": ")[2] if ": " in raw_text else raw_text
+    if len(body) > MAX_MESSAGE_CHARS:
+        return _guest_notice(hub, sock, f"That message is too long (the limit is {MAX_MESSAGE_CHARS:,} characters).")
+    # The sender's name is stamped on by the host, never taken from the message: a modified
+    # client could otherwise post as anyone — including the host.
+    raw_text = f"{guest_name}: {body}"
+    text = f"{MSG_PREFIX}{msg_id}|{raw_text}"
+    if not hub.record_message(msg_id, guest_name, body):
         return  # unusable or already-used id: never relay it (it could shadow someone's message)
     _ping_from_guest(hub, sock, guest_name, host_name, raw_text, event_queue)
     event_queue.put(("chat", {"raw": raw_text, "colors": hub.colormap_snapshot(), "msg_id": msg_id}))
     hub.broadcast(text, exclude_sock=sock)
 
-def handle_guest_connection(sock, addr, hub: Hub, host_name: str, event_queue: queue.Queue):
-    ban_info = hub.get_ban_info(addr[0])
-    if ban_info:
-        reason = ban_info.get("reason") or "no reason given"
-        hub.send_private(sock, BAN_NOTICE_PREFIX + f"{format_time(ban_info['until'])}|{reason}")
+def _handle_ban_appeal(sock, addr, hub: Hub, payload: str):
+    """Someone who's banned (they can't join, so they dial in just to appeal)."""
+    def finish(text: str):
+        hub.send_private(sock, NOTICE_PREFIX + text)
         sock.close()
-        return
 
+    ban = hub.get_ban_info(addr[0])
+    if ban is None:
+        return finish("You aren't banned any more — just try joining again.")
+    appeal = parse_appeal(payload)
+    if appeal is None or appeal["kind"] != "ban":
+        return finish("That appeal couldn't be read.")
+    if not hub.mark_ban_appealed(addr[0]):
+        return finish("You've already appealed this ban — the admins have it. Hang tight!")
+    name = json.loads(payload).get("name", "Someone")
+    reason = ban.get("reason") or "no reason given"
+    hub.admin_broadcast(format_appeal(
+        "Ban Appeal", f"{str(name)[:30]} ({addr[0]})",
+        f"is appealing their ban (by {ban.get('banned_by', '?')}, until {format_until(ban['until'])}; reason: \"{reason}\"). "
+        f"To lift it: /unban {addr[0]}", appeal["answers"]))
+    finish("Your appeal was sent to the host and admins. If they unban you, you can rejoin straight away.")
+
+def _handle_warning_appeal(payload: str, sock, guest_name: str, hub: Hub):
+    appeal = parse_appeal(payload)
+    if appeal is None or appeal["kind"] != "warn":
+        return _guest_notice(hub, sock, "That appeal couldn't be read.")
+    record = hub.mark_warning_appealed(guest_name, appeal["number"])
+    if record is None:
+        return _guest_notice(hub, sock, "There's no such warning to appeal, or you've already appealed it.")
+    hub.admin_broadcast(format_appeal(
+        "Warning Appeal", guest_name, f"is appealing warning #{appeal['number']} (from {record['by']}: \"{record['reason']}\")", appeal["answers"]))
+    _guest_notice(hub, sock, "Your appeal was sent to the host and admins.")
+
+def handle_guest_connection(sock, addr, hub: Hub, host_name: str, event_queue: queue.Queue):
     try:
+        sock.settimeout(10)  # a real client speaks immediately; don't let silent connections pile up
         first = recv_message(sock, hub.fernet)
+        sock.settimeout(None)
     except InvalidToken:
         try: sock.sendall((0xFFFFFFFF).to_bytes(MSG_LEN_BYTES, 'big'))
         except OSError: pass
         sock.close()
         return
     except (OSError, ConnectionError):
+        sock.close()
+        return
+
+    if first.startswith(APPEAL_PREFIX):
+        _handle_ban_appeal(sock, addr, hub, first[len(APPEAL_PREFIX):])
+        return
+
+    ban_info = hub.get_ban_info(addr[0])
+    if ban_info:
+        reason = ban_info.get("reason") or "no reason given"
+        hub.send_private(sock, BAN_NOTICE_PREFIX + f"{format_until(ban_info['until'])}|{reason}")
         sock.close()
         return
 
@@ -2786,6 +3155,7 @@ HELP_TEXT = (
     "/nick <new name> (you can change yours twice per chat), /help — "
     "host only: /ipban <ip> [min|perm] [reason], /rename <current name> <new name>. "
     "Paste an image with Ctrl+V (Cmd+V on Mac) to send it. "
+    "Right-click a message to reply to it, or report it to the admins. "
     "Right-click a message or attachment to edit/delete it (admins can delete anyone's, but never whispers). "
     "To whisper a file or sticker, type /whisper <name> then click the 📎 or 🌠 button."
 )
@@ -2921,7 +3291,7 @@ def _cmd_ban(arg, hub, me, reply):
     until, reason = parse_ban_args(parts)
     ip = hub.get_info(target).get("ip")
     if ip: hub.ban_ip(ip, until, me, reason)
-    until_str = format_time(until)
+    until_str = format_until(until)
     hub.eject(target, BAN_NOTICE_PREFIX + f"{until_str}|{reason}", f"* {name} has been IP banned *")
     hub.log_admin_action(me, f"banned {name} ({ip}) until {until_str}. Reason: {reason}")
     reply(f"Banned {name} ({ip}) until {until_str}. Reason: {reason}")
@@ -2933,7 +3303,7 @@ def _cmd_ipban(arg, hub, me, reply):
     ip = parts[0].strip()
     until, reason = parse_ban_args(parts)
     hub.ban_ip(ip, until, me, reason)
-    until_str = format_time(until)
+    until_str = format_until(until)
 
     # If someone is connected from that IP right now (under any name), kick
     # them too — otherwise the ban only bites on their next connection attempt.
@@ -2971,8 +3341,8 @@ def _cmd_mute(arg, hub, me, reply):
     if target_sock:
         hub.send_private(target_sock, MUTE_NOTICE_PREFIX + f"You were muted by {me} for {minutes:g} minute(s). Reason: {reason}")
         hub.send_private(target_sock, MUTE_STATUS_PREFIX + f"1:{until}")
-    hub.log_admin_action(me, f"muted {name} for {minutes:g} min. Reason: {reason}")
-    reply(f"Muted {name} for {minutes:g} min until {format_time(until)}. Reason: {reason}")
+    hub.log_admin_action(me, f"muted {name} until {format_until(until)}. Reason: {reason}")
+    reply(f"Muted {name} for {format_duration(minutes * 60)}, until {format_until(until)}. Reason: {reason}")
 
 def _cmd_unmute(arg, hub, me, reply):
     if not arg: return reply("Usage: /unmute <name>")
@@ -3060,7 +3430,8 @@ def guest_recv_loop(sock, fernet, event_queue, local_colors, colors_lock, known_
             return True
         if text.startswith(BAN_NOTICE_PREFIX):
             until_str, _, reason = text[len(BAN_NOTICE_PREFIX):].partition("|")
-            put(("disconnected", f"You were banned from the chat hosted by {host_ip} until {until_str}. Reason: {reason}"))
+            put(("banned_live", {"message": f"You were banned from the chat hosted by {host_ip} until {until_str}. Reason: {reason}",
+                                 "until": until_str, "reason": reason}))
             return False
         if text.startswith(KICK_NOTICE_PREFIX):
             by, _, reason = text[len(KICK_NOTICE_PREFIX):].partition("|")
@@ -3097,12 +3468,19 @@ def guest_recv_loop(sock, fernet, event_queue, local_colors, colors_lock, known_
             return True
         if text.startswith(FILEABORT_PREFIX):
             msg_id, _, reason = text[len(FILEABORT_PREFIX):].partition("|")
-            assembler.abort(msg_id)
-            if reason:
-                put(("system", f"A file transfer was cancelled: {reason}"))
+            info = assembler.abort(msg_id)
+            if info is not None:
+                put(("system", abort_message(info, reason)))
             return True
         if text.startswith(FEATURES_PREFIX):
             host_features.update(f for f in text[len(FEATURES_PREFIX):].split(",") if f)
+            return True
+        if text.startswith(REPLY_PREFIX):
+            try:
+                msg_id, to, author, snippet = text[len(REPLY_PREFIX):].split("|", 3)
+                put(("reply", {"msg_id": msg_id, "to": to, "author": author, "snippet": snippet}))
+            except ValueError:
+                pass
             return True
         if text.startswith(RENAME_PREFIX):
             try:
@@ -3111,6 +3489,9 @@ def guest_recv_loop(sock, fernet, event_queue, local_colors, colors_lock, known_
                 return True
             known_names.discard(old)
             known_names.add(new)
+            if old in typing_names:
+                typing_names.discard(old)
+                put(("typing", list(typing_names)))
             put(("rename", {"old": old, "new": new, "by": by}))
             return True
         if text.startswith(WARN_PREFIX):
@@ -3157,6 +3538,9 @@ def guest_recv_loop(sock, fernet, event_queue, local_colors, colors_lock, known_
             put(("roster", sorted(known_names)))
         elif m := LEAVE_PATTERN.match(text):
             known_names.discard(m.group(1))
+            if m.group(1) in typing_names:  # they left mid-sentence — don't keep showing "X is typing…"
+                typing_names.discard(m.group(1))
+                put(("typing", list(typing_names)))
             put(("roster", sorted(known_names)))
         elif m := re.match(r"^(.+?): ", text):
             known_names.add(m.group(1))
@@ -3240,12 +3624,14 @@ class HostConnection:
                 continue
         udp_sock.close()
 
-    def send_chat(self, text: str):
+    def send_chat(self, text: str, reply_to: dict = None):
         if run_mod_command(text, self.hub, self.name, lambda t: self.event_queue.put(("system", t))):
             self.name = self.hub.host_name  # /nick may have renamed us
             # Commands like /color change shared state; refresh our own view now.
             self.event_queue.put(("colormap", self.hub.colormap_snapshot()))
             return
+        if len(text) > MAX_MESSAGE_CHARS:
+            return self.event_queue.put(("system", f"That message is too long (the limit is {MAX_MESSAGE_CHARS:,} characters)."))
 
         route_pings(self.hub, self.name, text, lambda t: self.event_queue.put(("system", t)), on_host_ping=lambda who: None)
 
@@ -3254,6 +3640,9 @@ class HostConnection:
         self.hub.record_message(msg_id, self.name, text)
         self.event_queue.put(("chat", {"raw": full_msg, "colors": self.hub.colormap_snapshot(), "msg_id": msg_id}))
         self.hub.broadcast(f"{MSG_PREFIX}{msg_id}|{full_msg}")
+        if reply_to and (payload := self.hub.make_reply(msg_id, self.name, reply_to["id"])):
+            self.hub.broadcast_reply(payload)
+            self.event_queue.put(("reply", payload))
 
     def send_snake(self, score: int, playing: bool):
         self.hub.update_snake(self.name, score, playing)
@@ -3280,23 +3669,26 @@ class HostConnection:
         self.hub.broadcast(f"{REACT_PREFIX}{msg_id}|{emoji}|{self.name}")
         self.event_queue.put(("react", {"msg_id": msg_id, "emoji": emoji, "sender": self.name}))
 
-    def send_file(self, filepath: str, on_done=None, to: str = None, on_progress=None):
+    def send_file(self, filepath: str, on_done=None, to: str = None, on_progress=None, cancel=None):
         """Sends a file to everyone, or privately to `to`. Streams big files from disk;
-        blocks until done (paced by recipients), so run it off the UI thread."""
+        blocks until done (paced by recipients), so run it off the UI thread. Set the `cancel`
+        Event to stop it part-way."""
         check_file_size(filepath)
         size, name = os.path.getsize(filepath), os.path.basename(filepath)
         if size <= INLINE_FILE_BYTES:
             with open(filepath, "rb") as f:
-                return self.send_file_bytes(name, f.read(), on_done, to, on_progress)
-        self._send_file(name, size, chunks_from_path(filepath), None, filepath, to, on_done, on_progress)
+                return self.send_file_bytes(name, f.read(), on_done, to, on_progress, cancel)
+        self._send_file(name, size, chunks_from_path(filepath), None, filepath, to, on_done, on_progress, cancel)
 
-    def send_file_bytes(self, filename: str, data: bytes, on_done=None, to: str = None, on_progress=None):
-        self._send_file(os.path.basename(filename), len(data), chunks_from_bytes(data), data, None, to, on_done, on_progress)
+    def send_file_bytes(self, filename: str, data: bytes, on_done=None, to: str = None, on_progress=None, cancel=None):
+        self._send_file(os.path.basename(filename), len(data), chunks_from_bytes(data), data, None, to, on_done, on_progress, cancel)
 
-    def _send_file(self, filename, size, chunks, data, path, to, on_done, on_progress):
+    def _send_file(self, filename, size, chunks, data, path, to, on_done, on_progress, cancel=None):
         done = on_done or (lambda ok: None)
+        if self.hub.closed:
+            return done(False)
         if size > MAX_FILE_BYTES:
-            self.event_queue.put(("system", f"{filename} is {format_size(size)} — the limit is {format_size(MAX_FILE_BYTES)}."))
+            self.event_queue.put(("system", f"{filename} is {format_size(size)} — the limit is {FILE_LIMIT_TEXT}."))
             return done(False)
         target = ""
         if to:
@@ -3304,15 +3696,26 @@ class HostConnection:
             if error:
                 self.event_queue.put(("system", error))
                 return done(False)
+            if self.hub.legacy_targets(target):
+                self.event_queue.put(("system", f"{target}'s version of chat_gui is too old to receive files — ask them to update."))
+                return done(False)
         msg_id = os.urandom(4).hex()
         self.hub.record_message(msg_id, self.name, filename, kind="file", to=target or None)
+        skipped = set()
+        abort_frame = encode_frame(self.hub.fernet, f"{FILEABORT_PREFIX}{msg_id}|your connection couldn't keep up with this file")
+        self.hub.announce_unreceivable(self.name, filename, size, target or None)
         try:
             for text in iter_file_texts(self.name, msg_id, target, filename, size, with_progress(chunks, size, on_progress)):
-                self.hub.relay_frame(encode_frame(self.hub.fernet, text), self.hub.transfer_targets(target or None))
+                if cancel is not None and cancel.is_set():
+                    raise UploadCancelled()
+                self.hub.relay_frame(encode_frame(self.hub.fernet, text), self.hub.transfer_targets(target or None, skipped=skipped),
+                                     cancel=cancel, skipped=skipped, abort_frame=abort_frame)
         except Exception as e:
             self.hub.messages.pop(msg_id, None)
-            self.hub.relay_frame(encode_frame(self.hub.fernet, f"{FILEABORT_PREFIX}{msg_id}|the sender hit an error"), self.hub.transfer_targets(target or None))
-            self.event_queue.put(("system", f"Couldn't send {filename}: {e}"))
+            reason = "cancelled by the sender" if isinstance(e, UploadCancelled) else "the sender hit an error"
+            self.hub.relay_frame(encode_frame(self.hub.fernet, f"{FILEABORT_PREFIX}{msg_id}|{reason}"), self.hub.transfer_targets(target or None, skipped=skipped))
+            if not isinstance(e, UploadCancelled) and not self.hub.closed:
+                self.event_queue.put(("system", f"Couldn't send {filename}: {e}"))
             return done(False)
         self.event_queue.put(("file", local_file_event(self.name, msg_id, target, filename, size, data, path)))
         done(True)
@@ -3337,6 +3740,7 @@ class GuestConnection:
     def __init__(self, name, host, port, fernet, event_queue):
         self.name = name
         self.host = host
+        self.port = port
         self.fernet = fernet
         self.event_queue = event_queue
         self.local_colors = {}
@@ -3370,7 +3774,7 @@ class GuestConnection:
 
         if response.startswith(BAN_NOTICE_PREFIX):
             until_str, _, reason = response[len(BAN_NOTICE_PREFIX):].partition("|")
-            raise PermissionError(f"You are banned from this room until {until_str}. Reason: {reason}")
+            raise BannedError(f"You are banned from this room until {until_str}. Reason: {reason}", until_str, reason)
         if response.startswith(NOTICE_PREFIX): raise PermissionError(response[len(NOTICE_PREFIX):])
         if not response.startswith(ROSTER_PREFIX): raise ConnectionError("Invalid handshake from host.")
 
@@ -3440,7 +3844,13 @@ class GuestConnection:
         # never see their own reaction applied.
         self.event_queue.put(("react", {"msg_id": msg_id, "emoji": emoji, "sender": self.name}))
 
-    def send_chat(self, text: str):
+    def send_appeal(self, payload: dict):
+        self._send(APPEAL_PREFIX + json.dumps(payload), report=False)
+
+    def send_report(self, msg_id: str, reason: str):
+        self._send(f"{REPORT_PREFIX}{msg_id}|{reason}", report=False)
+
+    def send_chat(self, text: str, reply_to: dict = None):
         stripped = text.strip()
         put = self.event_queue.put
         cmd, _, arg = stripped.partition(" ")
@@ -3472,10 +3882,15 @@ class GuestConnection:
             else: put(("system", "Only admins can use moderation commands."))
             return
 
+        if len(text) > MAX_MESSAGE_CHARS:
+            return put(("system", f"That message is too long (the limit is {MAX_MESSAGE_CHARS:,} characters)."))
         msg_id = os.urandom(4).hex()
         full_msg = f"{self.name}: {text}"
         if self._send(f"{MSG_PREFIX}{msg_id}|{full_msg}"):
             put(("chat", {"raw": full_msg, "colors": self._colors_copy(), "msg_id": msg_id}))
+            if reply_to:
+                put(("reply", {"msg_id": msg_id, "to": reply_to["id"], "author": reply_to["author"], "snippet": reply_to["snippet"]}))
+                self._send(f"{REPLYTO_PREFIX}{msg_id}|{reply_to['id']}", report=False)
 
     def send_typing(self, started: bool):
         self._send((TYPING_START_PREFIX if started else TYPING_STOP_PREFIX) + self.name, report=False)
@@ -3488,41 +3903,54 @@ class GuestConnection:
         self.event_queue.put(("system", f"You {verb} Do Not Disturb."))
         self._send(DND_PREFIX + f"{self.name}|{'on' if active else 'off'}", report=False)
 
-    def send_file(self, filepath: str, on_done=None, to: str = None, on_progress=None):
+    def send_file(self, filepath: str, on_done=None, to: str = None, on_progress=None, cancel=None):
         """Sends a file to everyone, or privately to `to`. Streams big files from disk;
         blocks until the last piece is queued (paced by the connection), so run it off
-        the UI thread. `on_done(ok)` fires once the final piece has actually gone out."""
+        the UI thread. `on_done(ok)` fires once the final piece has actually gone out;
+        set the `cancel` Event to stop part-way."""
         check_file_size(filepath)
         size, name = os.path.getsize(filepath), os.path.basename(filepath)
         if size <= INLINE_FILE_BYTES:
             with open(filepath, "rb") as f:
-                return self.send_file_bytes(name, f.read(), on_done, to, on_progress)
-        self._send_file(name, size, chunks_from_path(filepath), None, filepath, to, on_done, on_progress)
+                return self.send_file_bytes(name, f.read(), on_done, to, on_progress, cancel)
+        self._send_file(name, size, chunks_from_path(filepath), None, filepath, to, on_done, on_progress, cancel)
 
-    def send_file_bytes(self, filename: str, data: bytes, on_done=None, to: str = None, on_progress=None):
-        self._send_file(os.path.basename(filename), len(data), chunks_from_bytes(data), data, None, to, on_done, on_progress)
+    def send_file_bytes(self, filename: str, data: bytes, on_done=None, to: str = None, on_progress=None, cancel=None):
+        self._send_file(os.path.basename(filename), len(data), chunks_from_bytes(data), data, None, to, on_done, on_progress, cancel)
 
-    def _send_file(self, filename, size, chunks, data, path, to, on_done, on_progress):
+    def _send_file(self, filename, size, chunks, data, path, to, on_done, on_progress, cancel=None):
         done = on_done or (lambda ok: None)
         if size > MAX_FILE_BYTES:
-            self.event_queue.put(("system", f"{filename} is {format_size(size)} — the limit is {format_size(MAX_FILE_BYTES)}."))
+            self.event_queue.put(("system", f"{filename} is {format_size(size)} — the limit is {FILE_LIMIT_TEXT}."))
             return done(False)
         outbox = self.outbox
-        if outbox is None:
+        if outbox is None or self.closing.is_set():
             return done(False)
         msg_id = os.urandom(4).hex()
         try:
             for text in iter_file_texts(self.name, msg_id, to or "", filename, size, with_progress(chunks, size, on_progress)):
                 # Wait until the writer has drained (so memory stays bounded and the chat stays
-                # responsive), then queue the next piece. Frames of one file are never reordered.
-                if not outbox.wait_below(TRANSFER_WINDOW_BYTES, TRANSFER_STALL_SECONDS):
-                    raise ConnectionError("the connection stalled")
+                # responsive), then queue the next piece. Waiting in half-second slices means
+                # Cancel takes effect promptly even on a slow connection.
+                waited = 0.0
+                while not outbox.wait_below(TRANSFER_WINDOW_BYTES, 0.5):
+                    if outbox.closed or self.closing.is_set():
+                        raise ConnectionError("the connection was lost")
+                    if cancel is not None and cancel.is_set():
+                        raise UploadCancelled()
+                    waited += 0.5
+                    if waited >= TRANSFER_STALL_SECONDS:
+                        raise ConnectionError("the connection stalled")
+                if cancel is not None and cancel.is_set() and not text.startswith(FILEEND_PREFIX):
+                    raise UploadCancelled()
                 last = text.startswith(FILEEND_PREFIX)
                 if not outbox.put(encode_frame(self.fernet, text), on_sent=done if last else None, bulk=True):
                     raise ConnectionError("the connection was lost")
         except Exception as e:
-            outbox.put(encode_frame(self.fernet, f"{FILEABORT_PREFIX}{msg_id}|the sender hit an error"), bulk=True)
-            self.event_queue.put(("system", f"Couldn't send {filename}: {e}"))
+            reason = "cancelled by the sender" if isinstance(e, UploadCancelled) else "the sender hit an error"
+            outbox.put(encode_frame(self.fernet, f"{FILEABORT_PREFIX}{msg_id}|{reason}"), bulk=True)
+            if not isinstance(e, UploadCancelled) and not self.closing.is_set():
+                self.event_queue.put(("system", f"Couldn't send {filename}: {e}"))
             return done(False)
         # Show our own copy straight away (the host doesn't echo files back to their sender).
         self.event_queue.put(("file", local_file_event(self.name, msg_id, to or "", filename, size, data, path)))
@@ -3662,6 +4090,7 @@ class ChatApp(tk.Tk):
         self._snake_win = None
         self._rainbow_instance_seq = 0
         self._job_seq = 0
+        self._session_id = 0
         self._jump_visible = False
         self.sent_history, self._history_pos, self._history_draft = [], None, ""
         self._active_dnd_bind = None
@@ -3676,6 +4105,10 @@ class ChatApp(tk.Tk):
             "react": lambda p: self.add_reaction(p["msg_id"], p["emoji"], p.get("sender", "")),
             "whisper": self.append_whisper_line,
             "rename": self._on_rename,
+            "reply": self._on_reply,
+            "banned": self._on_banned,
+            "banned_live": self._on_banned_live,
+            "appeal_result": self._on_appeal_result,
             "warned": self._on_warned,
             "snake": self._on_snake_event,
             "upload_done": self._on_upload_done,
@@ -3722,6 +4155,9 @@ class ChatApp(tk.Tk):
         self._my_messages = {}         # msg_id -> current text of messages *I* sent (editable)
         self._attachments = {}         # msg_id -> {"data", "filename", "photo", "mine", "whisper"} for files/images in the log
         self._whisper_ids = set()      # msg_ids of whisper lines (private: no reactions, no admin delete)
+        self._session_id += 1          # lets late events from a previous chat be recognised and ignored
+        self._reply_to = None          # {"id", "author", "snippet"} while composing a reply
+        self._appealed_warnings = set()  # warning numbers we've already appealed
         self._room_code = ""
         self._upload_jobs = {}         # job id -> {"name", "to", "pct"} for files we're sending
         self._incoming = {}            # msg_id -> {"filename", "sender", "pct"} for big files arriving
@@ -4013,6 +4449,10 @@ class ChatApp(tk.Tk):
 
         self.connect_btn = make_button(card, "Connect", self.on_connect_clicked, bg=BTN_GREEN, hover_bg=BTN_GREEN_HOVER)
         self.connect_btn.grid(row=8, column=0, columnspan=3, pady=(16, 0), sticky="ew")
+        self._ban_ctx = None  # what the appeal needs, while we're showing a ban message
+        self.appeal_btn = make_button(card, "APPEAL BAN", self._open_ban_appeal, bg=BTN_RED, hover_bg=BTN_RED_HOVER)
+        self.appeal_btn.grid(row=9, column=0, columnspan=3, pady=(8, 0), sticky="ew")
+        self.appeal_btn.grid_remove()
 
         self.mode_var.trace_add("write", lambda *_args: self._on_mode_change())
         self._on_mode_change()
@@ -4107,6 +4547,8 @@ class ChatApp(tk.Tk):
 
     def on_connect_clicked(self):
         if self._connecting or self.connection: return
+        if self._ban_ctx and self._ban_ctx.get("name") != self.name_entry.get().strip():
+            self._set_ban_context(None)  # a different name: it's a new attempt, not a follow-up to that ban
         name, key = self.name_entry.get().strip(), self.key_entry.get()
         room_code, mode = self.room_entry.get().strip(), self.mode_var.get()
 
@@ -4143,6 +4585,9 @@ class ChatApp(tk.Tk):
             return put(("connect_fail", error))
         try:
             conn = GuestConnection(name, host_ip, port, fernet, self.event_queue)
+        except BannedError as e:
+            return put(("banned", {"message": str(e), "host_ip": host_ip, "port": port, "fernet": fernet, "name": name,
+                                   "until": e.until_str, "reason": e.reason, "room_code": room_code}))
         except PermissionError as e:
             return put(("connect_fail", str(e)))
         except (OSError, ConnectionError) as e:
@@ -4151,6 +4596,7 @@ class ChatApp(tk.Tk):
         put(("connect_success", {"connection": conn, "mode": "join", "name": name, "room_code": room_code, "unlock_prefix": unlock_prefix}))
 
     def _on_connect_success(self, payload):
+        self._set_ban_context(None)
         self._set_connecting(False)
         self.connection = payload["connection"]
         self.my_name = payload["name"]
@@ -4160,6 +4606,116 @@ class ChatApp(tk.Tk):
             self.update_roster(self.connection.initial_roster)
             self.connection.start(payload.get("unlock_prefix"))
         self._save_settings()
+
+    # ---- appeals ----
+
+    def _set_ban_context(self, ctx):
+        self._ban_ctx = ctx
+        if ctx: self.appeal_btn.grid()
+        else: self.appeal_btn.grid_remove()
+
+    def _on_banned(self, ctx):
+        """Joining was refused because we're banned: say so, and offer to appeal."""
+        self._set_connecting(False)
+        self._set_status(ctx["message"], "error")
+        self._set_ban_context(ctx)
+        self._teardown_connection()
+
+    def _on_banned_live(self, payload):
+        """We were banned while in the chat. Remember how to reach the host so the appeal works."""
+        conn = self.connection
+        ctx = None
+        if isinstance(conn, GuestConnection):
+            ctx = {**payload, "host_ip": conn.host, "port": conn.port, "fernet": conn.fernet, "name": self.my_name, "room_code": self._room_code}
+        self._return_to_connect_screen(payload["message"], "error")
+        self._set_ban_context(ctx)
+
+    def _open_ban_appeal(self):
+        ctx = self._ban_ctx
+        if not ctx:
+            return
+        intro = (f"You were banned until {ctx['until']}.\nReason given: {ctx['reason']}\n\n"
+                 "Answer a few questions and the host and admins will see them. If they're feeling kind, you'll be unbanned.")
+        self._open_appeal_form("appeal_ban", "Appeal your ban", intro, BAN_APPEAL_QUESTIONS, self._submit_ban_appeal)
+
+    def _submit_ban_appeal(self, answers):
+        ctx = self._ban_ctx
+        if not ctx:
+            return
+        self._set_status("Sending your appeal…", "info")
+        payload = {"kind": "ban", "name": ctx["name"], "answers": answers}
+
+        def work():
+            try:
+                reply = send_ban_appeal(ctx["host_ip"], ctx["port"], ctx["fernet"], payload)
+                ok = reply.startswith("Your appeal was sent")
+                self.event_queue.put(("appeal_result", {"ok": ok, "message": reply}))
+            except ConnectionError as e:
+                self.event_queue.put(("appeal_result", {"ok": False, "message": str(e)}))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _on_appeal_result(self, payload):
+        self._set_status(payload["message"], "ok" if payload["ok"] else "error")
+        if payload["ok"]:
+            self._set_ban_context(None)  # one appeal per ban — nothing more to press
+
+    def _open_warning_appeal(self, number: int, by: str, reason: str):
+        if number in self._appealed_warnings:
+            return messagebox.showinfo("Appeal", "You've already appealed that warning.", parent=self)
+        intro = f"Warning #{number} from {by}:\n“{reason}”\n\nAnswer a few questions and the host and admins will see them."
+
+        def submit(answers):
+            self._appealed_warnings.add(number)
+            if self.connection is not None:
+                self.connection.send_appeal({"kind": "warn", "number": number, "answers": answers})
+                self.append_system_line(f"Sending your appeal for warning #{number}…")
+
+        self._open_appeal_form(f"appeal_warn_{number}", f"Appeal warning #{number}", intro, WARN_APPEAL_QUESTIONS, submit)
+
+    def _open_appeal_form(self, dialog_name, title, intro, questions, on_submit):
+        """A questionnaire dialog; on_submit([[question, answer], ...]) is called when they hit Send."""
+        popup = self._open_dialog(dialog_name, title, padx=20, pady=16)
+        if popup is None:
+            return
+        tk.Label(popup, text=title, bg=BG_PANEL, fg=FG_TEXT, font=(CHAT_FONT[0], 14, "bold")).pack(anchor="w")
+        tk.Label(popup, text=intro, bg=BG_PANEL, fg=FG_MUTED, font=CHAT_FONT, wraplength=470, justify="left").pack(anchor="w", pady=(4, 6))
+        getters = []
+        for item in questions:
+            kind, question = item[0], item[1]
+            tk.Label(popup, text=question, bg=BG_PANEL, fg=FG_TEXT, font=BOLD_FONT, wraplength=470, justify="left", anchor="w").pack(fill="x", pady=(8, 2))
+            if kind == "text":
+                box = tk.Text(popup, height=2, width=58, bg=BG_INPUT, fg=FG_TEXT, insertbackground=FG_TEXT, relief="flat", font=CHAT_FONT, wrap="word")
+                box.pack(fill="x")
+                getters.append((question, lambda b=box: b.get("1.0", "end").strip()))
+            elif kind == "choice":
+                var = tk.StringVar(value=item[2][0])
+                option = tk.OptionMenu(popup, var, *item[2])
+                option.configure(bg=BG_INPUT, fg=FG_TEXT, activebackground=BTN_NEUTRAL, activeforeground="white", relief="flat", highlightthickness=0, font=CHAT_FONT)
+                option["menu"].configure(bg=BG_PANEL, fg=FG_TEXT)
+                option.pack(anchor="w")
+                getters.append((question, var.get))
+            elif kind == "scale":
+                scale = tk.Scale(popup, from_=1, to=10, orient="horizontal", length=280, bg=BG_PANEL, fg=FG_TEXT, highlightthickness=0, troughcolor=BG_INPUT)
+                scale.set(5)
+                scale.pack(anchor="w")
+                getters.append((question, lambda sc=scale: str(sc.get())))
+        hint = tk.Label(popup, text="", bg=BG_PANEL, fg=COLOR_PALETTE["red"], font=CHAT_FONT)
+        hint.pack(anchor="w", pady=(8, 0))
+
+        def send():
+            answers = [[q, g()] for q, g in getters]
+            if not answers[0][1]:
+                hint.configure(text="Please answer the first question at least.")
+                return
+            self._close_popup(dialog_name)
+            on_submit(answers)
+
+        row = tk.Frame(popup, bg=BG_PANEL)
+        row.pack(anchor="e", pady=(6, 0))
+        make_button(row, "Cancel", lambda: self._close_popup(dialog_name), bg=BTN_NEUTRAL, hover_bg=BTN_NEUTRAL_HOVER, padx=14, pady=5).pack(side="left", padx=(0, 8))
+        make_button(row, "Send appeal", send, bg=BTN_GREEN, hover_bg=BTN_GREEN_HOVER, padx=16, pady=5).pack(side="left")
+        popup.lift()
 
     def _on_connect_fail(self, message):
         self._set_connecting(False)
@@ -4180,6 +4736,7 @@ class ChatApp(tk.Tk):
         self._hide_jump()
         self.typing_var.set("")
         self._refresh_upload_label()
+        self._clear_reply()
         self.dnd_btn.disabled = False
         self._set_dnd_button_style(False)
         self._apply_mute_state(False)
@@ -4252,7 +4809,10 @@ class ChatApp(tk.Tk):
         tk.Label(popup, text="⚠  You have been warned", bg=BG_PANEL, fg=COLOR_PALETTE["red"], font=(CHAT_FONT[0], 14, "bold")).pack(anchor="w")
         tk.Label(popup, text=f"By {by}   ·   warning #{count}", bg=BG_PANEL, fg=FG_MUTED, font=CHAT_FONT).pack(anchor="w", pady=(6, 10))
         tk.Label(popup, text=reason, bg=BG_PANEL, fg=FG_TEXT, font=CHAT_FONT, wraplength=380, justify="left").pack(anchor="w")
-        make_button(popup, "OK", lambda: self._close_popup(name), bg=BTN_NEUTRAL, hover_bg=BTN_NEUTRAL_HOVER, padx=18, pady=5).pack(anchor="e", pady=(16, 0))
+        buttons = tk.Frame(popup, bg=BG_PANEL)
+        buttons.pack(anchor="e", pady=(16, 0))
+        make_button(buttons, "Appeal", lambda: self._open_warning_appeal(count, by, reason), bg=COLOR_PALETTE["blue"], hover_bg=BTN_BLUE_HOVER, padx=16, pady=5).pack(side="left", padx=(0, 8))
+        make_button(buttons, "OK", lambda: self._close_popup(name), bg=BTN_NEUTRAL, hover_bg=BTN_NEUTRAL_HOVER, padx=18, pady=5).pack(side="left")
         popup.lift()
 
     def _return_to_connect_screen(self, message, kind):
@@ -4312,8 +4872,7 @@ class ChatApp(tk.Tk):
             self.dnd_btn.bind(bind, lambda e: self.on_dnd_keybind_picker())
             self.dnd_btn.label.bind(bind, lambda e: self.on_dnd_keybind_picker())
 
-        body = tk.Frame(self.chat_frame, bg=BG_DARK)
-        body.pack(fill="both", expand=True)
+        body = tk.Frame(self.chat_frame, bg=BG_DARK)  # packed last — see the end of this method
 
         self.log = scrolledtext.ScrolledText(body, bg=BG_DARK, fg=FG_TEXT, insertbackground=FG_TEXT, relief="flat", state="disabled", wrap="word", padx=10, pady=8, font=CHAT_FONT, highlightthickness=0, bd=0)
         self.log.pack(side="left", fill="both", expand=True)
@@ -4323,6 +4882,8 @@ class ChatApp(tk.Tk):
         self.log.tag_configure("reaction_style", foreground=COLOR_PALETTE["yellow"], font=(CHAT_FONT[0], 9))
         self.log.tag_configure("edited_mark", foreground=FG_MUTED, font=(CHAT_FONT[0], 8, "italic"))
         self.log.tag_configure("deleted_mark", foreground=FG_MUTED, font=(CHAT_FONT[0], 9, "italic"))
+        self.log.tag_configure("quote", foreground=FG_MUTED, font=(CHAT_FONT[0], 9, "italic"))
+        self.log.tag_configure("flash", background=BTN_NEUTRAL)
         self.log.tag_configure("align_right", justify="right")
         self.log.tag_configure("align_left", justify="left")
 
@@ -4348,17 +4909,25 @@ class ChatApp(tk.Tk):
         self.member_list_frame.pack(fill="both", expand=True, padx=10)
 
         self.typing_var = tk.StringVar(value="")
-        tk.Label(self.chat_frame, textvariable=self.typing_var, bg=BG_DARK, fg=FG_MUTED, font=(CHAT_FONT[0], 9, "italic"), anchor="w").pack(fill="x", padx=10)
+        self.typing_label = tk.Label(self.chat_frame, textvariable=self.typing_var, bg=BG_DARK, fg=FG_MUTED, font=(CHAT_FONT[0], 9, "italic"), anchor="w")
 
         self.upload_var = tk.StringVar(value="")
-        self.upload_label = tk.Label(self.chat_frame, textvariable=self.upload_var, bg=BG_DARK, fg=COLOR_PALETTE["yellow"], font=(CHAT_FONT[0], 9, "bold"), anchor="w")  # packed only while uploading
+        self.upload_row = tk.Frame(self.chat_frame, bg=BG_DARK)  # packed only while a transfer is in progress
+        self.upload_label = tk.Label(self.upload_row, textvariable=self.upload_var, bg=BG_DARK, fg=COLOR_PALETTE["yellow"], font=(CHAT_FONT[0], 9, "bold"), anchor="w")
+        self.upload_label.pack(side="left", fill="x", expand=True)
+        self.cancel_upload_btn = make_button(self.upload_row, "✕ Cancel", self._cancel_uploads, bg=BTN_RED, hover_bg=BTN_RED_HOVER, padx=8, pady=1, font=(CHAT_FONT[0], 9, "bold"))
 
         self.mute_status_var = tk.StringVar(value="")
         self.mute_label = tk.Label(self.chat_frame, textvariable=self.mute_status_var, bg=BG_DARK, fg=COLOR_PALETTE["red"], font=(CHAT_FONT[0], 9, "bold"), anchor="w")
-        self.mute_label.pack(fill="x", padx=10)
+
+        self.reply_bar = tk.Frame(self.chat_frame, bg=BG_PANEL)  # packed only while replying
+        self.reply_label = tk.Label(self.reply_bar, text="", bg=BG_PANEL, fg=FG_TEXT, font=CHAT_FONT, anchor="w")
+        self.reply_label.pack(side="left", fill="x", expand=True, padx=(10, 4), pady=4)
+        reply_close = tk.Label(self.reply_bar, text="✕", bg=BG_PANEL, fg=FG_MUTED, font=BOLD_FONT, cursor="hand2", padx=10)
+        reply_close.pack(side="right")
+        reply_close.bind("<Button-1>", lambda e: self._clear_reply())
 
         self.bottom_bar = tk.Frame(self.chat_frame, bg=BG_DARK)
-        self.bottom_bar.pack(fill="x", padx=10, pady=(0, 10))
 
         def tool_button(text, command):
             btn = make_button(self.bottom_bar, text, command, bg=BG_INPUT, hover_bg=BTN_NEUTRAL_HOVER, padx=10, pady=6)
@@ -4383,6 +4952,15 @@ class ChatApp(tk.Tk):
         self.send_btn = make_button(self.bottom_bar, "Send", self.on_send, bg=COLOR_PALETTE["blue"], hover_bg=BTN_BLUE_HOVER, padx=16, pady=6)
         self.send_btn.pack(side="left", padx=(6, 0))
 
+        # Pack order is how Tk shares out a short window: widgets packed first are satisfied first
+        # and the last one packed is what gets squeezed. The log used to be packed first, so every
+        # status line above the message box (uploading, muted, someone typing) shrank the chat bar —
+        # sometimes to a sliver. Reserve the bottom strip first; the log gives way instead.
+        self.bottom_bar.pack(side="bottom", fill="x", padx=10, pady=(0, 10))
+        self.mute_label.pack(side="bottom", fill="x", padx=10)
+        self.typing_label.pack(side="bottom", fill="x", padx=10)
+        body.pack(fill="both", expand=True)
+
     def _set_input_state(self, enabled: bool):
         self.msg_entry.configure(state="normal" if enabled else "disabled")
         for btn in (self.send_btn, self.attach_btn, self.sticker_btn, self.emoji_btn):
@@ -4393,7 +4971,7 @@ class ChatApp(tk.Tk):
     def _apply_mute_state(self, muted: bool, until: float = 0.0):
         self._cancel_timer("mute")
         self._set_input_state(not muted)
-        until_text = f" until {format_time(until)}" if until else ""
+        until_text = f" until {format_until(until)}" if until else ""
         self.mute_status_var.set(f"🔇 You are muted{until_text} — messages won't send." if muted else "")
 
         if muted and until:
@@ -4619,6 +5197,9 @@ class ChatApp(tk.Tk):
             self._close_popup(name)
         if open_pickers:
             return "break"
+        if self._reply_to is not None and not self.suggest_popup:
+            self._clear_reply()
+            return "break"
         if self.suggest_popup:
             self.destroy_suggestions()
         elif self._history_pos is not None:
@@ -4637,6 +5218,9 @@ class ChatApp(tk.Tk):
         if not self.connection or str(self.msg_entry["state"]) == "disabled": return "break"
         text = self.msg_entry.get().strip()
         if not text: return "break"
+        if len(text) > MAX_MESSAGE_CHARS:  # keep what they typed so they can trim it
+            self.append_system_line(f"That message is {len(text):,} characters — the limit is {MAX_MESSAGE_CHARS:,}. Shorten it, or send it as a file.")
+            return "break"
         self._set_entry_text("")
         self._history_pos = None
 
@@ -4654,7 +5238,9 @@ class ChatApp(tk.Tk):
 
         self._remember_sent(text)
         self._stop_typing_signal()
-        self.connection.send_chat(text)
+        reply, self._reply_to = (None if text.startswith("/") else self._reply_to), None  # replies only apply to ordinary messages
+        self._clear_reply()
+        self.connection.send_chat(text, reply)
         self._maybe_start_slowmode_cooldown()
         return "break"
 
@@ -4788,7 +5374,7 @@ class ChatApp(tk.Tk):
         jobs = list(self._upload_jobs.values())
         if jobs:
             job = jobs[0]
-            text = f"⏳ Uploading and Sending… {job['name']}"
+            text = f"✖ Cancelling… {job['name']}" if job.get("cancelling") else f"⏳ Uploading and Sending… {job['name']}"
             if job.get("to"): text += f" (whisper to {job['to']})"
             if job.get("pct") is not None: text += f" {job['pct']:.0f}%"
             if len(jobs) > 1: text += f"  [{len(jobs)} in progress]"
@@ -4800,11 +5386,15 @@ class ChatApp(tk.Tk):
             parts.append(text)
         if not parts:
             self.upload_var.set("")
-            self.upload_label.pack_forget()
+            self.upload_row.pack_forget()
             return
         self.upload_var.set("   ".join(parts))
-        if not self.upload_label.winfo_manager():
-            self.upload_label.pack(fill="x", padx=10, before=self.mute_label)
+        if not self.upload_row.winfo_manager():
+            self.upload_row.pack(side="bottom", fill="x", padx=10, before=self.typing_label)
+        if jobs and not self.cancel_upload_btn.winfo_manager():
+            self.cancel_upload_btn.pack(side="right", padx=(8, 0))
+        elif not jobs and self.cancel_upload_btn.winfo_manager():
+            self.cancel_upload_btn.pack_forget()
 
     def _start_upload(self, filename: str, loader=None, to: str = None, path: str = None):
         """Sending a file — reading it, encrypting it, and pacing it to the connection — runs
@@ -4815,33 +5405,43 @@ class ChatApp(tk.Tk):
         if conn is None:
             return
         self._job_seq += 1
-        job = self._job_seq
-        self._upload_jobs[job] = {"name": filename, "to": to, "pct": None}
+        job, session, cancel = self._job_seq, self._session_id, threading.Event()
+        self._upload_jobs[job] = {"name": filename, "to": to, "pct": None, "cancel": cancel}
         self._refresh_upload_label()
         last_pct = [-100.0]
 
         def report(ok, name=filename, error=None):
-            self.event_queue.put(("upload_done", {"job": job, "ok": ok, "filename": name, "error": error}))
+            self.event_queue.put(("upload_done", {"job": job, "session": session, "ok": ok, "filename": name, "error": error,
+                                                  "cancelled": cancel.is_set() and not ok}))
 
         def progress(sent, size):
             pct = sent * 100.0 / size if size else 100.0
             if pct - last_pct[0] >= 2 or sent >= size:
                 last_pct[0] = pct
-                self.event_queue.put(("upload_progress", {"job": job, "pct": pct}))
+                self.event_queue.put(("upload_progress", {"job": job, "session": session, "pct": pct}))
 
         def work():
             try:
                 if path is not None:
-                    conn.send_file(path, on_done=lambda ok: report(ok), to=to, on_progress=progress)
+                    conn.send_file(path, on_done=lambda ok: report(ok), to=to, on_progress=progress, cancel=cancel)
                 else:
                     name, data = loader()
-                    conn.send_file_bytes(name, data, on_done=lambda ok: report(ok, name), to=to, on_progress=progress)
+                    conn.send_file_bytes(name, data, on_done=lambda ok: report(ok, name), to=to, on_progress=progress, cancel=cancel)
             except Exception as e:
                 report(False, filename, str(e))
 
         threading.Thread(target=work, daemon=True).start()
 
+    def _cancel_uploads(self):
+        """The ✕ Cancel button: stop everything we're currently sending."""
+        for job in self._upload_jobs.values():
+            job["cancel"].set()
+            job["cancelling"] = True
+        self._refresh_upload_label()
+
     def _on_upload_progress(self, payload):
+        if payload.get("session") != self._session_id:
+            return  # from a chat we've since left
         job = self._upload_jobs.get(payload["job"])
         if job is not None:
             job["pct"] = payload["pct"]
@@ -4855,9 +5455,13 @@ class ChatApp(tk.Tk):
         self._refresh_upload_label()
 
     def _on_upload_done(self, payload):
+        if payload.get("session") != self._session_id:
+            return  # a leftover from a chat we've since left — don't leak it into this one
         self._upload_jobs.pop(payload.get("job"), None)
         self._refresh_upload_label()
-        if payload.get("error"):
+        if payload.get("cancelled"):
+            self.append_system_line(f"Cancelled sending {payload['filename']}.")
+        elif payload.get("error"):
             self.append_system_line(f"Couldn't send {payload['filename']}: {payload['error']}")
         elif not payload["ok"]:
             self.append_system_line(f"Couldn't send {payload['filename']}.")
@@ -5438,17 +6042,26 @@ class ChatApp(tk.Tk):
                 menu.add_command(label=emoji, command=lambda e=emoji: self.send_reaction(msg_id, e))
                 entries += 1
             mine, noun = msg_id in self._my_messages, "message"
-        admin_may_delete = self.is_admin and not private  # admins never see (or delete) whispers
-        if mine or admin_may_delete:  # is_admin is also True for the host
+
+        known = msg_id in self._msg_authors
+        am_host = isinstance(self.connection, HostConnection)
+        actions = []  # (label, command) — the things you can do with this message, below the emoji row
+        if known and not private:
+            actions.append(("Reply", lambda: self.start_reply(msg_id)))
+        if known and not mine and not am_host:
+            actions.append((f"Report {noun}", lambda: self.start_report(msg_id)))
+        if mine:
+            if attachment is None:
+                actions.append(("Edit message", lambda: self.start_edit(msg_id)))
+            actions.append((f"Delete {noun}", lambda: self.start_delete(msg_id)))
+        elif self.is_admin and not private:  # is_admin is also True for the host; admins never see (or delete) whispers
+            actions.append((f"Delete {noun} (admin)", lambda: self.start_delete(msg_id)))
+        if actions:
             if entries:
                 menu.add_separator()
-            if mine:
-                if attachment is None:
-                    menu.add_command(label="Edit message", command=lambda: self.start_edit(msg_id))
-                menu.add_command(label=f"Delete {noun}", command=lambda: self.start_delete(msg_id))
-            else:
-                menu.add_command(label=f"Delete {noun} (admin)", command=lambda: self.start_delete(msg_id))
-            entries += 1
+            for label, command in actions:
+                menu.add_command(label=label, command=command)
+            entries += len(actions)
         return menu if entries else None
 
     def show_reaction_menu(self, event, msg_id):
@@ -5459,6 +6072,61 @@ class ChatApp(tk.Tk):
         finally: menu.grab_release()
 
     # ---- editing / deleting messages ----
+
+    # ---- replying to and reporting messages ----
+
+    def start_reply(self, msg_id):
+        author = self._msg_authors.get(msg_id)
+        if author is None or not self.connection:
+            return
+        attachment = self._attachments.get(msg_id)
+        if attachment is not None:
+            snippet = f"[attachment] {attachment['filename']}"
+        else:
+            ranges = self.log.tag_ranges(f"body_{msg_id}")
+            snippet = self.log.get(ranges[0], ranges[1]) if ranges else ""
+        snippet = " ".join(snippet.split())[:80]
+        self._reply_to = {"id": msg_id, "author": author, "snippet": snippet}
+        self.reply_label.configure(text=f"↪ Replying to {author}: {snippet}")
+        if not self.reply_bar.winfo_manager():
+            self.reply_bar.pack(side="bottom", fill="x", padx=10, pady=(0, 4), before=self.mute_label)
+        self.msg_entry.focus_set()
+
+    def _clear_reply(self):
+        self._reply_to = None
+        if self.reply_bar.winfo_manager():
+            self.reply_bar.pack_forget()
+
+    def _on_reply(self, payload):
+        """Draw the little quote line above a message that replies to another."""
+        ranges = self.log.tag_ranges(f"msg_{payload['msg_id']}")
+        if not ranges:
+            return
+        follow = self._at_bottom()
+        mine = self._msg_authors.get(payload["msg_id"], "").lower() == self.my_name.lower()
+        quote_tag = f"quote_{payload['msg_id']}"
+        with self._log_edit():
+            self.log.insert(str(ranges[0]), f"   ↪ {payload['author']}: {payload['snippet']}\n", ("quote", quote_tag, "align_right" if mine else "align_left"))
+        self.log.tag_bind(quote_tag, "<Button-1>", lambda e, target=payload["to"]: self._jump_to(target))
+        if follow:
+            self.log.see("end")
+
+    def _jump_to(self, msg_id):
+        ranges = self.log.tag_ranges(f"msg_{msg_id}")
+        if not ranges:
+            return self.append_system_line("That message is no longer in the chat log.")
+        self.log.see(ranges[0])
+        self.log.tag_add("flash", ranges[0], ranges[1])
+        self.after(1200, lambda: self.log.tag_remove("flash", "1.0", "end"))
+
+    def start_report(self, msg_id):
+        if not self.connection or msg_id not in self._msg_authors:
+            return
+        noun = "attachment" if msg_id in self._attachments else "message"
+        reason = simpledialog.askstring(f"Report {noun}", f"Report this {noun} to the admins.\nWhy? (optional — a few words is plenty)", parent=self)
+        if reason is None:
+            return  # cancelled
+        self.connection.send_report(msg_id, reason.strip())
 
     def start_edit(self, msg_id):
         current = self._my_messages.get(msg_id)
