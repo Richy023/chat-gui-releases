@@ -1,6 +1,16 @@
 #!/usr/bin/env python3
 """
-chat_gui.py — v1.4.10b — ENCRYPTED instant messenger with a desktop GUI.
+chat_gui.py — v1.4.10c — ENCRYPTED instant messenger with a desktop GUI.
+
+Changes in 1.4.10c:
+- Fixed: joining by Room Code could fail ("Could not find Room") while entering the host's
+  IP worked. The Room Code is built from the host's IP, and a VPN (or any extra network
+  adapter) can make the machine report a different address from the one guests reach it on.
+  The code was also only worked out once, when the Host screen opened, so a later IP change
+  (Wi-Fi reconnect, sleep/wake, DHCP renewal) left it stale. It's now re-checked when you
+  press Host and every few seconds while hosting (the title bar and chat show a new code if
+  it changes); the host answers for every address it has, guests try the Room Code on every
+  network they're on, and the host's welcome line lists any extra addresses it found.
 
 Changes in 1.4.10b:
 - Appeals: a banned person sees an APPEAL BAN button on the home screen (a short,
@@ -303,7 +313,7 @@ except ImportError:
 if sys.platform == "darwin":
     ensure_installed("pyobjus", required=False)
 
-VERSION = "1.4.10b"
+VERSION = "1.4.10c"
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -1029,12 +1039,33 @@ def get_local_ip() -> str:
     except OSError:
         return "127.0.0.1"
 
+def get_local_ips() -> list:
+    """Every usable (non-loopback, non-link-local) IPv4 address this machine has,
+    with the default-route address first. A machine on Wi-Fi + Ethernet, or with a VPN
+    or virtual adapters, has several, and the Room Code only matches one of them."""
+    ips = []
+    def add(ip):
+        if ip and not ip.startswith(("127.", "169.254.", "0.")) and ip not in ips:
+            ips.append(ip)
+    add(get_local_ip())
+    try:
+        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+            add(info[4][0])
+    except OSError:
+        pass
+    try:
+        for ip in socket.gethostbyname_ex(socket.gethostname())[2]:
+            add(ip)
+    except OSError:
+        pass
+    return ips
+
 def _guess_broadcast_addresses() -> set:
     addrs = {"255.255.255.255"}
-    local_ip = get_local_ip()
-    parts = local_ip.split(".")
-    if len(parts) == 4 and local_ip != "127.0.0.1":
-        addrs.add(".".join(parts[:3]) + ".255")
+    for local_ip in get_local_ips():
+        parts = local_ip.split(".")
+        if len(parts) == 4:
+            addrs.add(".".join(parts[:3]) + ".255")
     try:
         hostname = socket.gethostname()
         for info in socket.getaddrinfo(hostname, None, socket.AF_INET):
@@ -1056,13 +1087,19 @@ def _local_subnet_hosts(local_ip: str) -> list:
     except ValueError: return []
     return [".".join(str(o) for o in network) + f".{h}" for h in range(1, 255)]
 
-def discover_host(room_code: str, target_ip: str = None, timeout: float = 4.0) -> tuple[str, int]:
+def discover_host(room_code: str, target_ip=None, timeout: float = 4.0) -> tuple[str, int]:
+    """target_ip may be one address, or a collection of addresses to try at once."""
     udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     udp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
     udp_sock.settimeout(0.5)
 
     msg = f"DISCOVER:{room_code}".encode('utf-8')
-    targets = {target_ip} if target_ip else (_guess_broadcast_addresses() | set(_local_subnet_hosts(get_local_ip())))
+    if target_ip:
+        targets = {target_ip} if isinstance(target_ip, str) else set(target_ip)
+    else:
+        targets = _guess_broadcast_addresses()
+        for ip in get_local_ips()[:3]:
+            targets |= set(_local_subnet_hosts(ip))
     deadline = time.time() + timeout
     
     try:
@@ -1334,6 +1371,21 @@ def perform_globalban(fingerprint: str, reason: str) -> str:
 # install time, so the in-app viewer stays complete going forward
 # without needing the whole history re-embedded on every release.
 EMBEDDED_CHANGELOG = [
+    {   "version": "1.4.10c",
+        "date": "2026-11-04",
+        "notes": (
+            "Bug fix: joining a host by Room Code could fail with 'Could not find Room' even though "
+            "entering the host's IP worked. The Room Code is built from the host's IP address, and a "
+            "VPN (or any extra network adapter) can make a computer report a different address from "
+            "the one guests actually reach it on. The code was also only worked out once, when the "
+            "host screen opened, so a later IP change (Wi-Fi reconnect, sleep/wake, DHCP renewal) left "
+            "it stale. The code is now re-checked the moment you press Host, and every few seconds "
+            "while hosting; if it changes, the chat shows the new code and the title bar updates. "
+            "The host answers for every address it has, guests try the Room Code against every "
+            "network they're on, and the host's welcome line lists any extra addresses it found, to "
+            "make odd networks easier to diagnose."
+        ),
+    },
     {   "version": "1.4.10b",
         "date": "2026-10-23",
         "notes": (
@@ -3612,13 +3664,31 @@ class HostConnection:
             self.event_queue.put(("system", f"Room Code lookup is unavailable ({e}) — guests will need to enter your IP:port instead."))
             return
         udp_sock.settimeout(1.0)
-        expected = f"DISCOVER:{room_code}"
+        # The code we advertised, plus a code for every address we currently have. These are
+        # refreshed while hosting, because the host's IP can change (Wi-Fi reconnect, sleep/wake,
+        # DHCP renewal) and the Room Code is built from it.
+        accepted = {f"DISCOVER:{room_code}"}
+        shown_code = room_code
+        last_primary = get_local_ip()
+        last_refresh = time.time()
         offer = f"OFFER:{self.tcp_port}".encode("utf-8")
 
         while not self.stop_event.is_set():
+            if time.time() - last_refresh >= 5.0:
+                last_refresh = time.time()
+                for ip in get_local_ips():
+                    accepted.add(f"DISCOVER:{generate_room_code(ip)}")
+                primary = get_local_ip()
+                if primary != last_primary and not primary.startswith("127."):
+                    last_primary = primary
+                    new_code = generate_room_code(primary)
+                    if new_code != shown_code:
+                        shown_code = new_code
+                        accepted.add(f"DISCOVER:{new_code}")
+                        self.event_queue.put(("room_code_changed", {"room_code": new_code, "ip": primary}))
             try:
                 data, addr = udp_sock.recvfrom(1024)
-                if data.decode("utf-8", errors="replace") == expected:
+                if data.decode("utf-8", errors="replace") in accepted:
                     udp_sock.sendto(offer, addr)
             except (socket.timeout, OSError):
                 continue
@@ -4033,15 +4103,19 @@ def resolve_join_target(room_code: str, manual_target: str = None):
             host_ip, port = discover_host(room_code, target_ip=host_ip)
         else:
             # Fast path first: Room Code = last two octets, so try the likely address directly.
-            prefix = ".".join(get_local_ip().split(".")[:2])
-            if prefix and not prefix.startswith("127."):
-                guess = f"{prefix}.{int(room_code[:3])}.{int(room_code[3:])}"
-                host_ip, port = discover_host(room_code, target_ip=guess, timeout=1.5)
+            # Try the prefix of every network we're on, not just the default-route one.
+            prefixes = []
+            for ip in get_local_ips():
+                prefix = ".".join(ip.split(".")[:2])
+                if prefix not in prefixes: prefixes.append(prefix)
+            guesses = {f"{p}.{int(room_code[:3])}.{int(room_code[3:])}" for p in prefixes}
+            if guesses:
+                host_ip, port = discover_host(room_code, target_ip=guesses, timeout=1.5)
             if not host_ip:
                 host_ip, port = discover_host(room_code)
 
     if not host_ip:
-        return None, None, unlock_prefix, f"Could not find Room {room_code}. Ensure the host is running and you are on the same Wi-Fi/network."
+        return None, None, unlock_prefix, f"Could not find Room {room_code}. Ensure the host is running and you are on the same Wi-Fi/network — or enter the host's IP in the 'Host IP' field."
     return host_ip, port, unlock_prefix, None
 
 
@@ -4101,6 +4175,7 @@ class ChatApp(tk.Tk):
         self._event_handlers = {
             "connect_success": self._on_connect_success,
             "connect_fail": self._on_connect_fail,
+            "room_code_changed": self._on_room_code_changed,
             "chat": self._on_chat_event,
             "react": lambda p: self.add_reaction(p["msg_id"], p["emoji"], p.get("sender", "")),
             "whisper": self.append_whisper_line,
@@ -4574,6 +4649,11 @@ class ChatApp(tk.Tk):
             return put(("connect_fail", f"This device isn't able to use chat_gui. ({ban.get('reason', 'no reason given')})"))
 
         if mode == "host":
+            # The code on screen was worked out when this screen opened; the IP may have changed
+            # since, which would leave guests knocking on an address we no longer have.
+            self._host_local_ip = get_local_ip()
+            self._host_all_ips = get_local_ips()  # looked up here, off the UI thread (hostname lookups can stall)
+            room_code = generate_room_code(self._host_local_ip)
             try:
                 conn = HostConnection(name, room_code, fernet, self.event_queue)
             except OSError as e:
@@ -4759,12 +4839,25 @@ class ChatApp(tk.Tk):
 
         if mode == "host":
             local_ip = self._host_local_ip or get_local_ip()
+            others = [ip for ip in getattr(self, "_host_all_ips", []) if ip != local_ip]
+            extra = f" (this device also has: {', '.join(others)})" if others else ""
             self.append_system_line(
-                f"Hosting Room {room_code} on {local_ip}. Guests on your same network segment can join with just the Room Code. "
+                f"Hosting Room {room_code} on {local_ip}{extra}. Guests on your same network segment can join with just the Room Code. "
                 f"If that doesn't work, have them enter {local_ip}:{self.connection.tcp_port} in the 'Host IP' field. Type /help for commands."
             )
         else:
             self.append_system_line(f"You joined Room {room_code} as {name}. Type /help for commands.")
+
+    def _on_room_code_changed(self, payload):
+        """Our IP changed while hosting, so the Room Code did too."""
+        if not isinstance(self.connection, HostConnection): return
+        self._room_code = payload["room_code"]
+        self._host_local_ip = payload["ip"]
+        self._update_room_label()
+        self.append_system_line(
+            f"Your IP changed to {payload['ip']}, so the Room Code is now {payload['room_code']}. "
+            f"Guests already in the chat aren't affected; new guests should use the new code."
+        )
 
     def _update_room_label(self):
         verb = "Hosting as" if isinstance(self.connection, HostConnection) else "Connected as"
