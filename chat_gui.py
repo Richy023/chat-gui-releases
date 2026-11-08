@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-chat_gui.py — v1.4.11c — ENCRYPTED instant messenger with a desktop GUI.
+chat_gui.py — v1.5.0 — ENCRYPTED instant messenger with a desktop GUI.
 
-Changes in 1.4.11c:
+Changes in 1.5.0:
 - The "New messages" button is back to a small button (bottom right, in its own strip under the
   chat so it still can't smear on macOS) instead of a full-width bar, and that strip no longer
   leaves an empty gap under the chat once the button has gone.
