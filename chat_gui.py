@@ -1,6 +1,16 @@
 #!/usr/bin/env python3
 """
-chat_gui.py — v1.4.11 — ENCRYPTED instant messenger with a desktop GUI.
+chat_gui.py — v1.4.11a — ENCRYPTED instant messenger with a desktop GUI.
+
+Changes in 1.4.11a:
+- The ⚠ Warning button reacts to what the admins do: yellow while you're warned (also while an
+  appeal is pending), flashes red a few times and settles back to yellow if your appeal is
+  rejected, and turns green — "✔ Appeal accepted" or "✔ Warning removed" — for about 5 seconds
+  before disappearing when the warning is deleted.
+- Fixed: clicking a recent chat no longer fills in the Host IP box. It used to paste the
+  IP *and the port from that earlier session*, and that port is usually stale (the host picks a
+  new one each time), which gave "machine actively refused the connection". Only the Room
+  Code is filled in now; it finds the host's current address and port on its own.
 
 Changes in 1.4.11:
 - Flappy Bird! Ctrl+Shift+S now opens a small game picker (Snake or Flappy Bird; press 1 / 2
@@ -350,7 +360,7 @@ except ImportError:
 if sys.platform == "darwin":
     ensure_installed("pyobjus", required=False)
 
-VERSION = "1.4.11"
+VERSION = "1.4.11a"
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -1740,6 +1750,18 @@ def perform_globalban(fingerprint: str, reason: str) -> str:
 # install time, so the in-app viewer stays complete going forward
 # without needing the whole history re-embedded on every release.
 EMBEDDED_CHANGELOG = [
+    {   "version": "1.4.11a",
+        "date": "2026-11-08",
+        "notes": (
+            "Fixed: clicking a recent chat no longer fills in the Host IP box. It used to paste the IP "
+            "along with the port from that earlier session, and that port is usually out of date (the "
+            "host picks a new one each time), which caused 'machine actively refused the connection'. "
+            "Only the Room Code is filled in now; it finds the host's current address and port itself. "
+            "The ⚠ Warning button now reacts to what the admins do: it flashes red and settles back to "
+            "yellow when an appeal is rejected, and turns green ('Appeal accepted' / 'Warning removed') "
+            "for about 5 seconds before disappearing when the warning is deleted."
+        ),
+    },
     {   "version": "1.4.11",
         "date": "2026-11-08",
         "notes": (
@@ -2443,7 +2465,7 @@ class Hub:
         else:
             if accept:
                 error, _, _ = self.delete_warning(a["who"], a["number"], by,
-                                                  f"appeal accepted — {reason}", log=False)
+                                                  f"appeal accepted — {reason}", log=False, state="accepted")
                 extra = " The warning has been deleted." if error is None else " (That warning had already been removed.)"
             else:
                 self._notice_to(a["who"], f"Your appeal for warning #{a['number']} was rejected by {by}. Reason: {reason}")
@@ -2452,7 +2474,7 @@ class Hub:
         text = f"Appeal #{appeal_id} ({what}) {verb}. Reason: {reason}.{extra}"
         return None, text, f"{verb} appeal #{appeal_id} from {a['who']}. Reason: {reason}"
 
-    def delete_warning(self, name: str, number, by: str, reason: str, log: bool = True):
+    def delete_warning(self, name: str, number, by: str, reason: str, log: bool = True, state: str = "removed"):
         """Deletes a warning (the latest active one if `number` is None); the warned person is told if
         they're here. Warning numbers are never reused. -> (error or None, canonical name, number)."""
         reason = " ".join(reason.split())[:300] or "no reason given"
@@ -2472,7 +2494,7 @@ class Hub:
         if log:
             self.record_mod("warning removed", canonical, by, reason, detail=f"#{number}")
         self._notice_to(canonical, f"Warning #{number} was removed by {by}. Reason: {reason}")
-        self._warn_state_to(canonical, number, "removed")
+        self._warn_state_to(canonical, number, state)  # "accepted" when it's the result of an appeal
         return None, canonical, number
 
     def ban_status(self, ip: str) -> dict:
@@ -4707,6 +4729,7 @@ def make_button(parent, text, command, bg, fg="white", font=BOLD_FONT, padx=14, 
 
     frame.label = label
     frame.base_bg = bg
+    frame.hover_bg = hover_bg   # change both (and .paint) to recolour the button for good
     frame.disabled = False
 
     def paint(color):
@@ -4722,7 +4745,7 @@ def make_button(parent, text, command, bg, fg="white", font=BOLD_FONT, padx=14, 
         if not frame.disabled: command()
 
     def on_enter(event=None):
-        if not frame.disabled: paint(hover_bg)
+        if not frame.disabled: paint(frame.hover_bg)
 
     def on_leave(event=None):
         if not frame.disabled: paint(frame.base_bg)
@@ -4780,6 +4803,9 @@ def resolve_join_target(room_code: str, manual_target: str = None):
 class ChatApp(tk.Tk):
     BUILTIN_STICKERS = {"GG": "#57F287", "RIP": "#ED4245", "HELLO": "#5B8CFF", "WOW": "#FEE75C", "BRUH": "#FFA347"}
     REACTION_CHOICES = ("😀", "😂", "❤️", "👍", "🔥", "😢", "😡")
+    WARN_YELLOW = ("#B8860B", "#D4A017")   # the ⚠ button's resting colour: warned, no appeal answered yet
+    WARN_GREEN = (BTN_GREEN, BTN_GREEN_HOVER)
+    WARN_RED = (BTN_RED, BTN_RED_HOVER)
     BASE_COMMANDS = ("/color", "/colors", "/list", "/clear", "/whisper", "/nick", "/warning", "/help")
     ADMIN_COMMANDS = ("/mute", "/unmute", "/kick", "/ban", "/unban", "/warn", "/unwarn", "/history", "/appeals",
                       "/accept", "/reject", "/slowmode", "/admin", "/unadmin")
@@ -4898,6 +4924,7 @@ class ChatApp(tk.Tk):
         self._session_id += 1          # lets late events from a previous chat be recognised and ignored
         self._reply_to = None          # {"id", "author", "snippet"} while composing a reply
         self._appealed_warnings = set()  # warning numbers we've already appealed
+        self._warn_fx = None             # "hold" / "flash" while the ⚠ button plays an effect (see _on_warn_state)
         self._latest_warning = None      # {"by", "count", "reason", "state"} — only the newest warning is kept (see the ⚠ button)
         self._appeal_pending = None      # {"number", "key"} while a warning appeal's "Sending…" line awaits the host's answer
         self._room_code = ""
@@ -5288,13 +5315,14 @@ class ChatApp(tk.Tk):
         return row
 
     def _on_recent_row_clicked(self, entry):
-        # Just prefills the normal fields with what worked last time — the user
-        # still enters the shared key and hits Connect as usual.
+        # Just prefills the Room Code from last time — the user still enters the shared key and hits
+        # Connect as usual. The Host IP box is deliberately NOT filled in: the port saved from that session
+        # is usually stale, and a typed IP:port skips the Room Code lookup that would find the current one.
+        # (It is cleared, so an older manual IP can't silently override the code we just filled in.)
         self.room_entry.configure(state="normal")
         self.room_entry.delete(0, "end")
         self.room_entry.insert(0, entry["room_code"])
         self.host_ip_entry.delete(0, "end")
-        self.host_ip_entry.insert(0, f"{entry['host_ip']}:{entry['port']}")
         self._set_status("Filled in from a recent connection — enter the shared key and press Connect.", "info")
         self.key_entry.focus_set()
 
@@ -5570,6 +5598,8 @@ class ChatApp(tk.Tk):
         self._apply_mute_state(False)
         self._close_popup("warning_view")
         self._cancel_timer("appeal_wait")
+        self._cancel_timer("warn_fx")
+        self._warn_fx = None
         self._refresh_warn_button()
         for child in self.member_list_frame.winfo_children(): child.destroy()
         self._update_window_title()
@@ -5650,16 +5680,21 @@ class ChatApp(tk.Tk):
         self.append_private_line(f"⚠ Warning #{count} from {by}: {reason}")
         self.bell()
         self._close_popup("warning_view")  # a newer warning replaces whatever was showing
+        self._cancel_timer("warn_fx")
+        self._warn_fx = None
         self._refresh_warn_button()
         self._show_warning_dialog()
 
     def _refresh_warn_button(self):
         """The ⚠ button in the top bar: there for as long as we hold a warning, so closing the pop-up
         never costs us the Appeal button."""
+        if self._warn_fx:
+            return  # an effect is playing — it repaints the button itself when it finishes
         warning = self._latest_warning
         if warning is None:
             self.warn_btn.pack_forget()
             return
+        self._paint_warn_btn(self.WARN_YELLOW)
         number = warning["count"]
         if warning["state"] == "rejected":
             note = " · appeal rejected"
@@ -5669,6 +5704,42 @@ class ChatApp(tk.Tk):
             note = ""
         self.warn_btn.label.configure(text=f"⚠ Warning #{number}{note}")
         self.warn_btn.pack(side="right", padx=(12, 0), pady=6, after=self.dnd_btn)
+
+    def _paint_warn_btn(self, colors):
+        self.warn_btn.base_bg, self.warn_btn.hover_bg = colors
+        self.warn_btn.paint(colors[0])
+
+    def _end_warn_fx(self):
+        """Stops any ⚠ button effect and puts the button back to how things really stand."""
+        self._cancel_timer("warn_fx")
+        self._warn_fx = None
+        self._refresh_warn_button()
+
+    def _warn_btn_removed(self, text: str):
+        """The warning is gone (an admin deleted it, or our appeal was accepted): the button goes green,
+        says so for a few seconds, then disappears."""
+        self._cancel_timer("warn_fx")
+        self._warn_fx = "hold"
+        self.warn_btn.label.configure(text=text)
+        self._paint_warn_btn(self.WARN_GREEN)
+        self.warn_btn.pack(side="right", padx=(12, 0), pady=6, after=self.dnd_btn)
+        self._set_timer("warn_fx", 5000, self._end_warn_fx)
+
+    def _warn_btn_rejected(self):
+        """Our appeal was rejected: the button flashes red a few times, then settles back to yellow."""
+        self._cancel_timer("warn_fx")
+        self._warn_fx = "flash"
+        self.warn_btn.label.configure(text=f"⚠ Warning #{self._latest_warning['count']} · appeal rejected")
+        self.warn_btn.pack(side="right", padx=(12, 0), pady=6, after=self.dnd_btn)
+        sequence = [self.WARN_RED, self.WARN_YELLOW] * 3
+        def step():
+            if self._warn_fx != "flash":
+                return
+            if not sequence:
+                return self._end_warn_fx()
+            self._paint_warn_btn(sequence.pop(0))
+            self._set_timer("warn_fx", 260, step)
+        step()
 
     def _show_warning_dialog(self):
         """Shows our latest warning, with the Appeal button while there's still an appeal to make."""
@@ -5701,12 +5772,17 @@ class ChatApp(tk.Tk):
             return  # not the warning we're showing
         reopen = "warning_view" in self._popups
         self._close_popup("warning_view")
-        if payload["state"] == "removed":
+        state = payload["state"]
+        if state in ("removed", "accepted"):
             self._latest_warning = None
-        elif payload["state"] == "rejected":
+            self._warn_btn_removed("✔ Appeal accepted" if state == "accepted" else "✔ Warning removed")
+            return
+        if state == "rejected":
             warning["state"] = "rejected"
             self._appealed_warnings.add(warning["count"])
-        self._refresh_warn_button()
+            self._warn_btn_rejected()
+        else:
+            self._refresh_warn_button()
         if reopen and self._latest_warning is not None:
             self._show_warning_dialog()
 
@@ -5800,7 +5876,7 @@ class ChatApp(tk.Tk):
             self.dnd_btn.bind(bind, lambda e: self.on_dnd_keybind_picker())
             self.dnd_btn.label.bind(bind, lambda e: self.on_dnd_keybind_picker())
 
-        self.warn_btn = make_button(top, "⚠ Warning", self._show_warning_dialog, bg="#B8860B", hover_bg="#D4A017", padx=12, pady=5)  # shown by _refresh_warn_button
+        self.warn_btn = make_button(top, "⚠ Warning", self._show_warning_dialog, bg=self.WARN_YELLOW[0], hover_bg=self.WARN_YELLOW[1], padx=12, pady=5)  # shown by _refresh_warn_button
 
         body = tk.Frame(self.chat_frame, bg=BG_DARK)  # packed last — see the end of this method
 
