@@ -1,12 +1,19 @@
 #!/usr/bin/env python3
 """
-chat_gui.py — v1.4.11a — ENCRYPTED instant messenger with a desktop GUI.
+chat_gui.py — v1.4.11b — ENCRYPTED instant messenger with a desktop GUI.
+
+Changes in 1.4.11b:
+- Fixed: the "New messages" button smeared up the screen as you scrolled (macOS). It is now a
+  bar in its own strip under the chat instead of floating over it, so nothing overlaps the
+  scrolling area.
+- The ⚠ Warning button's rejected-appeal flash is now six quick flashes between red and white
+  (about a second and a half), then it settles back to yellow.
 
 Changes in 1.4.11a:
 - The ⚠ Warning button reacts to what the admins do: yellow while you're warned (also while an
-  appeal is pending), flashes red a few times and settles back to yellow if your appeal is
-  rejected, and turns green — "✔ Appeal accepted" or "✔ Warning removed" — for about 5 seconds
-  before disappearing when the warning is deleted.
+  appeal is pending), flashes red and settles back to yellow if your appeal is rejected, and turns
+  green — "✔ Appeal accepted" or "✔ Warning removed" — for about 5 seconds before disappearing
+  when the warning is deleted.
 - Fixed: clicking a recent chat no longer fills in the Host IP box. It used to paste the
   IP *and the port from that earlier session*, and that port is usually stale (the host picks a
   new one each time), which gave "machine actively refused the connection". Only the Room
@@ -360,7 +367,7 @@ except ImportError:
 if sys.platform == "darwin":
     ensure_installed("pyobjus", required=False)
 
-VERSION = "1.4.11a"
+VERSION = "1.4.11b"
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -1750,6 +1757,14 @@ def perform_globalban(fingerprint: str, reason: str) -> str:
 # install time, so the in-app viewer stays complete going forward
 # without needing the whole history re-embedded on every release.
 EMBEDDED_CHANGELOG = [
+    {   "version": "1.4.11b",
+        "date": "2026-11-08",
+        "notes": (
+            "Fixed: the 'New messages' button smeared up the screen as you scrolled (macOS). It is now a "
+            "bar in its own strip under the chat instead of floating over it. The ⚠ Warning button's "
+            "rejected-appeal flash is now six quick flashes between red and white, then back to yellow."
+        ),
+    },
     {   "version": "1.4.11a",
         "date": "2026-11-08",
         "notes": (
@@ -4806,6 +4821,7 @@ class ChatApp(tk.Tk):
     WARN_YELLOW = ("#B8860B", "#D4A017")   # the ⚠ button's resting colour: warned, no appeal answered yet
     WARN_GREEN = (BTN_GREEN, BTN_GREEN_HOVER)
     WARN_RED = (BTN_RED, BTN_RED_HOVER)
+    WARN_WHITE = ("#FFFFFF", "#EEEEEE")
     BASE_COMMANDS = ("/color", "/colors", "/list", "/clear", "/whisper", "/nick", "/warning", "/help")
     ADMIN_COMMANDS = ("/mute", "/unmute", "/kick", "/ban", "/unban", "/warn", "/unwarn", "/history", "/appeals",
                       "/accept", "/reject", "/slowmode", "/admin", "/unadmin")
@@ -5092,14 +5108,13 @@ class ChatApp(tk.Tk):
         self._unseen += 1
         self.jump_btn.configure(text="↓ 1 new message" if self._unseen == 1 else f"↓ {self._unseen} new messages")
         if not self._jump_visible:
-            self.jump_btn.place(in_=self.log, relx=1.0, rely=1.0, anchor="se", x=-12, y=-8)
+            self.jump_btn.pack(fill="x", padx=10, pady=(4, 6))
             self._jump_visible = True
-        self.jump_btn.lift()
 
     def _hide_jump(self):
         self._unseen = 0
         if self._jump_visible:
-            self.jump_btn.place_forget()
+            self.jump_btn.pack_forget()
             self._jump_visible = False
 
     def _scroll_to_bottom(self):
@@ -5708,6 +5723,8 @@ class ChatApp(tk.Tk):
     def _paint_warn_btn(self, colors):
         self.warn_btn.base_bg, self.warn_btn.hover_bg = colors
         self.warn_btn.paint(colors[0])
+        # white text vanishes on the white flash, so the text goes red there (red-on-white / white-on-red)
+        self.warn_btn.label.configure(fg=BTN_RED if colors is self.WARN_WHITE else "white")
 
     def _end_warn_fx(self):
         """Stops any ⚠ button effect and puts the button back to how things really stand."""
@@ -5726,19 +5743,19 @@ class ChatApp(tk.Tk):
         self._set_timer("warn_fx", 5000, self._end_warn_fx)
 
     def _warn_btn_rejected(self):
-        """Our appeal was rejected: the button flashes red a few times, then settles back to yellow."""
+        """Our appeal was rejected: the button flashes red and white six times, quickly, then settles back to yellow."""
         self._cancel_timer("warn_fx")
         self._warn_fx = "flash"
         self.warn_btn.label.configure(text=f"⚠ Warning #{self._latest_warning['count']} · appeal rejected")
         self.warn_btn.pack(side="right", padx=(12, 0), pady=6, after=self.dnd_btn)
-        sequence = [self.WARN_RED, self.WARN_YELLOW] * 3
+        sequence = [self.WARN_RED, self.WARN_WHITE] * 6
         def step():
             if self._warn_fx != "flash":
                 return
             if not sequence:
                 return self._end_warn_fx()
             self._paint_warn_btn(sequence.pop(0))
-            self._set_timer("warn_fx", 260, step)
+            self._set_timer("warn_fx", 120, step)
         step()
 
     def _show_warning_dialog(self):
@@ -5880,8 +5897,15 @@ class ChatApp(tk.Tk):
 
         body = tk.Frame(self.chat_frame, bg=BG_DARK)  # packed last — see the end of this method
 
-        self.log = scrolledtext.ScrolledText(body, bg=BG_DARK, fg=FG_TEXT, insertbackground=FG_TEXT, relief="flat", state="disabled", wrap="word", padx=10, pady=8, font=CHAT_FONT, highlightthickness=0, bd=0)
-        self.log.pack(side="left", fill="both", expand=True)
+        log_col = tk.Frame(body, bg=BG_DARK)
+        log_col.pack(side="left", fill="both", expand=True)
+        # The "New messages" bar lives in its own strip UNDER the log. It used to float over the log, but on
+        # macOS Tk scrolls a Text by copying pixels inside the window's one shared surface, and that copies
+        # anything drawn over the Text too — smearing the button up the screen. Nothing overlaps the log now.
+        self.jump_bar = tk.Frame(log_col, bg=BG_DARK)
+        self.jump_bar.pack(side="bottom", fill="x")
+        self.log = scrolledtext.ScrolledText(log_col, bg=BG_DARK, fg=FG_TEXT, insertbackground=FG_TEXT, relief="flat", state="disabled", wrap="word", padx=10, pady=8, font=CHAT_FONT, highlightthickness=0, bd=0)
+        self.log.pack(side="top", fill="both", expand=True)
         self.log.tag_configure("system", foreground=FG_MUTED, font=(CHAT_FONT[0], 9, "italic"))
         self.log.tag_configure("private", foreground=COLOR_PALETTE["yellow"])
         self.log.tag_configure("timestamp", foreground=FG_MUTED, font=(CHAT_FONT[0], 8))
@@ -5901,10 +5925,7 @@ class ChatApp(tk.Tk):
         # (also when the window is resized, which can put the end back in view).
         self.log.bind("<Configure>", lambda e: self.after_idle(self._sync_jump_btn), add="+")
 
-        # The button sits OVER the log but is not a child of it: on macOS, Tk scrolls a Text by copying its
-        # pixels, and a child widget gets copied along too — which smears the button up the screen
-        # as you scroll. A sibling placed with in_= isn't part of that copy.
-        self.jump_btn = tk.Label(body, text="↓ New messages", bg=COLOR_PALETTE["blue"], fg="white", font=BOLD_FONT, padx=10, pady=4, cursor="hand2")
+        self.jump_btn = tk.Label(self.jump_bar, text="↓ New messages", bg=COLOR_PALETTE["blue"], fg="white", font=BOLD_FONT, padx=10, pady=5, cursor="hand2")
         self.jump_btn.bind("<Button-1>", lambda e: self._scroll_to_bottom())
         # The wheel over the button would otherwise do nothing — pass it on to the log.
         for bind in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
