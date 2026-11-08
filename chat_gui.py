@@ -1,6 +1,14 @@
 #!/usr/bin/env python3
 """
-chat_gui.py — v1.4.11b — ENCRYPTED instant messenger with a desktop GUI.
+chat_gui.py — v1.4.11c — ENCRYPTED instant messenger with a desktop GUI.
+
+Changes in 1.4.11c:
+- The "New messages" button is back to a small button (bottom right, in its own strip under the
+  chat so it still can't smear on macOS) instead of a full-width bar, and that strip no longer
+  leaves an empty gap under the chat once the button has gone.
+- Fixed: the Recent list showed the same room several times if you'd joined it more than once
+  (each join came with a different port). A room code now appears once, with its latest address;
+  repeats already saved are folded together too.
 
 Changes in 1.4.11b:
 - Fixed: the "New messages" button smeared up the screen as you scrolled (macOS). It is now a
@@ -367,7 +375,7 @@ except ImportError:
 if sys.platform == "darwin":
     ensure_installed("pyobjus", required=False)
 
-VERSION = "1.4.11b"
+VERSION = "1.5.0"
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -1518,15 +1526,21 @@ def load_recent_hosts() -> list:
     entries = load_json(RECENT_HOSTS_FILE, list)
     cutoff = time.time() - RECENT_HOSTS_MAX_AGE
     fresh = [e for e in entries if isinstance(e, dict) and e.get("last_connected", 0) >= cutoff]
-    if len(fresh) != len(entries):
-        save_recent_hosts(fresh)
-    return fresh
+    fresh.sort(key=lambda e: e.get("last_connected", 0), reverse=True)
+    seen, unique = set(), []
+    for e in fresh:  # one entry per room code — the newest (its address and port are the current ones)
+        if e.get("room_code") not in seen:
+            seen.add(e.get("room_code"))
+            unique.append(e)
+    if len(unique) != len(entries):
+        save_recent_hosts(unique)
+    return unique
 
 def save_recent_hosts(entries: list):
     save_json(RECENT_HOSTS_FILE, entries[:RECENT_HOSTS_MAX_ENTRIES])
 
 def remember_recent_host(room_code: str, host_ip: str, port: int):
-    entries = [e for e in load_recent_hosts() if not (e.get("room_code") == room_code and e.get("host_ip") == host_ip and e.get("port") == port)]
+    entries = [e for e in load_recent_hosts() if e.get("room_code") != room_code]  # joining a room again replaces its entry (the port differs every session)
     entries.insert(0, {"room_code": room_code, "host_ip": host_ip, "port": port, "last_connected": time.time()})
     save_recent_hosts(entries[:RECENT_HOSTS_MAX_ENTRIES])
 
@@ -1757,6 +1771,16 @@ def perform_globalban(fingerprint: str, reason: str) -> str:
 # install time, so the in-app viewer stays complete going forward
 # without needing the whole history re-embedded on every release.
 EMBEDDED_CHANGELOG = [
+    {   "version": "1.5.0",
+        "date": "2026-11-08",
+        "notes": (
+            "The 'New messages' button is back to a small button (bottom right, in its own strip under "
+            "the chat so it still can't smear on macOS) instead of a full-width bar, with no leftover gap "
+            "once it hides. Fixed: the Recent "
+            "list showed the same room several times if you'd joined it more than once — a room code "
+            "now appears once, with its latest address."
+        ),
+    },
     {   "version": "1.4.11b",
         "date": "2026-11-08",
         "notes": (
@@ -5108,13 +5132,14 @@ class ChatApp(tk.Tk):
         self._unseen += 1
         self.jump_btn.configure(text="↓ 1 new message" if self._unseen == 1 else f"↓ {self._unseen} new messages")
         if not self._jump_visible:
-            self.jump_btn.pack(fill="x", padx=10, pady=(4, 6))
+            self.jump_btn.pack(side="right", padx=14, pady=(3, 5))
             self._jump_visible = True
 
     def _hide_jump(self):
         self._unseen = 0
         if self._jump_visible:
             self.jump_btn.pack_forget()
+            self.jump_bar.configure(height=1)  # an emptied frame would otherwise keep the button's height as dead space
             self._jump_visible = False
 
     def _scroll_to_bottom(self):
@@ -5899,7 +5924,7 @@ class ChatApp(tk.Tk):
 
         log_col = tk.Frame(body, bg=BG_DARK)
         log_col.pack(side="left", fill="both", expand=True)
-        # The "New messages" bar lives in its own strip UNDER the log. It used to float over the log, but on
+        # The "New messages" button lives in its own strip UNDER the log. It used to float over the log, but on
         # macOS Tk scrolls a Text by copying pixels inside the window's one shared surface, and that copies
         # anything drawn over the Text too — smearing the button up the screen. Nothing overlaps the log now.
         self.jump_bar = tk.Frame(log_col, bg=BG_DARK)
@@ -5925,7 +5950,7 @@ class ChatApp(tk.Tk):
         # (also when the window is resized, which can put the end back in view).
         self.log.bind("<Configure>", lambda e: self.after_idle(self._sync_jump_btn), add="+")
 
-        self.jump_btn = tk.Label(self.jump_bar, text="↓ New messages", bg=COLOR_PALETTE["blue"], fg="white", font=BOLD_FONT, padx=10, pady=5, cursor="hand2")
+        self.jump_btn = tk.Label(self.jump_bar, text="↓ New messages", bg=COLOR_PALETTE["blue"], fg="white", font=(CHAT_FONT[0], 9, "bold"), padx=8, pady=2, cursor="hand2")
         self.jump_btn.bind("<Button-1>", lambda e: self._scroll_to_bottom())
         # The wheel over the button would otherwise do nothing — pass it on to the log.
         for bind in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
