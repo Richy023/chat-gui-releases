@@ -1,6 +1,26 @@
 #!/usr/bin/env python3
 """
-chat_gui.py — v1.4.10d — ENCRYPTED instant messenger with a desktop GUI.
+chat_gui.py — v1.4.11 — ENCRYPTED instant messenger with a desktop GUI.
+
+Changes in 1.4.11:
+- Flappy Bird! Ctrl+Shift+S now opens a small game picker (Snake or Flappy Bird; press 1 / 2
+  or click). Flappy Bird has its own live leaderboard, shared with the chat like Snake's.
+  Space, Up, W or a click flaps. The bird wears your name colour.
+- The games work from the home screen too, not only inside a chat. Off a chat the board
+  shows just you; your best score per game is remembered on this computer. Open game
+  windows now stay open as you join or leave a chat, and re-announce your score to the room.
+- Warnings: a "⚠ Warning" button now sits in the chat's top bar for as long as you have
+  a warning you haven't dealt with. Closing the warning pop-up no longer loses the Appeal
+  button — click the ⚠ button (or type /warning) to see your latest warning and appeal it
+  whenever you like. The button shows the appeal's progress, and disappears if the warning
+  is deleted. Only your latest warning is kept.
+- Sending a warning appeal now edits the "Sending your appeal…" line into "Appeal sent ✔"
+  instead of adding a second line.
+- A banned person's screen checks in with the host every 6 seconds (was 10).
+- Fixed: the "New messages" button smeared upwards as you scrolled (macOS), now shows how many
+  new messages are waiting, and disappears whenever you get back to the bottom — scrolling,
+  trackpad, dragging the scrollbar, keys or resizing — and the mouse wheel works over it.
+- Fixed: the whole Snake / Flappy Bird window flashed whenever your score went up (macOS).
 
 Changes in 1.4.10d:
 - Replying to a message now pings its author (unless they're on Do Not Disturb, in which
@@ -266,6 +286,7 @@ import queue
 import time
 import re
 import random
+import math
 import base64
 import hashlib
 import importlib
@@ -329,7 +350,7 @@ except ImportError:
 if sys.platform == "darwin":
     ensure_installed("pyobjus", required=False)
 
-VERSION = "1.4.10d"
+VERSION = "1.4.11"
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -451,18 +472,28 @@ REPLYTO_PREFIX = "__REPLYTO__:"      # guest -> host: "msg_id|target_msg_id" (se
 REPLY_PREFIX = "__REPLY__:"          # host -> clients: "msg_id|target_msg_id|author|snippet"
 BANCHECK_PREFIX = "__BANCHECK__:"    # a banned person's app -> host (first frame of a fresh connection): "are we still banned?"
 BANSTATUS_PREFIX = "__BANSTATUS__:"  # host -> that app: JSON {"state": banned|unbanned|free, "by", "reason", "appeal"}
-BAN_POLL_SECONDS = 10                # how often a banned person's screen asks the host
+BAN_POLL_SECONDS = 6                 # how often a banned person's screen asks the host
 APPEAL_PREFIX = "__APPEAL__:"        # a JSON appeal for a ban (first frame of a fresh connection) or a warning (when connected)
 NICK_PREFIX = "__NICK__:"            # guest -> host: "new nickname"
 RENAME_PREFIX = "__RENAME__:"        # host -> everyone: "old|new|renamed_by"
 WARN_PREFIX = "__WARN__:"            # host -> the warned person: "by|warning_number|reason"
 SNAKE_PREFIX = "__SNAKE__:"        # guest -> host: "score|playing"; host -> clients: "name|best|score|playing"
+FLAPPY_PREFIX = "__FLAPPY__:"      # same shape as SNAKE_PREFIX, for the Flappy Bird leaderboard (1.4.11+)
+GAME_PREFIXES = {"snake": SNAKE_PREFIX, "flappy": FLAPPY_PREFIX}
+WARNSTATE_PREFIX = "__WARNSTATE__:"  # host -> the warned person: "warning_number|removed" or "warning_number|rejected" (1.4.11+)
+APPEAL_SENT_TEXT = "Your appeal was sent to the host and admins."
+APPEAL_MISSING_TEXT = "There's no such warning to appeal, or you've already appealed it."
+APPEAL_UNREADABLE_TEXT = "That appeal couldn't be read."
+APPEAL_REPLY_TEXTS = (APPEAL_SENT_TEXT, APPEAL_MISSING_TEXT, APPEAL_UNREADABLE_TEXT)
 WHISPER_PREFIX = "__WHISPER__:"    # guest -> host: "msg_id|target|text"; host -> both parties: "msg_id|from|to|text"
 FEATURES_PREFIX = "__FEATURES__:"  # each side announces optional features it understands
 FEATURE_EDIT = "edit"              # edit/delete of messages (added in 1.4.9b)
 FEATURE_FILES = "files"            # chunked file transfers (1.4.10b+) — older clients would show every chunk as a chat line
 FEATURE_REPLY = "reply"            # reply-to-message quotes (1.4.10b+)
-HOST_FEATURES = frozenset({FEATURE_EDIT, FEATURE_FILES, FEATURE_REPLY})
+FEATURE_FLAPPY = "flappy"          # Flappy Bird leaderboard frames (1.4.11+) — older clients would show them as chat lines
+FEATURE_WARNSYNC = "warnsync"      # warning removed/rejected notices that drive the ⚠ button (1.4.11+)
+HOST_FEATURES = frozenset({FEATURE_EDIT, FEATURE_FILES, FEATURE_REPLY, FEATURE_FLAPPY, FEATURE_WARNSYNC})
+GAME_FEATURES = {"snake": None, "flappy": FEATURE_FLAPPY}  # which feature a client needs to hear a game's leaderboard
 
 # ---- Secret gradient unlocks ----
 # Typed into the "Host IP" field on the join screen instead of an actual
@@ -497,12 +528,13 @@ GRADIENT_UNLOCK_CODES = {
     AURORA_SECRET_CODE: (AURORA_SENTINEL, AURORA_UNLOCK_PREFIX),
 }
 
-# ---- Snake minigame (each person plays their own game; the leaderboard is shared live) ----
-SNAKE_KEYBIND = "<Control-Shift-KeyPress-S>"
+# ---- Minigames: Snake and Flappy Bird (each person plays their own game; the leaderboards are shared live) ----
+GAMES_KEYBIND = "<Control-Shift-KeyPress-S>"   # opens the game picker — in a chat or on the home screen
 SNAKE_COLS = 24
 SNAKE_ROWS = 18
 SNAKE_CELL_PX = 20
 SNAKE_TICK_MS = 130
+FLAPPY_TICK_MS = 20
 SETTINGS_FILE = app_path("chat_gui_settings.json")
 
 class SnakeGame:
@@ -563,51 +595,228 @@ class SnakeGame:
             self.body.pop()
 
 
-class SnakeWindow(tk.Toplevel):
-    """Snake, opened with the secret SNAKE_KEYBIND. Everyone plays their own local game,
-    but scores are shared live with the room: the leaderboard shows everyone in the chat
-    who has played (and who's playing right now). It lives only as long as the room —
-    nothing is saved, so it starts empty whenever the chat is restarted."""
+class FlappyGame:
+    """Flappy Bird logic — no Tk, no I/O, deterministic given a seeded rng. One tick is one
+    frame (FLAPPY_TICK_MS). The bird waits in place until the first flap."""
 
+    WIDTH, HEIGHT, GROUND = 320, 440, 40
+    BIRD_X, BIRD_R = 80, 10
+    GRAVITY, FLAP_V, MAX_FALL = 0.42, -6.6, 9.0
+    PIPE_W, GAP, SPEED, SPACING = 54, 124, 2.5, 175
+    EDGE_MARGIN = 45     # a gap's centre never gets closer than this (plus half a gap) to the ceiling or ground
+    MAX_SHIFT = 130      # ...and never jumps further than this from the previous gap, so every pipe is reachable
+
+    def __init__(self, rng=None):
+        self.rng = rng or random
+        self.reset()
+
+    def reset(self):
+        self.bird_y = (self.HEIGHT - self.GROUND) / 2
+        self.vy = 0.0
+        self.pipes = []          # [{"x": left edge, "gap_y": centre of the gap, "scored": bool}]
+        self.score = 0
+        self.started = False
+        self.alive = True
+        self.frame = 0
+
+    @property
+    def playing(self) -> bool:
+        return self.alive and self.started
+
+    def flap(self):
+        if not self.alive:
+            return
+        self.started = True
+        self.vy = self.FLAP_V
+
+    def _spawn_pipe(self):
+        low = self.EDGE_MARGIN + self.GAP / 2
+        high = self.HEIGHT - self.GROUND - self.EDGE_MARGIN - self.GAP / 2
+        if self.pipes:
+            prev = self.pipes[-1]["gap_y"]
+            low, high = max(low, prev - self.MAX_SHIFT), min(high, prev + self.MAX_SHIFT)
+        self.pipes.append({"x": float(self.WIDTH), "gap_y": self.rng.uniform(low, high), "scored": False})
+
+    def tick(self):
+        if not self.alive:
+            return
+        self.frame += 1
+        if not self.started:
+            return
+        self.vy = min(self.vy + self.GRAVITY, self.MAX_FALL)
+        self.bird_y += self.vy
+        for pipe in self.pipes:
+            pipe["x"] -= self.SPEED
+        if not self.pipes or self.pipes[-1]["x"] <= self.WIDTH - self.SPACING:
+            self._spawn_pipe()
+        self.pipes = [p for p in self.pipes if p["x"] + self.PIPE_W > 0]
+
+        for pipe in self.pipes:
+            if not pipe["scored"] and pipe["x"] + self.PIPE_W < self.BIRD_X - self.BIRD_R:
+                pipe["scored"] = True
+                self.score += 1
+
+        top, bottom = self.bird_y - self.BIRD_R, self.bird_y + self.BIRD_R
+        if top < 0 or bottom > self.HEIGHT - self.GROUND:
+            self.alive = False
+            return
+        for pipe in self.pipes:
+            if self.BIRD_X + self.BIRD_R > pipe["x"] and self.BIRD_X - self.BIRD_R < pipe["x"] + self.PIPE_W:
+                if top < pipe["gap_y"] - self.GAP / 2 or bottom > pipe["gap_y"] + self.GAP / 2:
+                    self.alive = False
+                    return
+
+
+class GameWindowBase(tk.Toplevel):
+    """What every minigame window shares: the live leaderboard, the player's colour, reporting the
+    score to the room (when there is one) and cleaning up. A subclass builds its canvas, calls
+    _build_footer(), and implements _state() -> (score, playing)."""
+
+    GAME_KEY = ""
+    GAME_TITLE = ""
+    HELP_TEXT = ""
+    LEADERBOARD_ROWS = 8
+
+    def __init__(self, app, color_value: str):
+        super().__init__(app)
+        self.app = app
+        self.color_value = color_value  # a hex color, or a gradient sentinel
+        self._tick_job = None
+        self._reported = None           # (score, playing) last sent to the room
+        self._board_layout = None       # what the leaderboard's widgets were built for (see refresh_leaderboard)
+        self._board_rows, self._best_label = [], None
+        self.title(self.GAME_TITLE)
+        self.configure(bg=BG_DARK, padx=12, pady=12)
+        self.resizable(False, False)
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.bind("<Escape>", lambda e: self._on_close())
+
+    def _build_footer(self, wrap_px: int):
+        # Fixed two-line labels: text that changes length (a score going 9 -> 10, "Game over…") must never
+        # change the window's size, or macOS redraws the whole window — which looked like a screen flash.
+        self.status_var = tk.StringVar()
+        tk.Label(self, textvariable=self.status_var, bg=BG_DARK, fg=FG_TEXT, font=CHAT_FONT, height=2, wraplength=wrap_px, justify="center").pack(pady=(6, 0))
+        tk.Label(self, text=self.HELP_TEXT, bg=BG_DARK, fg=FG_MUTED, font=(CHAT_FONT[0], 9), height=2, wraplength=wrap_px, justify="center").pack()
+        self.leaderboard_frame = tk.Frame(self, bg=BG_DARK)
+        self.leaderboard_frame.pack(fill="x", pady=(8, 0))
+
+    def _state(self):
+        raise NotImplementedError
+
+    def set_color(self, color_value: str):
+        self.color_value = color_value
+
+    def _gradient_or_flat(self, index: int = 0) -> str:
+        palette = GRADIENT_PALETTES.get(self.color_value)
+        return palette[index % len(palette)] if palette else self.color_value
+
+    def _report(self):
+        """Tell the room our score / whether we're mid-game — only when it changed."""
+        state = self._state()
+        if state != self._reported:
+            self._reported = state
+            self.app.game_report(self.GAME_KEY, *state)
+
+    def rejoin(self):
+        """The room changed (we joined one, or left): say where we are now and redraw the board."""
+        self._reported = None
+        self._report()
+        self.refresh_leaderboard()
+
+    def refresh_leaderboard(self):
+        """Brings the leaderboard up to date (called whenever anyone's score changes — for the person
+        playing, on every point). Widgets are only rebuilt when the board's *shape* changes (who's listed,
+        in what order, in a chat or not); a score changing just rewrites a label's text in place, so the
+        window never relays out mid-game."""
+        try:
+            frame = self.leaderboard_frame
+            in_room = self.app.in_room()
+            me = self.app.game_player_name().lower()
+            # Our own row is always listed (even at 0), so it doesn't pop in — and resize the window — at our first flap.
+            rows = [e for e in self.app.game_boards[self.GAME_KEY].values() if e["best"] > 0 or e["playing"] or e["name"].lower() == me]
+            rows.sort(key=lambda e: (-e["best"], e["name"].lower()))
+            rows = rows[:self.LEADERBOARD_ROWS]
+            my_best = self.app.game_best(self.GAME_KEY)
+            layout = (in_room, tuple((e["name"], self.app.game_name_color(e["name"])) for e in rows))
+            if layout != self._board_layout:
+                self._board_layout = layout
+                self._rebuild_leaderboard(frame, in_room, rows, my_best)
+            for (best_label, playing_label), entry in zip(self._board_rows, rows):
+                self._set_label(best_label, f"  best {entry['best']}")
+                self._set_label(playing_label, f"   ● playing — {entry['score']}" if entry["playing"] else "")
+            if self._best_label is not None:
+                self._set_label(self._best_label, f"Your best on this computer: {my_best}" if my_best else "\u00a0")
+        except tk.TclError:
+            pass  # the window is going away
+
+    @staticmethod
+    def _set_label(label, text: str):
+        if label.cget("text") != text:
+            label.configure(text=text)
+
+    def _rebuild_leaderboard(self, frame, in_room: bool, rows: list, my_best: int = 0):
+        for w in frame.winfo_children(): w.destroy()
+        self._board_rows, self._best_label = [], None
+        title = "Leaderboard — this chat" if in_room else "Leaderboard — not in a chat"
+        tk.Label(frame, text=title, bg=BG_DARK, fg=FG_MUTED, font=BOLD_FONT).pack(anchor="w")
+        if not rows:
+            tk.Label(frame, text="No scores yet — be the first!" if in_room else "No scores yet — go on, give it a go!",
+                     bg=BG_DARK, fg=FG_MUTED, font=CHAT_FONT).pack(anchor="w")
+        for rank, entry in enumerate(rows, 1):
+            row = tk.Frame(frame, bg=BG_DARK)
+            row.pack(fill="x")
+            tk.Label(row, text=f"{rank}.", bg=BG_DARK, fg=FG_MUTED, font=CHAT_FONT, width=3, anchor="e").pack(side="left")
+            tk.Label(row, text=entry["name"], bg=BG_DARK, fg=self.app.game_name_color(entry["name"]), font=BOLD_FONT).pack(side="left", padx=(4, 0))
+            best_label = tk.Label(row, text="", bg=BG_DARK, fg=FG_TEXT, font=CHAT_FONT)
+            best_label.pack(side="left")
+            playing_label = tk.Label(row, text="", bg=BG_DARK, fg=COLOR_PALETTE["green"], font=CHAT_FONT)
+            playing_label.pack(side="left")
+            self._board_rows.append((best_label, playing_label))
+        self._best_label = tk.Label(frame, text="\u00a0", bg=BG_DARK, fg=FG_MUTED, font=(CHAT_FONT[0], 9))  # always there: it fills in later
+        self._best_label.pack(anchor="w", pady=(4, 0))
+        note = "Resets when the chat is restarted." if in_room else "Join a chat and your scores show up for everyone in it."
+        tk.Label(frame, text=note, bg=BG_DARK, fg=FG_MUTED, font=(CHAT_FONT[0], 8)).pack(anchor="w", pady=(2, 0))
+
+    def _on_close(self):
+        if self._tick_job:
+            try: self.after_cancel(self._tick_job)
+            except Exception: pass
+            self._tick_job = None
+        score, playing = self._state()
+        if playing:
+            self.app.game_report(self.GAME_KEY, score, False)  # no longer "playing" once the window is gone
+        if self.app._game_wins.get(self.GAME_KEY) is self:
+            del self.app._game_wins[self.GAME_KEY]
+        self.destroy()
+
+
+class SnakeWindow(GameWindowBase):
+    """Snake. Everyone plays their own local game, but scores are shared live with the room: the
+    leaderboard shows everyone in the chat who has played (and who's playing right now). It lives
+    only as long as the room — it starts empty whenever the chat is restarted."""
+
+    GAME_KEY, GAME_TITLE = "snake", "Snake"
+    HELP_TEXT = "Arrows or WASD to move — Space to restart after a game over"
     ARROW_DIRECTIONS = {
         "Up": (0, -1), "w": (0, -1), "W": (0, -1),
         "Down": (0, 1), "s": (0, 1), "S": (0, 1),
         "Left": (-1, 0), "a": (-1, 0), "A": (-1, 0),
         "Right": (1, 0), "d": (1, 0), "D": (1, 0),
     }
-    LEADERBOARD_ROWS = 8
 
-    def __init__(self, app, player_name: str, color_value: str):
-        super().__init__(app)
-        self.app = app
-        self.player_name = player_name
-        self.color_value = color_value  # a hex color, or a gradient sentinel
-
-        self.title("Snake")
-        self.configure(bg=BG_DARK, padx=12, pady=12)
-        self.resizable(False, False)
-        self.protocol("WM_DELETE_WINDOW", self._on_close)
-
+    def __init__(self, app, color_value: str):
+        super().__init__(app, color_value)
         self.game = SnakeGame()
-        self._tick_job = None
         self._rainbow_offset = 0
-        self._reported = None  # (score, alive) last sent to the room
 
         canvas_w, canvas_h = SNAKE_COLS * SNAKE_CELL_PX, SNAKE_ROWS * SNAKE_CELL_PX
         self.canvas = tk.Canvas(self, width=canvas_w, height=canvas_h, bg=BG_PANEL, highlightthickness=0)
         self.canvas.pack()
-
-        self.status_var = tk.StringVar()
-        tk.Label(self, textvariable=self.status_var, bg=BG_DARK, fg=FG_TEXT, font=CHAT_FONT).pack(pady=(8, 0))
-        tk.Label(self, text="Arrows or WASD to move — Space to restart after a game over", bg=BG_DARK, fg=FG_MUTED, font=(CHAT_FONT[0], 9)).pack()
-
-        self.leaderboard_frame = tk.Frame(self, bg=BG_DARK)
-        self.leaderboard_frame.pack(fill="x", pady=(10, 0))
+        self._build_footer(canvas_w)
 
         for keysym, vec in self.ARROW_DIRECTIONS.items():
             self.bind(f"<KeyPress-{keysym}>", lambda e, v=vec: self.game.set_direction(*v))
         self.bind("<space>", lambda e: self._restart_if_dead())
-        self.bind("<Escape>", lambda e: self._on_close())
 
         self._report()
         self.refresh_leaderboard()
@@ -615,15 +824,8 @@ class SnakeWindow(tk.Toplevel):
         self.focus_set()
         self._loop()
 
-    def set_color(self, color_value: str):
-        self.color_value = color_value
-
-    def _report(self):
-        """Tell the room our score / whether we're mid-game — only when it changed."""
-        state = (self.game.score, self.game.alive)
-        if state != self._reported:
-            self._reported = state
-            self.app.snake_report(self.game.score, self.game.alive)
+    def _state(self):
+        return (self.game.score, self.game.alive)
 
     def _restart_if_dead(self):
         if not self.game.alive:
@@ -647,10 +849,7 @@ class SnakeWindow(tk.Toplevel):
         self._tick_job = self.after(SNAKE_TICK_MS, self._loop)
 
     def _segment_color(self, index: int) -> str:
-        palette = GRADIENT_PALETTES.get(self.color_value)
-        if palette:
-            return palette[(index + self._rainbow_offset) % len(palette)]
-        return self.color_value
+        return self._gradient_or_flat(index + self._rainbow_offset)
 
     def _draw(self):
         self.canvas.delete("all")
@@ -670,35 +869,147 @@ class SnakeWindow(tk.Toplevel):
         if not self.game.alive:
             self.canvas.create_rectangle(0, 0, self.canvas.winfo_reqwidth(), self.canvas.winfo_reqheight(), fill=BG_PANEL, stipple="gray50", outline="")
 
-    def refresh_leaderboard(self):
-        """Redraws from the room's live board (called whenever anyone's score changes)."""
-        for w in self.leaderboard_frame.winfo_children(): w.destroy()
-        tk.Label(self.leaderboard_frame, text="Leaderboard — this chat", bg=BG_DARK, fg=FG_MUTED, font=BOLD_FONT).pack(anchor="w")
-        board = [e for e in self.app.snake_board.values() if e["best"] > 0 or e["playing"]]
-        if not board:
-            tk.Label(self.leaderboard_frame, text="No scores yet — be the first!", bg=BG_DARK, fg=FG_MUTED, font=CHAT_FONT).pack(anchor="w")
-            return
-        board.sort(key=lambda e: (-e["best"], e["name"].lower()))
-        for rank, entry in enumerate(board[:self.LEADERBOARD_ROWS], 1):
-            row = tk.Frame(self.leaderboard_frame, bg=BG_DARK)
-            row.pack(fill="x")
-            tk.Label(row, text=f"{rank}.", bg=BG_DARK, fg=FG_MUTED, font=CHAT_FONT, width=3, anchor="e").pack(side="left")
-            tk.Label(row, text=entry["name"], bg=BG_DARK, fg=self.app.snake_name_color(entry["name"]), font=BOLD_FONT).pack(side="left", padx=(4, 0))
-            tk.Label(row, text=f"  best {entry['best']}", bg=BG_DARK, fg=FG_TEXT, font=CHAT_FONT).pack(side="left")
-            if entry["playing"]:
-                tk.Label(row, text=f"   ● playing — {entry['score']}", bg=BG_DARK, fg=COLOR_PALETTE["green"], font=CHAT_FONT).pack(side="left")
-        tk.Label(self.leaderboard_frame, text="Resets when the chat is restarted.", bg=BG_DARK, fg=FG_MUTED, font=(CHAT_FONT[0], 8)).pack(anchor="w", pady=(4, 0))
 
-    def _on_close(self):
-        if self._tick_job:
-            try: self.after_cancel(self._tick_job)
-            except Exception: pass
-            self._tick_job = None
+class FlappyWindow(GameWindowBase):
+    """Flappy Bird: Space, ↑, W or a click flaps. The bird wears your name colour, like the snake."""
+
+    GAME_KEY, GAME_TITLE = "flappy", "Flappy Bird"
+    HELP_TEXT = "Space, ↑, W or click to flap — Space to restart after a game over"
+    SKY, PIPE, PIPE_EDGE, GROUND_TOP, GROUND_FILL = "#6FC3E8", "#3CB043", "#2A7A31", "#73BF2E", "#DED895"
+    RESTART_DELAY_TICKS = 18   # after dying, ignore flaps for a moment so a frantic last tap doesn't restart at once
+
+    def __init__(self, app, color_value: str):
+        super().__init__(app, color_value)
+        self.game = FlappyGame()
+        self._dead_ticks = 0
+        self._status = ""
+        self.canvas = tk.Canvas(self, width=FlappyGame.WIDTH, height=FlappyGame.HEIGHT, bg=self.SKY, highlightthickness=0)
+        self.canvas.pack()
+        self._build_footer(FlappyGame.WIDTH)
+
+        for keysym in ("space", "Up", "w", "W"):
+            self.bind(f"<KeyPress-{keysym}>", self._flap)
+        self.canvas.bind("<Button-1>", self._flap)
+
+        self._report()
+        self.refresh_leaderboard()
+        self._set_status()
+        self.focus_set()
+        self._loop()
+
+    def _state(self):
+        return (self.game.score, self.game.playing)
+
+    def _flap(self, event=None):
+        game = self.game
+        if game.alive:
+            game.flap()
+            self._report()
+        elif self._dead_ticks >= self.RESTART_DELAY_TICKS:
+            game.reset()
+            self._dead_ticks = 0
+            self._report()
+        self._set_status()
+        return "break"
+
+    def _set_status(self):
+        game = self.game
+        if not game.alive:
+            text = f"Game over — score {game.score}. Press Space to try again."
+        elif not game.started:
+            text = "Press Space or click to start"
+        else:
+            text = f"Score: {game.score}"
+        if text != self._status:
+            self._status = text
+            self.status_var.set(text)
+
+    def _loop(self):
         if self.game.alive:
-            self.app.snake_report(self.game.score, False)  # no longer "playing" once the window is gone
-        if getattr(self.app, "_snake_win", None) is self:
-            self.app._snake_win = None
+            self.game.tick()
+            self._report()
+        else:
+            self._dead_ticks += 1
+        self._set_status()
+        self._draw()
+        self._tick_job = self.after(FLAPPY_TICK_MS, self._loop)
+
+    def _draw(self):
+        c, g = self.canvas, self.game
+        c.delete("all")
+        w, h, ground_top = FlappyGame.WIDTH, FlappyGame.HEIGHT, FlappyGame.HEIGHT - FlappyGame.GROUND
+
+        for pipe in g.pipes:
+            x0, x1 = pipe["x"], pipe["x"] + g.PIPE_W
+            gap_top, gap_bottom = pipe["gap_y"] - g.GAP / 2, pipe["gap_y"] + g.GAP / 2
+            c.create_rectangle(x0, 0, x1, gap_top, fill=self.PIPE, outline=self.PIPE_EDGE, width=2)
+            c.create_rectangle(x0 - 3, gap_top - 16, x1 + 3, gap_top, fill=self.PIPE, outline=self.PIPE_EDGE, width=2)
+            c.create_rectangle(x0, gap_bottom, x1, ground_top, fill=self.PIPE, outline=self.PIPE_EDGE, width=2)
+            c.create_rectangle(x0 - 3, gap_bottom, x1 + 3, gap_bottom + 16, fill=self.PIPE, outline=self.PIPE_EDGE, width=2)
+
+        c.create_rectangle(0, ground_top, w, h, fill=self.GROUND_FILL, outline="")
+        c.create_rectangle(0, ground_top, w, ground_top + 8, fill=self.GROUND_TOP, outline="")
+
+        bob = 0 if g.started else math.sin(g.frame * 0.12) * 5  # idles up and down until the first flap
+        by, bx, r = g.bird_y + bob, g.BIRD_X, g.BIRD_R
+        body = self._gradient_or_flat(g.frame // 4)
+        c.create_oval(bx - r - 2, by - r + 1, bx + r + 2, by + r - 1, fill=body, outline="#222222")
+        wing_up = (g.frame // 6) % 2 == 0 and g.alive
+        wing_y = by - 2 if wing_up else by + 2
+        c.create_oval(bx - 9, wing_y - 3, bx + 1, wing_y + 4, fill="white", outline="#222222")
+        c.create_oval(bx + 3, by - 7, bx + 9, by - 1, fill="white", outline="#222222")
+        c.create_oval(bx + 6, by - 5, bx + 8, by - 3, fill="black", outline="")
+        c.create_polygon(bx + r, by - 1, bx + r + 9, by + 2, bx + r, by + 5, fill="#FF9A1F", outline="#222222")
+
+        score_text = str(g.score)
+        c.create_text(w / 2 + 2, 52, text=score_text, font=(CHAT_FONT[0], 32, "bold"), fill="#222222")
+        c.create_text(w / 2, 50, text=score_text, font=(CHAT_FONT[0], 32, "bold"), fill="white")
+        if not g.alive:
+            c.create_rectangle(0, 0, w, h, fill="#000000", stipple="gray25", outline="")
+            c.create_text(w / 2, h / 2 - 10, text="Game over", font=(CHAT_FONT[0], 24, "bold"), fill="white")
+            c.create_text(w / 2, h / 2 + 24, text=f"Score {g.score}", font=(CHAT_FONT[0], 14), fill="white")
+        elif not g.started:
+            c.create_text(w / 2, h / 2 + 70, text="Press Space to flap", font=(CHAT_FONT[0], 13, "bold"), fill="white")
+
+
+class GamePicker(tk.Toplevel):
+    """Ctrl+Shift+S opens this: pick which minigame to play. Works in a chat or on the home screen."""
+
+    CHOICES = (("snake", "🐍  Snake", "1"), ("flappy", "🐦  Flappy Bird", "2"))
+
+    def __init__(self, app):
+        super().__init__(app)
+        self.app = app
+        self.title("Games")
+        self.configure(bg=BG_PANEL, padx=24, pady=20)
+        self.resizable(False, False)
+        self.transient(app)
+        self.protocol("WM_DELETE_WINDOW", self._close)
+        self.bind("<Escape>", lambda e: self._close())
+        tk.Label(self, text="🎮  Pick a game", bg=BG_PANEL, fg=FG_TEXT, font=TITLE_FONT).pack(anchor="w")
+        where = "Scores are shared with everyone in this chat." if app.in_room() else "Not in a chat — scores stay on this computer."
+        tk.Label(self, text=where, bg=BG_PANEL, fg=FG_MUTED, font=(CHAT_FONT[0], 9)).pack(anchor="w", pady=(4, 12))
+        for key, label, shortcut in self.CHOICES:
+            row = tk.Frame(self, bg=BG_PANEL)
+            row.pack(fill="x", pady=4)
+            make_button(row, label, lambda k=key: self._pick(k), bg=BTN_GREEN, hover_bg=BTN_GREEN_HOVER, padx=16, pady=8).pack(side="left")
+            best = app.game_best(key)
+            tk.Label(row, text=f"  your best: {best}" if best else "", bg=BG_PANEL, fg=FG_MUTED, font=CHAT_FONT).pack(side="left")
+            self.bind(shortcut, lambda e, k=key: self._pick(k))
+        tk.Label(self, text="Press 1 or 2, or click. Esc closes this.", bg=BG_PANEL, fg=FG_MUTED, font=(CHAT_FONT[0], 8)).pack(anchor="w", pady=(10, 0))
+        self.focus_set()
+
+    def _pick(self, key):
+        self._close()
+        self.app.open_game(key)
+
+    def _close(self):
+        if self.app._game_picker is self:
+            self.app._game_picker = None
         self.destroy()
+
+GAME_WINDOWS = {"snake": SnakeWindow, "flappy": FlappyWindow}
+GAME_KEYS = tuple(GAME_WINDOWS)
 
 EMOJI_PICKER_SET = [
     "😀", "😂", "😅", "😊", "😉", "😍", "😘", "😜", "🤔", "😎",
@@ -1429,6 +1740,23 @@ def perform_globalban(fingerprint: str, reason: str) -> str:
 # install time, so the in-app viewer stays complete going forward
 # without needing the whole history re-embedded on every release.
 EMBEDDED_CHANGELOG = [
+    {   "version": "1.4.11",
+        "date": "2026-11-08",
+        "notes": (
+            "New: Flappy Bird! Ctrl+Shift+S now opens a game picker (Snake or Flappy Bird — press 1 or 2, "
+            "or click). Flappy Bird has its own live leaderboard shared with the chat, just like Snake's; "
+            "Space, Up, W or a click flaps, and the bird wears your name colour. The games now work from "
+            "the home screen too, not just inside a chat — your best score per game is remembered on this "
+            "computer, and open game windows stay open as you join or leave a chat. Warnings: a '⚠ Warning' "
+            "button now stays in the chat's top bar while you have a warning you haven't dealt with, so "
+            "closing the pop-up no longer loses the Appeal button (click it, or type /warning). Sending a "
+            "warning appeal now edits 'Sending your appeal…' into 'Appeal sent ✔' instead of adding a new "
+            "line. A banned person's screen now checks for unbans every 6 seconds (was 10). Also fixed: "
+            "the 'New messages' button no longer smears as you scroll (macOS), counts how many messages "
+            "are waiting, and goes away whenever you scroll back to the bottom; and the game windows no "
+            "longer flash when your score goes up."
+        ),
+    },
     {   "version": "1.4.10d",
         "date": "2026-11-06",
         "notes": (
@@ -1873,6 +2201,7 @@ class Hub:
         self.host_nick = {"nick_changes": 0, "nick_locked": False}  # same bookkeeping the guests keep in their client info
         self.local_files = None   # the host's own FileAssembler (set by HostConnection)
         self.snake = {}           # name.lower() -> {"name", "best", "score", "playing"}; lives and dies with the room
+        self.boards = {"snake": self.snake, "flappy": {}}  # one live leaderboard per minigame
         self.unbans = {}          # ip -> {"by", "reason", "time"}: who lifted a ban and why (so the banned person can be told)
         self.appeals = {}         # id -> {"id", "kind", "who", "ip", "number", "status", ...}
         self.appeal_seq = 0
@@ -2074,6 +2403,13 @@ class Hub:
         if sock is not None:
             self.send_private(sock, NOTICE_PREFIX + text)
 
+    def _warn_state_to(self, name: str, number, state: str):
+        """Tells a warned person's app how their warning ended up (their ⚠ button follows) — only if
+        their app understands it; an older one would show the raw protocol text."""
+        sock = self.find_socket_by_name(name)
+        if sock is not None and FEATURE_WARNSYNC in self.get_info(sock).get("features", ()):
+            self.send_private(sock, f"{WARNSTATE_PREFIX}{number}|{state}")
+
     def decide_appeal(self, appeal_id: int, accept: bool, by: str, reason: str):
         """Accepts or rejects an appeal. -> (error or None, reply text, admin-log text).
         Accepting a ban appeal lifts the ban; accepting a warning appeal deletes the warning."""
@@ -2111,6 +2447,7 @@ class Hub:
                 extra = " The warning has been deleted." if error is None else " (That warning had already been removed.)"
             else:
                 self._notice_to(a["who"], f"Your appeal for warning #{a['number']} was rejected by {by}. Reason: {reason}")
+                self._warn_state_to(a["who"], a["number"], "rejected")
                 extra = " The warning stands; they've been told."
         text = f"Appeal #{appeal_id} ({what}) {verb}. Reason: {reason}.{extra}"
         return None, text, f"{verb} appeal #{appeal_id} from {a['who']}. Reason: {reason}"
@@ -2135,6 +2472,7 @@ class Hub:
         if log:
             self.record_mod("warning removed", canonical, by, reason, detail=f"#{number}")
         self._notice_to(canonical, f"Warning #{number} was removed by {by}. Reason: {reason}")
+        self._warn_state_to(canonical, number, "removed")
         return None, canonical, number
 
     def ban_status(self, ip: str) -> dict:
@@ -2302,10 +2640,11 @@ class Hub:
                     group.discard(old_key)
                     group.add(new_key)
             self.typing.pop(canonical_old, None)
-            entry = self.snake.pop(old_key, None)
-            if entry is not None:
-                entry["name"] = new
-                self.snake[new_key] = entry
+            for board in self.boards.values():
+                entry = board.pop(old_key, None)
+                if entry is not None:
+                    entry["name"] = new
+                    board[new_key] = entry
             for key in [k for k in self.warn_log if k[0] == old_key]:
                 self.warn_log[(new_key, key[1])] = self.warn_log.pop(key)
             for record in self.messages.values():  # so they can still edit/delete what they wrote
@@ -2343,38 +2682,45 @@ class Hub:
         self.log_admin_action(by, f"warned {canonical} (warning #{count}). Reason: {reason}")
         return None
 
-    # ---- snake leaderboard ----
+    # ---- minigame leaderboards (Snake, Flappy Bird) ----
 
     @staticmethod
-    def _snake_wire(entry: dict) -> str:
-        return f"{SNAKE_PREFIX}{entry['name']}|{entry['best']}|{entry['score']}|{1 if entry['playing'] else 0}"
+    def _game_wire(game: str, entry: dict) -> str:
+        return f"{GAME_PREFIXES[game]}{entry['name']}|{entry['best']}|{entry['score']}|{1 if entry['playing'] else 0}"
 
-    def update_snake(self, name: str, score, playing: bool, exclude_sock=None, emit: bool = False):
-        """Records a player's current score (their best is the max seen this session) and
-        tells everyone else."""
+    def update_game(self, game: str, name: str, score, playing: bool, exclude_sock=None, emit: bool = False):
+        """Records a player's current score (their best is the max seen this session) and tells
+        everyone else — for Flappy Bird, only the clients that understand its frames."""
+        board = self.boards.get(game)
+        if board is None: return None
         try: score = max(0, min(int(score), 100_000))
         except (TypeError, ValueError): return None
         with self.lock:
-            entry = self.snake.setdefault(name.lower(), {"name": name, "best": 0, "score": 0, "playing": False})
+            entry = board.setdefault(name.lower(), {"name": name, "best": 0, "score": 0, "playing": False})
             entry.update(name=name, score=score, playing=bool(playing))
             entry["best"] = max(entry["best"], score)
             snapshot = dict(entry)
-        self.broadcast(self._snake_wire(snapshot), exclude_sock=exclude_sock)
+        wire = self._game_wire(game, snapshot)
+        if feature := GAME_FEATURES.get(game):
+            self.broadcast_feature(feature, wire, exclude_sock)
+        else:
+            self.broadcast(wire, exclude_sock=exclude_sock)
         if emit:
-            self._emit("snake", snapshot)
+            self._emit("game", {"game": game, "entry": snapshot})
         return snapshot
 
-    def snake_entries(self) -> list:
+    def game_entries(self, game: str) -> list:
         with self.lock:
-            return [dict(e) for e in self.snake.values()]
+            return [dict(e) for e in self.boards.get(game, {}).values()]
 
-    def snake_player_left(self, name: str):
-        with self.lock:
-            entry = self.snake.get(name.lower())
-            still_playing = bool(entry and entry["playing"])
-            score = entry["score"] if entry else 0
-        if still_playing:
-            self.update_snake(name, score, False, emit=True)
+    def game_player_left(self, name: str):
+        for game, board in self.boards.items():
+            with self.lock:
+                entry = board.get(name.lower())
+                still_playing = bool(entry and entry["playing"])
+                score = entry["score"] if entry else 0
+            if still_playing:
+                self.update_game(game, name, score, False, emit=True)
 
     # ---- whispers ----
 
@@ -3179,9 +3525,10 @@ def _process_guest_message(text, sock, guest_name, hub: Hub, host_name, event_qu
             _guest_notice(hub, sock, error)
         return
 
-    if text.startswith(SNAKE_PREFIX):
-        score, _, playing = text[len(SNAKE_PREFIX):].partition("|")
-        hub.update_snake(guest_name, score, playing == "1", exclude_sock=sock, emit=True)
+    if any(text.startswith(prefix) for prefix in GAME_PREFIXES.values()):
+        game, prefix = next((g, p) for g, p in GAME_PREFIXES.items() if text.startswith(p))
+        score, _, playing = text[len(prefix):].partition("|")
+        hub.update_game(game, guest_name, score, playing == "1", exclude_sock=sock, emit=True)
         return
 
     if text.startswith(DND_PREFIX):
@@ -3203,6 +3550,9 @@ def _process_guest_message(text, sock, guest_name, hub: Hub, host_name, event_qu
 
     if text.startswith(FEATURES_PREFIX):
         hub.set_features(sock, [f for f in text[len(FEATURES_PREFIX):].split(",") if f])
+        if FEATURE_FLAPPY in hub.get_info(sock).get("features", ()):  # catch them up on the Flappy Bird board
+            for entry in hub.game_entries("flappy"):
+                hub.send_private(sock, Hub._game_wire("flappy", entry))
         # Only a client that announced itself gets our reply — an older one never
         # does, so it never sees protocol text it can't parse.
         hub.send_private(sock, FEATURES_PREFIX + ",".join(sorted(HOST_FEATURES)))
@@ -3309,16 +3659,16 @@ def _handle_ban_appeal(sock, addr, hub: Hub, payload: str):
 def _handle_warning_appeal(payload: str, sock, guest_name: str, hub: Hub):
     appeal = parse_appeal(payload)
     if appeal is None or appeal["kind"] != "warn":
-        return _guest_notice(hub, sock, "That appeal couldn't be read.")
+        return _guest_notice(hub, sock, APPEAL_UNREADABLE_TEXT)
     record = hub.mark_warning_appealed(guest_name, appeal["number"])
     if record is None:
-        return _guest_notice(hub, sock, "There's no such warning to appeal, or you've already appealed it.")
+        return _guest_notice(hub, sock, APPEAL_MISSING_TEXT)
     appeal_id = hub.register_appeal("warn", record.get("name", guest_name), number=appeal["number"])
     hub.admin_broadcast(format_appeal(
         f"Warning Appeal #{appeal_id}", guest_name,
         f"is appealing warning #{appeal['number']} (from {record['by']}: \"{record['reason']}\"). "
         f"To decide: /accept {appeal_id} [reason]  or  /reject {appeal_id} [reason]", appeal["answers"]))
-    _guest_notice(hub, sock, "Your appeal was sent to the host and admins.")
+    _guest_notice(hub, sock, APPEAL_SENT_TEXT)
 
 def handle_guest_connection(sock, addr, hub: Hub, host_name: str, event_queue: queue.Queue):
     try:
@@ -3395,8 +3745,8 @@ def handle_guest_connection(sock, addr, hub: Hub, host_name: str, event_queue: q
             info = hub.get_info(sock)
             hub.send_private(sock, MUTE_STATUS_PREFIX + f"1:{info['muted_until']}")
         hub.mark_ready(sock)  # from here on the client receives broadcasts normally
-        for entry in hub.snake_entries():  # catch the joiner up on the live Snake leaderboard
-            hub.send_private(sock, Hub._snake_wire(entry))
+        for entry in hub.game_entries("snake"):  # catch the joiner up on the live Snake leaderboard
+            hub.send_private(sock, Hub._game_wire("snake", entry))
         hub.broadcast_colormap()
         event_queue.put(("colormap", hub.colormap_snapshot()))
         event_queue.put(("roster", hub.names()))
@@ -3423,7 +3773,7 @@ def handle_guest_connection(sock, addr, hub: Hub, host_name: str, event_queue: q
         try: sock.close()
         except OSError: pass
         if not hub.closed:
-            hub.snake_player_left(guest_name)
+            hub.game_player_left(guest_name)
             name = info["name"] if info else guest_name
             if not (info and info.get("kicked")):
                 event_queue.put(("system", f"{name} disconnected"))
@@ -3447,9 +3797,10 @@ HELP_TEXT = (
     "Commands: /mute <name> <min> [reason], /unmute <name>, /kick <name> [reason], "
     "/ban <name> [min|perm] [reason], /unban <ip or name> [reason], /slowmode [sec], /admin <name>, /unadmin <name>, "
     "/warn <name> [reason], /unwarn <name> [warning #] [reason], /history [name], /appeals, "
-    "/accept <appeal #> [reason], /reject <appeal #> [reason], /color <name>, /colors, /list, /clear [lines], /whisper <name> <msg>, "
+    "/accept <appeal #> [reason], /reject <appeal #> [reason], /color <name>, /colors, /list, /clear [lines], /warning (see your latest warning, and appeal it), /whisper <name> <msg>, "
     "/nick <new name> (you can change yours twice per chat), /help — "
     "host only: /ipban <ip> [min|perm] [reason], /rename <current name> <new name>. "
+    "Ctrl+Shift+S opens the games (Snake, Flappy Bird) — in a chat or on the home screen. "
     "Paste an image with Ctrl+V (Cmd+V on Mac) to send it. "
     "Right-click a message to reply to it, or report it to the admins. "
     "Right-click a message or attachment to edit/delete it (admins can delete anyone's, but never whispers). "
@@ -3821,6 +4172,12 @@ def guest_recv_loop(sock, fernet, event_queue, local_colors, colors_lock, known_
             return True
         if text.startswith(FEATURES_PREFIX):
             host_features.update(f for f in text[len(FEATURES_PREFIX):].split(",") if f)
+            put(("features", None))  # now we know what the host understands (an open game can announce itself)
+            return True
+        if text.startswith(WARNSTATE_PREFIX):
+            number, _, state = text[len(WARNSTATE_PREFIX):].partition("|")
+            if number.isdigit():
+                put(("warn_state", {"number": int(number), "state": state}))
             return True
         if text.startswith(REPLY_PREFIX):
             try:
@@ -3848,13 +4205,14 @@ def guest_recv_loop(sock, fernet, event_queue, local_colors, colors_lock, known_
             except ValueError:
                 pass
             return True
-        if text.startswith(SNAKE_PREFIX):
-            try:
-                name, best, score, playing = text[len(SNAKE_PREFIX):].rsplit("|", 3)
-                put(("snake", {"name": name, "best": int(best), "score": int(score), "playing": playing == "1"}))
-            except ValueError:
-                pass
-            return True
+        for game, prefix in GAME_PREFIXES.items():
+            if text.startswith(prefix):
+                try:
+                    name, best, score, playing = text[len(prefix):].rsplit("|", 3)
+                    put(("game", {"game": game, "entry": {"name": name, "best": int(best), "score": int(score), "playing": playing == "1"}}))
+                except ValueError:
+                    pass
+                return True
         if text.startswith(WHISPER_PREFIX):
             msg_id, _, rest = text[len(WHISPER_PREFIX):].partition("|")
             sender, _, rest = rest.partition("|")
@@ -4011,8 +4369,8 @@ class HostConnection:
             route_reply_ping(self.hub, self.name, payload, lambda t: self.event_queue.put(("system", t)),
                              on_host_ping=lambda who: None)
 
-    def send_snake(self, score: int, playing: bool):
-        self.hub.update_snake(self.name, score, playing)
+    def send_game(self, game: str, score: int, playing: bool):
+        self.hub.update_game(game, self.name, score, playing)
 
     def send_dnd(self, active: bool):
         if self.hub.set_dnd(self.name, active):
@@ -4262,8 +4620,11 @@ class GuestConnection:
     def send_typing(self, started: bool):
         self._send((TYPING_START_PREFIX if started else TYPING_STOP_PREFIX) + self.name, report=False)
 
-    def send_snake(self, score: int, playing: bool):
-        self._send(f"{SNAKE_PREFIX}{score}|{1 if playing else 0}", report=False)
+    def send_game(self, game: str, score: int, playing: bool):
+        feature = GAME_FEATURES.get(game)
+        if feature and feature not in self.host_features:
+            return  # an older host would show the frame as a chat line
+        self._send(f"{GAME_PREFIXES[game]}{score}|{1 if playing else 0}", report=False)
 
     def send_dnd(self, active: bool):
         verb = "turned on" if active else "turned off"
@@ -4419,7 +4780,7 @@ def resolve_join_target(room_code: str, manual_target: str = None):
 class ChatApp(tk.Tk):
     BUILTIN_STICKERS = {"GG": "#57F287", "RIP": "#ED4245", "HELLO": "#5B8CFF", "WOW": "#FEE75C", "BRUH": "#FFA347"}
     REACTION_CHOICES = ("😀", "😂", "❤️", "👍", "🔥", "😢", "😡")
-    BASE_COMMANDS = ("/color", "/colors", "/list", "/clear", "/whisper", "/nick", "/help")
+    BASE_COMMANDS = ("/color", "/colors", "/list", "/clear", "/whisper", "/nick", "/warning", "/help")
     ADMIN_COMMANDS = ("/mute", "/unmute", "/kick", "/ban", "/unban", "/warn", "/unwarn", "/history", "/appeals",
                       "/accept", "/reject", "/slowmode", "/admin", "/unadmin")
     PLAYER_ARG_COMMANDS = frozenset({"/mute", "/unmute", "/kick", "/ban", "/warn", "/unwarn", "/history", "/rename", "/whisper", "/admin", "/unadmin"})
@@ -4459,11 +4820,14 @@ class ChatApp(tk.Tk):
         self._picker_anchors = {}      # picker name -> the button that opens it
         self.photo_cache = []          # keeps PhotoImages alive — Tk drops them otherwise
         self.suggest_popup = None
-        self._snake_win = None
+        self._game_wins = {}           # game key -> its open window (they outlive chats: you can play on the home screen)
+        self._game_picker = None
         self._rainbow_instance_seq = 0
         self._job_seq = 0
         self._session_id = 0
         self._jump_visible = False
+        self._unseen = 0               # messages that arrived out of view since the "New messages" button appeared
+        self._jump_sync_pending = False
         self.sent_history, self._history_pos, self._history_draft = [], None, ""
         self._active_dnd_bind = None
         saved_bind = self.settings.get("dnd_keybind")
@@ -4484,14 +4848,16 @@ class ChatApp(tk.Tk):
             "appeal_result": self._on_appeal_result,
             "ban_status": self._on_ban_status,
             "warned": self._on_warned,
-            "snake": self._on_snake_event,
+            "game": self._on_game_event,
+            "features": lambda _: self._games_context_changed(),
+            "warn_state": self._on_warn_state,
             "upload_done": self._on_upload_done,
             "upload_progress": self._on_upload_progress,
             "transfer_progress": self._on_transfer_progress,
             "msg_edit": self._on_msg_edit,
             "msg_delete": self._on_msg_delete,
             "system": self.append_system_line,
-            "private": self.append_private_line,
+            "private": self._on_private_text,
             "roster": self.update_roster,
             "colormap": self._on_colormap_event,
             "typing": self.update_typing,
@@ -4512,7 +4878,7 @@ class ChatApp(tk.Tk):
         self.connect_frame.pack(fill="both", expand=True)
         self._focus_first_empty()
 
-        self.bind_all(SNAKE_KEYBIND, self.on_open_snake)
+        self.bind_all(GAMES_KEYBIND, self.on_open_games)
         self.bind("<FocusIn>", self._on_focus_in)
         self.bind_all("<Button-1>", self._on_global_click, add="+")  # click-away closes the in-window pickers
         self.protocol("WM_DELETE_WINDOW", self.on_close)
@@ -4532,11 +4898,12 @@ class ChatApp(tk.Tk):
         self._session_id += 1          # lets late events from a previous chat be recognised and ignored
         self._reply_to = None          # {"id", "author", "snippet"} while composing a reply
         self._appealed_warnings = set()  # warning numbers we've already appealed
-        self._warn_popups = {}           # warning number -> its pop-up's name (so appealing can close it)
+        self._latest_warning = None      # {"by", "count", "reason", "state"} — only the newest warning is kept (see the ⚠ button)
+        self._appeal_pending = None      # {"number", "key"} while a warning appeal's "Sending…" line awaits the host's answer
         self._room_code = ""
         self._upload_jobs = {}         # job id -> {"name", "to", "pct"} for files we're sending
         self._incoming = {}            # msg_id -> {"filename", "sender", "pct"} for big files arriving
-        self.snake_board = {}          # name.lower() -> {"name", "best", "score", "playing"}: the room's live Snake scores
+        self.game_boards = {key: {} for key in GAME_KEYS}  # game -> name.lower() -> {"name", "best", "score", "playing"}: the room's live scores
         self.typing_last_seen = {}
         self.user_msg_times = {}       # name.lower() -> recent message timestamps (spam ranking)
         self.user_last_msg_time = {}   # name.lower() -> timestamp of their last message (idle ranking)
@@ -4663,23 +5030,47 @@ class ChatApp(tk.Tk):
             self._trim_log()
 
     def _at_bottom(self, precise: bool = False) -> bool:
-        """Is the reader looking at the end of the log? `precise` first lets Tk finish
-        pending layout and also accepts "last line is visible" — slower, so it's used
-        only for the delayed re-check, not on every appended line."""
+        """Is the reader looking at the end of the log? `precise` first lets Tk finish pending layout —
+        slower, so it's used only for the delayed re-checks, not on every appended line.
+        The last line counts as in view when it's fully on screen (or the view fraction reaches 1)."""
         if not self.log.winfo_ismapped():
             return True  # not on screen yet (e.g. the room is still starting) — nothing to be "behind" on
         if precise:
             self.log.update_idletasks()
-            if self.log.dlineinfo("end-1c") is not None:
+            info = self.log.dlineinfo("end-1c")
+            if info is not None and info[1] + info[3] <= self.log.winfo_height() + 1:
                 return True
         return self.log.yview()[1] >= 0.999
 
+    def _on_log_yscroll(self, first, last):
+        """Tk calls this whenever the log's visible range changes, however it changed."""
+        self.log.vbar.set(first, last)
+        if self._jump_visible and not self._jump_sync_pending:
+            self._jump_sync_pending = True
+            self.after_idle(self._sync_jump_btn)
+
+    def _wheel_over_jump_btn(self, event):
+        if event.num == 4: units = -3
+        elif event.num == 5: units = 3
+        elif sys.platform == "darwin": units = -event.delta  # macOS reports small per-notch deltas
+        else: units = -int(event.delta / 120) * 3
+        if units:
+            self.log.yview_scroll(units, "units")
+        return "break"
+
     def _show_jump(self):
-        if not self._jump_visible and self.log.winfo_ismapped():
-            self.jump_btn.place(relx=1.0, rely=1.0, anchor="se", x=-12, y=-8)
+        """Something new arrived out of view: show the button, with how many (called once per arrival)."""
+        if not self.log.winfo_ismapped():
+            return
+        self._unseen += 1
+        self.jump_btn.configure(text="↓ 1 new message" if self._unseen == 1 else f"↓ {self._unseen} new messages")
+        if not self._jump_visible:
+            self.jump_btn.place(in_=self.log, relx=1.0, rely=1.0, anchor="se", x=-12, y=-8)
             self._jump_visible = True
+        self.jump_btn.lift()
 
     def _hide_jump(self):
+        self._unseen = 0
         if self._jump_visible:
             self.jump_btn.place_forget()
             self._jump_visible = False
@@ -4689,6 +5080,8 @@ class ChatApp(tk.Tk):
         self._hide_jump()
 
     def _sync_jump_btn(self):
+        """Hides the button once the reader has got back to the end of the log, by any route."""
+        self._jump_sync_pending = False
         if self._jump_visible and self._at_bottom(precise=True):
             self._hide_jump()
 
@@ -5098,8 +5491,13 @@ class ChatApp(tk.Tk):
             self._appealed_warnings.add(number)
             if self.connection is not None:
                 self.connection.send_appeal({"kind": "warn", "number": number, "answers": answers})
-                self.append_system_line(f"Sending your appeal for warning #{number}…")
-            self._close_popup(self._warn_popups.pop(number, ""))  # the warning pop-up has done its job
+                key = f"appeal_{number}"
+                self._status_line_new(key, f"Sending your appeal for warning #{number}…")
+                self._appeal_pending = {"number": number, "key": key}
+                self._set_timer("appeal_wait", 12000, lambda: self._status_line_update(
+                    key, f"Still waiting for the host to confirm your appeal for warning #{number}…"))
+            self._close_popup("warning_view")  # the warning pop-up has done its job
+            self._refresh_warn_button()
 
         self._open_appeal_form(f"appeal_warn_{number}", f"Appeal warning #{number}", intro, WARN_APPEAL_QUESTIONS, submit)
 
@@ -5170,10 +5568,9 @@ class ChatApp(tk.Tk):
         self.dnd_btn.disabled = False
         self._set_dnd_button_style(False)
         self._apply_mute_state(False)
-        if self._snake_win is not None:
-            try: self._snake_win._on_close()
-            except Exception: pass
-            self._snake_win = None
+        self._close_popup("warning_view")
+        self._cancel_timer("appeal_wait")
+        self._refresh_warn_button()
         for child in self.member_list_frame.winfo_children(): child.destroy()
         self._update_window_title()
 
@@ -5198,6 +5595,10 @@ class ChatApp(tk.Tk):
             )
         else:
             self.append_system_line(f"You joined Room {room_code} as {name}. Type /help for commands.")
+        # Open game windows carry on. A host's can say where it stands at once; a guest's does so once the
+        # host has answered our feature announcement (see the "features" event) — until then, just redraw.
+        if mode == "host": self._games_context_changed()
+        else: self._refresh_games()
 
     def _on_room_code_changed(self, payload):
         """Our IP changed while hosting, so the Room Code did too."""
@@ -5230,11 +5631,12 @@ class ChatApp(tk.Tk):
         for key, author in list(self._msg_authors.items()):
             if author.lower() == old_key:
                 self._msg_authors[key] = new
-        entry = self.snake_board.pop(old_key, None)
-        if entry is not None:
-            entry["name"] = new
-            self.snake_board[new_key] = entry
-            self._refresh_snake()
+        for key, board in self.game_boards.items():
+            entry = board.pop(old_key, None)
+            if entry is not None:
+                entry["name"] = new
+                board[new_key] = entry
+                self._refresh_games(key)
         self.typing_last_seen.pop(old, None)
         self.update_roster([new if n.lower() == old_key else n for n in self.current_roster])
         if by.lower() == old_key:
@@ -5244,21 +5646,102 @@ class ChatApp(tk.Tk):
 
     def _on_warned(self, payload):
         by, count, reason = payload["by"], payload["count"], payload["reason"]
+        self._latest_warning = {"by": by, "count": count, "reason": reason, "state": "active"}
         self.append_private_line(f"⚠ Warning #{count} from {by}: {reason}")
         self.bell()
-        name = f"warning_{time.time_ns()}"
-        popup = self._open_dialog(name, "⚠ Warning", padx=24, pady=20)
+        self._close_popup("warning_view")  # a newer warning replaces whatever was showing
+        self._refresh_warn_button()
+        self._show_warning_dialog()
+
+    def _refresh_warn_button(self):
+        """The ⚠ button in the top bar: there for as long as we hold a warning, so closing the pop-up
+        never costs us the Appeal button."""
+        warning = self._latest_warning
+        if warning is None:
+            self.warn_btn.pack_forget()
+            return
+        number = warning["count"]
+        if warning["state"] == "rejected":
+            note = " · appeal rejected"
+        elif number in self._appealed_warnings:
+            note = " · appeal sent"
+        else:
+            note = ""
+        self.warn_btn.label.configure(text=f"⚠ Warning #{number}{note}")
+        self.warn_btn.pack(side="right", padx=(12, 0), pady=6, after=self.dnd_btn)
+
+    def _show_warning_dialog(self):
+        """Shows our latest warning, with the Appeal button while there's still an appeal to make."""
+        warning = self._latest_warning
+        if warning is None:
+            return messagebox.showinfo("Warning", "You don't have any warnings right now.", parent=self)
+        by, count, reason = warning["by"], warning["count"], warning["reason"]
+        popup = self._open_dialog("warning_view", "⚠ Warning", padx=24, pady=20)
         if popup is None:
             return
-        self._warn_popups[count] = name
         tk.Label(popup, text="⚠  You have been warned", bg=BG_PANEL, fg=COLOR_PALETTE["red"], font=(CHAT_FONT[0], 14, "bold")).pack(anchor="w")
         tk.Label(popup, text=f"By {by}   ·   warning #{count}", bg=BG_PANEL, fg=FG_MUTED, font=CHAT_FONT).pack(anchor="w", pady=(6, 10))
         tk.Label(popup, text=reason, bg=BG_PANEL, fg=FG_TEXT, font=CHAT_FONT, wraplength=380, justify="left").pack(anchor="w")
         buttons = tk.Frame(popup, bg=BG_PANEL)
         buttons.pack(anchor="e", pady=(16, 0))
-        make_button(buttons, "Appeal", lambda: self._open_warning_appeal(count, by, reason), bg=COLOR_PALETTE["blue"], hover_bg=BTN_BLUE_HOVER, padx=16, pady=5).pack(side="left", padx=(0, 8))
-        make_button(buttons, "OK", lambda: self._close_popup(name), bg=BTN_NEUTRAL, hover_bg=BTN_NEUTRAL_HOVER, padx=18, pady=5).pack(side="left")
+        if warning["state"] == "rejected":
+            tk.Label(popup, text="Your appeal was rejected — the warning stands.", bg=BG_PANEL, fg=COLOR_PALETTE["red"], font=CHAT_FONT).pack(anchor="w", pady=(10, 0))
+        elif count in self._appealed_warnings:
+            tk.Label(popup, text="Appeal sent ✔ — the host and admins have it.", bg=BG_PANEL, fg=COLOR_PALETTE["green"], font=CHAT_FONT).pack(anchor="w", pady=(10, 0))
+        else:
+            make_button(buttons, "Appeal", lambda: self._open_warning_appeal(count, by, reason), bg=COLOR_PALETTE["blue"], hover_bg=BTN_BLUE_HOVER, padx=16, pady=5).pack(side="left", padx=(0, 8))
+        make_button(buttons, "Close", lambda: self._close_popup("warning_view"), bg=BTN_NEUTRAL, hover_bg=BTN_NEUTRAL_HOVER, padx=18, pady=5).pack(side="left")
+        tk.Label(popup, text="Closing this is fine — the ⚠ button at the top of the chat (or /warning) brings it back.", bg=BG_PANEL, fg=FG_MUTED, font=(CHAT_FONT[0], 8)).pack(anchor="w", pady=(10, 0))
         popup.lift()
+
+    def _on_warn_state(self, payload):
+        """The host tells us how our latest warning ended up: removed, or its appeal rejected."""
+        warning = self._latest_warning
+        if warning is None or warning["count"] != payload["number"]:
+            return  # not the warning we're showing
+        reopen = "warning_view" in self._popups
+        self._close_popup("warning_view")
+        if payload["state"] == "removed":
+            self._latest_warning = None
+        elif payload["state"] == "rejected":
+            warning["state"] = "rejected"
+            self._appealed_warnings.add(warning["count"])
+        self._refresh_warn_button()
+        if reopen and self._latest_warning is not None:
+            self._show_warning_dialog()
+
+    # ---- the "Sending your appeal…" line that becomes "Appeal sent ✔" ----
+
+    def _status_line_new(self, key: str, text: str):
+        """A system line we can rewrite later with _status_line_update (it's tagged with `key`)."""
+        with self._log_append():
+            self.log.insert("end", f"* {text}", ("system", f"status_{key}"))
+            self.log.insert("end", "\n", ("system",))
+
+    def _status_line_update(self, key: str, text: str):
+        tag = f"status_{key}"
+        ranges = self.log.tag_ranges(tag)
+        if not ranges:  # the line is gone (the log was cleared) — say it again as a new line
+            return self.append_system_line(text)
+        with self._log_edit():
+            start, end = ranges[0], ranges[1]
+            self.log.delete(start, end)
+            self.log.insert(start, f"* {text}", ("system", tag))
+
+    def _on_private_text(self, text: str):
+        """A private line from the host. If it's the answer to a warning appeal we just sent, it rewrites
+        the "Sending…" line; anything else is shown as usual."""
+        pending = self._appeal_pending
+        if pending is not None and text in APPEAL_REPLY_TEXTS:
+            self._appeal_pending = None
+            self._cancel_timer("appeal_wait")
+            number = pending["number"]
+            if text == APPEAL_SENT_TEXT:
+                self._status_line_update(pending["key"], f"Appeal sent for warning #{number} ✔ — the host and admins have it.")
+            else:
+                self._status_line_update(pending["key"], f"Couldn't send your appeal for warning #{number}: {text}")
+            return
+        self.append_private_line(text)
 
     def _return_to_connect_screen(self, message, kind):
         self._teardown_connection()
@@ -5287,15 +5770,15 @@ class ChatApp(tk.Tk):
 
     def _teardown_connection(self):
         self._teardown_popups()
-        if self._snake_win is not None:  # the room is gone, so is its leaderboard
-            try: self._snake_win._on_close()
-            except Exception: pass
-            self._snake_win = None
+        self._close_popup("warning_view")
         self._stop_typing_signal()
         if self.connection:
             try: self.connection.close()
             except Exception: pass
             self.connection = None
+            # The room is gone, and so are its leaderboards — but open games stay open (home screen play).
+            self.game_boards = {key: {} for key in GAME_KEYS}
+            self._games_context_changed()
 
     # ------------------------------------------------------------------
     # Chat screen
@@ -5316,6 +5799,8 @@ class ChatApp(tk.Tk):
         for bind in ("<Button-2>", "<Button-3>"):
             self.dnd_btn.bind(bind, lambda e: self.on_dnd_keybind_picker())
             self.dnd_btn.label.bind(bind, lambda e: self.on_dnd_keybind_picker())
+
+        self.warn_btn = make_button(top, "⚠ Warning", self._show_warning_dialog, bg="#B8860B", hover_bg="#D4A017", padx=12, pady=5)  # shown by _refresh_warn_button
 
         body = tk.Frame(self.chat_frame, bg=BG_DARK)  # packed last — see the end of this method
 
@@ -5339,12 +5824,18 @@ class ChatApp(tk.Tk):
         # Hide the "new messages" button once the reader scrolls back to the end
         # (also when the window is resized, which can put the end back in view).
         self.log.bind("<Configure>", lambda e: self.after_idle(self._sync_jump_btn), add="+")
-        for widget in (self.log, self.log.vbar):
-            for bind in ("<MouseWheel>", "<Button-4>", "<Button-5>", "<ButtonRelease-1>", "<KeyRelease>"):
-                widget.bind(bind, lambda e: self.after_idle(self._sync_jump_btn), add="+")
 
-        self.jump_btn = tk.Label(self.log, text="↓ New messages", bg=COLOR_PALETTE["blue"], fg="white", font=BOLD_FONT, padx=10, pady=4, cursor="hand2")
+        # The button sits OVER the log but is not a child of it: on macOS, Tk scrolls a Text by copying its
+        # pixels, and a child widget gets copied along too — which smears the button up the screen
+        # as you scroll. A sibling placed with in_= isn't part of that copy.
+        self.jump_btn = tk.Label(body, text="↓ New messages", bg=COLOR_PALETTE["blue"], fg="white", font=BOLD_FONT, padx=10, pady=4, cursor="hand2")
         self.jump_btn.bind("<Button-1>", lambda e: self._scroll_to_bottom())
+        # The wheel over the button would otherwise do nothing — pass it on to the log.
+        for bind in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+            self.jump_btn.bind(bind, self._wheel_over_jump_btn)
+        # Every change of the view — wheel, trackpad, dragging the scrollbar, keys, a resize — reaches us
+        # through the scrollbar callback, so the button can't miss the reader getting back to the bottom.
+        self.log.configure(yscrollcommand=self._on_log_yscroll)
 
         member_panel = tk.Frame(body, bg=BG_PANEL, width=160)
         member_panel.pack(side="right", fill="y")
@@ -5672,6 +6163,13 @@ class ChatApp(tk.Tk):
         first_word = text.split()[0].lower()
         if first_word == "/clear":
             self._handle_clear_command(text.split())
+            return "break"
+
+        if first_word == "/warning":
+            if self._latest_warning is None:
+                self.append_system_line("You don't have any warnings right now.")
+            else:
+                self._show_warning_dialog()
             return "break"
 
         if first_word == "/globalban":
@@ -6128,27 +6626,47 @@ class ChatApp(tk.Tk):
         self._teardown_connection()
         self.destroy()
 
-    # ---- snake ----
+    # ---- minigames (Snake, Flappy Bird) ----
 
-    def on_open_snake(self, event=None):
-        if not self.connection:
-            return  # only makes sense once you're actually in a chat session
-        if self._snake_win is not None:
+    def in_room(self) -> bool:
+        return self.connection is not None
+
+    def game_player_name(self) -> str:
+        """Who a game's score belongs to: our chat name in a room, otherwise whatever is in the name box."""
+        if self.connection is not None and self.my_name:
+            return self.my_name
+        return self.name_entry.get().strip() or self.my_name or "Player"
+
+    def on_open_games(self, event=None):
+        """Ctrl+Shift+S — works anywhere in the app, in a chat or not."""
+        if self._game_picker is not None:
             try:
-                self._snake_win.lift()
-                self._snake_win.focus_force()
-            except Exception:
-                pass
-            return "break"
-        self._snake_win = SnakeWindow(self, self.my_name, self._snake_color())
+                self._game_picker.lift()
+                self._game_picker.focus_force()
+                return "break"
+            except tk.TclError:
+                self._game_picker = None
+        self._game_picker = GamePicker(self)
         return "break"
 
-    def _snake_color(self) -> str:
-        """The snake wears your name's colour — a flat colour or one of the gradients."""
-        fallback = HOST_COLOR if isinstance(self.connection, HostConnection) else FG_TEXT
-        return self.known_colors.get(self.my_name.lower()) or fallback
+    def open_game(self, key: str):
+        win = self._game_wins.get(key)
+        if win is not None:
+            try:
+                win.deiconify()
+                win.lift()
+                win.focus_force()
+                return
+            except tk.TclError:
+                self._game_wins.pop(key, None)
+        self._game_wins[key] = GAME_WINDOWS[key](self, self._game_color())
 
-    def snake_name_color(self, name: str) -> str:
+    def _game_color(self) -> str:
+        """The snake / bird wears your name's colour — a flat colour or one of the gradients."""
+        fallback = HOST_COLOR if isinstance(self.connection, HostConnection) else FG_TEXT
+        return self.known_colors.get(self.game_player_name().lower()) or fallback
+
+    def game_name_color(self, name: str) -> str:
         color = self.known_colors.get(name.lower(), FG_TEXT)
         palette = GRADIENT_PALETTES.get(color)
         if not palette:
@@ -6157,22 +6675,47 @@ class ChatApp(tk.Tk):
         luminance = lambda c: 0.299 * int(c[1:3], 16) + 0.587 * int(c[3:5], 16) + 0.114 * int(c[5:7], 16)
         return max(palette, key=luminance)
 
-    def snake_report(self, score: int, playing: bool):
-        """Called by the Snake window: update our row on the board and tell the room."""
-        entry = self.snake_board.setdefault(self.my_name.lower(), {"name": self.my_name, "best": 0, "score": 0, "playing": False})
-        entry.update(score=score, playing=playing)
+    def game_best(self, key: str) -> int:
+        bests = self.settings.get("game_bests")
+        value = bests.get(key, 0) if isinstance(bests, dict) else 0
+        return value if isinstance(value, int) and value > 0 else 0
+
+    def game_report(self, key: str, score: int, playing: bool):
+        """Called by a game window: update our row on its board, remember a new personal best, and tell the room."""
+        name = self.game_player_name()
+        entry = self.game_boards[key].setdefault(name.lower(), {"name": name, "best": 0, "score": 0, "playing": False})
+        entry.update(name=name, score=score, playing=playing)
         entry["best"] = max(entry["best"], score)
+        if score > self.game_best(key):
+            bests = self.settings.get("game_bests")
+            if not isinstance(bests, dict):
+                bests = self.settings["game_bests"] = {}
+            bests[key] = score
+            self._game_best_unsaved = True
+        if not playing and getattr(self, "_game_best_unsaved", False):  # a game just ended: write the new best down
+            self._game_best_unsaved = False
+            self._save_settings()
         if self.connection is not None:
-            self.connection.send_snake(score, playing)
-        self._refresh_snake()
+            self.connection.send_game(key, score, playing)
+        self._refresh_games(key)
 
-    def _on_snake_event(self, entry):
-        self.snake_board[entry["name"].lower()] = entry
-        self._refresh_snake()
+    def _on_game_event(self, payload):
+        board = self.game_boards.get(payload["game"])
+        if board is not None:
+            board[payload["entry"]["name"].lower()] = payload["entry"]
+            self._refresh_games(payload["game"])
 
-    def _refresh_snake(self):
-        if self._snake_win is not None:
-            self._snake_win.refresh_leaderboard()
+    def _refresh_games(self, key: str = None):
+        for game, win in list(self._game_wins.items()):
+            if key is None or game == key:
+                win.refresh_leaderboard()
+
+    def _games_context_changed(self):
+        """We joined or left a chat: every open game redraws its board and says where it stands (to the
+        room, if we're in one — otherwise just to the home-screen board)."""
+        for win in list(self._game_wins.values()):
+            try: win.rejoin()
+            except tk.TclError: pass
 
     # ------------------------------------------------------------------
     # Stickers + emoji
@@ -6352,9 +6895,9 @@ class ChatApp(tk.Tk):
     def _on_colormap_event(self, colors):
         self.known_colors.update(colors)
         self.update_roster(self.current_roster)
-        if self._snake_win is not None:
-            self._snake_win.set_color(self._snake_color())  # keep the snake matching our name colour
-            self._snake_win.refresh_leaderboard()           # …and the names on the leaderboard
+        for win in list(self._game_wins.values()):
+            win.set_color(self._game_color())  # keep the snake / bird matching our name colour
+            win.refresh_leaderboard()          # …and the names on the leaderboard
 
     # ------------------------------------------------------------------
     # Chat log rendering

@@ -1,7 +1,7 @@
 {
-  "version": "1.4.10d",
+  "version": "1.4.11",
   "url": "https://raw.githubusercontent.com/Richy023/chat-gui-releases/main/chat_gui.py",
-  "sha256": "016f8ed9eeca65213d6fd5e18eb2fe7ac9d96b0fb8ed8f6f9573b70feacda247",
-  "signature": "9217AyUhHVSc8M4hJHzBW46rUimOXrIIkLvLukQoNl5xlNn4BxibEdwMtJmL9EK/KZ6bDBz4Vpo2c7Sl7lSHAA==",
-  "notes": "Minor additions bug fixes"
+  "sha256": "84f63c7111d95262f8fd6e9312d54ec9046f709f00179238e3e42a682a1d1643",
+  "signature": "bTtxYuYz1GzyrIGhCvDarbGAAHZWSVwrESoHsAVFZ7sYPeIr/X1ofkVlxnQPK1qhe+LS9xdt3dKvjH30ygMfBA==",
+  "notes": "Major addition - flappy bird, and many improvements and bug fixes"
 }
