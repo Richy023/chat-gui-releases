@@ -1,6 +1,18 @@
 #!/usr/bin/env python3
 """
-chat_gui.py — v1.5.0a — ENCRYPTED instant messenger with a desktop GUI.
+chat_gui.py — v1.5.0b — ENCRYPTED instant messenger with a desktop GUI.
+
+Changes in 1.5.0b:
+- Durations in /mute, /ban and /ipban now take units: 30 (minutes, as before), 90m, 2h, 7d, 2w,
+  3mo, 1y. Months and years are calendar ones — "1y" ends at the same date and time next year.
+  (A year typed as a number of minutes is easy to get slightly wrong: 365 days is 525,600 minutes,
+  and 8,765 hours' worth lands 5 hours late.)
+- /unwarn no longer guesses: with more than one active warning it lists them and asks which to
+  remove (/unwarn <name> <#>, or /unwarn <name> all). With just one, it removes that one.
+- Several warnings at once: the ⚠ button now shows all your active warnings ("⚠ Warnings #1, #3").
+  With more than one, clicking it opens a menu of them; pick one to see who warned you, why, its
+  appeal status, and to appeal it. Warnings (and their appeal status) are remembered by the host,
+  so they're still there if you leave and rejoin the chat.
 
 Changes in 1.5.0a:
 - Toast notifications for moderation outcomes: a warning appeal accepted or rejected, being banned,
@@ -77,7 +89,7 @@ Changes in 1.4.10d:
   /accept <#> [reason] and /reject <#> [reason] close them. Accepting a ban appeal lifts the
   ban; accepting a warning appeal deletes the warning. The person is told the outcome and
   your reason (a rejected ban appeal shows up on their ban screen).
-- /unwarn <name> [warning #] [reason] deletes a warning (latest one if no number).
+- /unwarn <name> [warning # | all] [reason] deletes a warning (asks which, if there's more than one).
 - /history [name] shows moderation history for this session: warnings (and whether they
   were removed), mutes, kicks, bans, unbans and appeal decisions. With no name, the latest
   entries for the whole room.
@@ -332,6 +344,8 @@ import time
 import re
 import random
 import math
+import datetime
+import calendar
 import base64
 import hashlib
 import importlib
@@ -395,7 +409,7 @@ except ImportError:
 if sys.platform == "darwin":
     ensure_installed("pyobjus", required=False)
 
-VERSION = "1.5.0a"
+VERSION = "1.5.0b"
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -525,6 +539,7 @@ WARN_PREFIX = "__WARN__:"            # host -> the warned person: "by|warning_nu
 SNAKE_PREFIX = "__SNAKE__:"        # guest -> host: "score|playing"; host -> clients: "name|best|score|playing"
 FLAPPY_PREFIX = "__FLAPPY__:"      # same shape as SNAKE_PREFIX, for the Flappy Bird leaderboard (1.4.11+)
 GAME_PREFIXES = {"snake": SNAKE_PREFIX, "flappy": FLAPPY_PREFIX}
+WARNSYNC_PREFIX = "__WARNSYNC__:"    # host -> a (re)joining person: JSON list of their active warnings (1.5.0b+)
 WARNSTATE_PREFIX = "__WARNSTATE__:"  # host -> the warned person: "warning_number|removed" or "warning_number|rejected" (1.4.11+)
 APPEAL_SENT_TEXT = "Your appeal was sent to the host and admins."
 APPEAL_MISSING_TEXT = "There's no such warning to appeal, or you've already appealed it."
@@ -1833,6 +1848,18 @@ def perform_globalban(fingerprint: str, reason: str) -> str:
 # install time, so the in-app viewer stays complete going forward
 # without needing the whole history re-embedded on every release.
 EMBEDDED_CHANGELOG = [
+    {   "version": "1.5.0b",
+        "date": "2026-11-10",
+        "notes": (
+            "Durations in /mute, /ban and /ipban now take units — 30 (minutes, as before), 90m, 2h, 7d, 2w, "
+            "3mo, 1y — and months/years are calendar ones, so '1y' ends at the same date and time next year. "
+            "/unwarn now asks which warning to remove when someone has more than one active (/unwarn <name> "
+            "<#> or /unwarn <name> all) instead of silently removing the newest. The ⚠ button now shows all "
+            "your active warnings; with more than one it opens a menu where you can pick a warning to see who "
+            "gave it, why, its appeal status, and appeal it. Your warnings are remembered by the host, so they "
+            "survive leaving and rejoining the chat."
+        ),
+    },
     {   "version": "1.5.0a",
         "date": "2026-11-09",
         "notes": (
@@ -1906,7 +1933,7 @@ EMBEDDED_CHANGELOG = [
             "has a number, /appeals lists the open ones, and /accept <#> [reason] or /reject <#> "
             "[reason] closes them — accepting a ban appeal lifts the ban, accepting a warning appeal "
             "deletes the warning, and the person is told the outcome and your reason. New: "
-            "/unwarn <name> [warning #] [reason] to delete a warning, and /history [name] to see "
+            "/unwarn <name> [warning # | all] [reason] to delete a warning, and /history [name] to see "
             "moderation history (warnings, mutes, kicks, bans, unbans, appeal decisions) for this "
             "session. Fixed: the 'You have been warned' pop-up now closes when you send an appeal."
         ),
@@ -2615,6 +2642,23 @@ class Hub:
         self._notice_to(canonical, f"Warning #{number} was removed by {by}. Reason: {reason}")
         self._warn_state_to(canonical, number, state)  # "accepted" when it's the result of an appeal
         return None, canonical, number
+
+    def active_warnings(self, name: str) -> list:
+        """[(number, record)] of `name`'s warnings that haven't been removed, oldest first."""
+        key = name.lower()
+        with self.lock:
+            return sorted(((n, dict(r)) for (who, n), r in self.warn_log.items() if who == key and not r.get("deleted")), key=lambda item: item[0])
+
+    def warning_sync_payload(self, name: str) -> list:
+        """What a (re)joining person's ⚠ button needs: each active warning, and where its appeal stands."""
+        with self.lock:
+            appeals = {a["number"]: a["status"] for a in self.appeals.values() if a["kind"] == "warn" and a["who"].lower() == name.lower()}
+        payload = []
+        for number, r in self.active_warnings(name):
+            status = appeals.get(number)
+            appeal = status if status in ("pending", "rejected") else ("pending" if r.get("appealed") else "none")
+            payload.append({"n": number, "by": r["by"], "reason": r["reason"], "appeal": appeal})
+        return payload
 
     def warnings_text(self, name: str, own: bool) -> str:
         """Every warning `name` has had this session — current and previous — and what became of each."""
@@ -3723,6 +3767,9 @@ def _process_guest_message(text, sock, guest_name, hub: Hub, host_name, event_qu
         if FEATURE_FLAPPY in hub.get_info(sock).get("features", ()):  # catch them up on the Flappy Bird board
             for entry in hub.game_entries("flappy"):
                 hub.send_private(sock, Hub._game_wire("flappy", entry))
+        if FEATURE_WARNSYNC in hub.get_info(sock).get("features", ()):  # …and on any warnings they still have
+            if payload := hub.warning_sync_payload(guest_name):
+                hub.send_private(sock, WARNSYNC_PREFIX + json.dumps(payload))
         # Only a client that announced itself gets our reply — an older one never
         # does, so it never sees protocol text it can't parse.
         hub.send_private(sock, FEATURES_PREFIX + ",".join(sorted(HOST_FEATURES)))
@@ -3964,12 +4011,13 @@ def host_accept_loop(server: socket.socket, hub: Hub, host_name: str, event_queu
 # ---- Slash commands ----
 
 HELP_TEXT = (
-    "Commands: /mute <name> <min> [reason], /unmute <name>, /kick <name> [reason], "
-    "/ban <name> [min|perm] [reason], /unban <ip or name> [reason], /slowmode [sec], /admin <name>, /unadmin <name>, "
+    "Commands: /mute <name> <time> [reason], /unmute <name>, /kick <name> [reason], "
+    "/ban <name> [time|perm] [reason], /unban <ip or name> [reason], /slowmode [sec], /admin <name>, /unadmin <name>, "
     "/warn <name> [reason], /unwarn <name> [warning #] [reason], /history [name], /appeals, "
     "/accept <appeal #> [reason], /reject <appeal #> [reason], /color <name>, /colors, /list, /clear [lines], /warnings (your warnings — admins: /warnings <name>), /whisper <name> <msg>, "
     "/nick <new name> (you can change yours twice per chat), /help — "
-    "host only: /ipban <ip> [min|perm] [reason], /rename <current name> <new name>. "
+    "Times: 30 (minutes), 90m, 2h, 7d, 2w, 3mo, 1y. "
+    "host only: /ipban <ip> [time|perm] [reason], /rename <current name> <new name>. "
     "Ctrl+Shift+S opens the games (Snake, Flappy Bird) — in a chat or on the home screen. "
     "Paste an image with Ctrl+V (Cmd+V on Mac) to send it. "
     "Right-click a message to reply to it, or report it to the admins. "
@@ -3978,6 +4026,36 @@ HELP_TEXT = (
 )
 
 PERMANENT_WORDS = ("perm", "indefinite", "0", "infinite")
+
+_DURATION_RE = re.compile(r"^(\d+(?:\.\d+)?)\s*([a-z]*)$")
+_DURATION_UNITS = {
+    "": 60, "m": 60, "min": 60, "mins": 60, "minute": 60, "minutes": 60,     # a bare number means minutes, as it always has
+    "s": 1, "sec": 1, "secs": 1, "second": 1, "seconds": 1,
+    "h": 3600, "hr": 3600, "hrs": 3600, "hour": 3600, "hours": 3600,
+    "d": 86400, "day": 86400, "days": 86400, "w": 604800, "wk": 604800, "wks": 604800, "week": 604800, "weeks": 604800,
+}
+_CALENDAR_UNITS = {"mo": 1, "mon": 1, "month": 1, "months": 1, "y": 12, "yr": 12, "yrs": 12, "year": 12, "years": 12}
+
+def parse_until(token: str, now: float = None):
+    """'30' (minutes) | '90m' | '2h' | '7d' | '2w' | '3mo' | '1y' -> the moment it ends, or None if `token` isn't a
+    duration. Months and years are calendar ones: '1y' ends at the same date and clock time next year (not
+    365 days — or 365.25 — from now, which drifts by hours)."""
+    m = _DURATION_RE.match(token.strip().lower())
+    if not m: return None
+    amount, unit = float(m.group(1)), m.group(2)
+    now = time.time() if now is None else now
+    if unit in _CALENDAR_UNITS:
+        if amount != int(amount): return None
+        months = int(amount) * _CALENDAR_UNITS[unit]
+        if months > 1200: return None
+        start = datetime.datetime.fromtimestamp(now)
+        year, month0 = divmod(start.year * 12 + (start.month - 1) + months, 12)
+        day = min(start.day, calendar.monthrange(year, month0 + 1)[1])
+        try: return time.mktime(start.replace(year=year, month=month0 + 1, day=day).timetuple())
+        except (OverflowError, ValueError): return None
+    if unit not in _DURATION_UNITS: return None
+    seconds = amount * _DURATION_UNITS[unit]
+    return now + seconds if 0 < seconds <= 100 * 365 * 86400 else None
 
 def parse_ban_args(parts: list) -> tuple:
     """`parts` = [target, duration?, reason?] -> (until_timestamp, reason).
@@ -3988,9 +4066,8 @@ def parse_ban_args(parts: list) -> tuple:
     if dur in PERMANENT_WORDS:
         until = float("inf")
     else:
-        try:
-            until = time.time() + float(dur) * 60
-        except ValueError:
+        until = parse_until(dur)
+        if until is None:
             until = float("inf")
             reason = f"{dur} {reason}".strip()
     return until, reason or "no reason given"
@@ -4098,7 +4175,7 @@ def _cmd_slowmode(arg, hub, me, reply):
 
 def _cmd_ban(arg, hub, me, reply):
     parts = arg.split(maxsplit=2)
-    if not parts: return reply("Usage: /ban <name> [minutes|perm] [reason]")
+    if not parts: return reply("Usage: /ban <name> [time|perm] [reason]   (time: 30, 2h, 7d, 1y …)")
     name = parts[0]
     if hub.is_host(name): return reply("You cannot ban the host.")
     target = hub.find_socket_by_name(name)
@@ -4117,7 +4194,7 @@ def _cmd_ban(arg, hub, me, reply):
 def _cmd_ipban(arg, hub, me, reply):
     if not hub.is_host(me): return reply("Only the host can use /ipban.")
     parts = arg.split(maxsplit=2)
-    if not parts: return reply("Usage: /ipban <ip> [minutes|perm] [reason]")
+    if not parts: return reply("Usage: /ipban <ip> [time|perm] [reason]   (time: 30, 2h, 7d, 1y …)")
     ip = parts[0].strip()
     until, reason = parse_ban_args(parts)
     hub.ban_ip(ip, until, me, reason)
@@ -4146,16 +4223,37 @@ def _cmd_unban(arg, hub, me, reply):
     reply(f"Unbanned IP: {ip}. If they're on their ban screen, they'll be told.")
 
 def _cmd_unwarn(arg, hub, me, reply):
+    usage = "Usage: /unwarn <name> [warning # | all] [reason]"
     parts = arg.split(maxsplit=2)
-    if not parts: return reply("Usage: /unwarn <name> [warning #] [reason]")
-    rest = parts[1:]
-    number, reason = None, " ".join(rest)
-    if rest and rest[0].lstrip("#").isdigit():
-        number, reason = int(rest[0].lstrip("#")), (rest[1] if len(rest) > 1 else "")
-    error, canonical, number = hub.delete_warning(parts[0], number, me, reason)
-    if error: return reply(error)
-    hub.log_admin_action(me, f"removed warning #{number} from {canonical}. Reason: {' '.join(reason.split()) or 'no reason given'}")
-    reply(f"Removed warning #{number} from {canonical}.")
+    if not parts: return reply(usage)
+    name, rest = parts[0], parts[1:]
+    selector, reason = None, " ".join(rest)
+    if rest and (rest[0].lstrip("#").isdigit() or rest[0].lower() == "all"):
+        selector, reason = rest[0].lstrip("#").lower(), (rest[1] if len(rest) > 1 else "")
+    active = hub.active_warnings(name)
+    if not active:
+        return reply(f"{name} has no active warnings.")
+    shown = active[0][1].get("name", name)
+    if selector is None:
+        if len(active) > 1:  # don't guess which one they meant
+            lines = [f"{shown} has {len(active)} active warnings — which one?"]
+            lines += [f"  #{n}  from {r['by']}: \"{r['reason']}\"" for n, r in active]
+            lines.append(f"/unwarn {shown} <#> [reason]    or    /unwarn {shown} all [reason]")
+            return reply("\n".join(lines))
+        selector = str(active[0][0])
+    numbers = [n for n, _ in active] if selector == "all" else [int(selector)]
+    removed = []
+    for number in numbers:
+        error, _, _ = hub.delete_warning(name, number, me, reason)
+        if error:
+            if len(numbers) == 1: return reply(error)
+        else:
+            removed.append(number)
+    if not removed: return reply(f"{shown} has no active warnings.")
+    listed = ", ".join(f"#{n}" for n in removed)
+    plural = "warnings" if len(removed) > 1 else "warning"
+    hub.log_admin_action(me, f"removed {plural} {listed} from {shown}. Reason: {' '.join(reason.split()) or 'no reason given'}")
+    reply(f"Removed {plural} {listed} from {shown}.")
 
 def warnings_report(hub, requester: str, arg: str, is_admin: bool) -> str:
     """The reply to /warnings [name]: your own warnings, or (for admins and the host) someone else's."""
@@ -4200,27 +4298,27 @@ def _cmd_accept(arg, hub, me, reply): _decide_appeal_cmd(arg, hub, me, reply, Tr
 def _cmd_reject(arg, hub, me, reply): _decide_appeal_cmd(arg, hub, me, reply, False)
 
 def _cmd_mute(arg, hub, me, reply):
+    usage = "Usage: /mute <name> <time> [reason]   (time: 30 minutes, 2h, 7d, 1y …)"
     parts = arg.split(maxsplit=2)
-    if len(parts) < 2: return reply("Usage: /mute <name> <minutes> [reason]")
+    if len(parts) < 2: return reply(usage)
     name = parts[0]
     if hub.is_host(name): return reply("You cannot mute the host.")
-    try: minutes = float(parts[1])
-    except ValueError:
-        return reply("Usage: /mute <name> <minutes> [reason]")
+    until = parse_until(parts[1])
+    if until is None: return reply(usage)
+    length = format_duration(until - time.time())
     reason = parts[2] if len(parts) > 2 else "no reason given"
-    until = time.time() + minutes * 60
     if not hub.mute(name, until, me, reason):
         return reply(f"No one named '{name}' is connected.")
 
     hub.broadcast(f"* {name} has been muted *")
     target_sock = hub.find_socket_by_name(name)
     hub.record_mod("mute", hub.get_info(target_sock).get("name", name) if target_sock else name, me, reason,
-                   detail=f"for {format_duration(minutes * 60)}")
+                   detail=f"for {length}")
     if target_sock:
-        hub.send_private(target_sock, MUTE_NOTICE_PREFIX + f"You were muted by {me} for {minutes:g} minute(s). Reason: {reason}")
+        hub.send_private(target_sock, MUTE_NOTICE_PREFIX + f"You were muted by {me} for {length}. Reason: {reason}")
         hub.send_private(target_sock, MUTE_STATUS_PREFIX + f"1:{until}")
     hub.log_admin_action(me, f"muted {name} until {until_token(until)}. Reason: {reason}")
-    reply(f"Muted {name} for {format_duration(minutes * 60)}, until {until_token(until)}. Reason: {reason}")
+    reply(f"Muted {name} for {length}, until {until_token(until)}. Reason: {reason}")
 
 def _cmd_unmute(arg, hub, me, reply):
     if not arg: return reply("Usage: /unmute <name>")
@@ -4358,6 +4456,10 @@ def guest_recv_loop(sock, fernet, event_queue, local_colors, colors_lock, known_
         if text.startswith(FEATURES_PREFIX):
             host_features.update(f for f in text[len(FEATURES_PREFIX):].split(",") if f)
             put(("features", None))  # now we know what the host understands (an open game can announce itself)
+            return True
+        if text.startswith(WARNSYNC_PREFIX):
+            try: put(("warn_sync", json.loads(text[len(WARNSYNC_PREFIX):])))
+            except ValueError: pass
             return True
         if text.startswith(WARNSTATE_PREFIX):
             number, _, state = text[len(WARNSTATE_PREFIX):].partition("|")
@@ -5046,6 +5148,7 @@ class ChatApp(tk.Tk):
             "game": self._on_game_event,
             "features": lambda _: self._games_context_changed(),
             "warn_state": self._on_warn_state,
+            "warn_sync": self._on_warn_sync,
             "upload_done": self._on_upload_done,
             "upload_progress": self._on_upload_progress,
             "transfer_progress": self._on_transfer_progress,
@@ -5096,7 +5199,8 @@ class ChatApp(tk.Tk):
         self._reply_to = None          # {"id", "author", "snippet"} while composing a reply
         self._appealed_warnings = set()  # warning numbers we've already appealed
         self._warn_fx = None             # "hold" / "flash" while the ⚠ button plays an effect (see _on_warn_state)
-        self._latest_warning = None      # {"by", "count", "reason", "state"} — only the newest warning is kept (see the ⚠ button)
+        self._warnings = {}              # warning number -> {"by", "reason", "state"}: every ACTIVE warning we hold (see the ⚠ button)
+        self._warn_view = None           # the warning number the warning dialog is showing
         self._appeal_pending = None      # {"number", "key"} while a warning appeal's "Sending…" line awaits the host's answer
         self._room_code = ""
         self._upload_jobs = {}         # job id -> {"name", "to", "pct"} for files we're sending
@@ -5905,35 +6009,71 @@ class ChatApp(tk.Tk):
 
     def _on_warned(self, payload):
         by, count, reason = payload["by"], payload["count"], payload["reason"]
-        self._latest_warning = {"by": by, "count": count, "reason": reason, "state": "active"}
+        self._warnings[count] = {"by": by, "reason": reason, "state": "active"}
         self.append_private_line(f"⚠ Warning #{count} from {by}: {reason}")
         self.bell()
-        self._close_popup("warning_view")  # a newer warning replaces whatever was showing
+        self._close_popup("warning_view")  # the new warning is what we show now
         self._cancel_timer("warn_fx")
         self._warn_fx = None
         self._refresh_warn_button()
-        self._show_warning_dialog()
+        self._show_warning_dialog(count)
         self._raise_for_attention(self._popups.get("warning_view"))
+
+    def _on_warn_sync(self, entries):
+        """On joining, the host tells us every warning we still have (and where each appeal stands), so
+        the ⚠ button is there even if we left and came back. Quiet: no pop-up, no sound."""
+        if not isinstance(entries, list): return
+        self._warnings = {}
+        for e in entries:
+            try: number, by, reason, appeal = int(e["n"]), str(e["by"]), str(e["reason"]), e.get("appeal", "none")
+            except (KeyError, TypeError, ValueError): continue
+            self._warnings[number] = {"by": by, "reason": reason, "state": "rejected" if appeal == "rejected" else "active", "note_done": True}
+            if appeal in ("pending", "rejected"):
+                self._appealed_warnings.add(number)
+        self._refresh_warn_button()
+
+    def _warn_note(self, number: int) -> str:
+        warning = self._warnings[number]
+        if warning["state"] == "rejected":
+            return "" if warning.get("note_done") else " · appeal rejected"  # shown for 3 s after the flash (see _warn_btn_rejected)
+        return " · appeal sent" if number in self._appealed_warnings else ""
 
     def _refresh_warn_button(self):
         """The ⚠ button in the top bar: there for as long as we hold a warning, so closing the pop-up
-        never costs us the Appeal button."""
+        never costs us the Appeal button. One warning: "⚠ Warning #2"; several: "⚠ Warnings #1, #3"."""
         if self._warn_fx:
             return  # an effect is playing — it repaints the button itself when it finishes
-        warning = self._latest_warning
-        if warning is None:
+        if not self._warnings:
             self.warn_btn.pack_forget()
             return
         self._paint_warn_btn(self.WARN_YELLOW)
-        number = warning["count"]
-        if warning["state"] == "rejected":
-            note = "" if warning.get("note_done") else " · appeal rejected"  # shown for 3 s after the flash (see _warn_btn_rejected)
-        elif number in self._appealed_warnings:
-            note = " · appeal sent"
+        numbers = sorted(self._warnings)
+        if len(numbers) == 1:
+            text = f"⚠ Warning #{numbers[0]}{self._warn_note(numbers[0])}"
+        elif len(numbers) <= 4:
+            text = "⚠ Warnings " + ", ".join(f"#{n}" for n in numbers)
         else:
-            note = ""
-        self.warn_btn.label.configure(text=f"⚠ Warning #{number}{note}")
+            text = f"⚠ {len(numbers)} warnings"
+        self.warn_btn.label.configure(text=text)
         self.warn_btn.pack(side="right", padx=(12, 0), pady=6, after=self.dnd_btn)
+
+    def _on_warn_btn_clicked(self):
+        """One warning: open it. Several: a menu of them, to pick which to look at."""
+        numbers = sorted(self._warnings)
+        if not numbers:
+            return messagebox.showinfo("Warning", "You don't have any warnings right now.", parent=self)
+        if len(numbers) == 1:
+            return self._show_warning_dialog(numbers[0])
+        menu = tk.Menu(self, tearoff=0, bg=BG_PANEL, fg=FG_TEXT)
+        for number in numbers:
+            warning = self._warnings[number]
+            reason = warning["reason"] if len(warning["reason"]) <= 40 else warning["reason"][:39] + "…"
+            status = "appeal rejected" if warning["state"] == "rejected" else ("appeal sent" if number in self._appealed_warnings else "no appeal yet")
+            menu.add_command(label=f"#{number} — {reason}   ({status})", command=lambda n=number: self._show_warning_dialog(n))
+        try:
+            menu.tk_popup(self.warn_btn.winfo_rootx(), self.warn_btn.winfo_rooty() + self.warn_btn.winfo_height())
+        finally:
+            menu.grab_release()
 
     def _paint_warn_btn(self, colors):
         self.warn_btn.base_bg, self.warn_btn.hover_bg = colors
@@ -5948,8 +6088,8 @@ class ChatApp(tk.Tk):
         self._refresh_warn_button()
 
     def _warn_btn_removed(self, text: str):
-        """The warning is gone (an admin deleted it, or our appeal was accepted): the button goes green,
-        says so for a few seconds, then disappears."""
+        """A warning is gone (an admin deleted it, or our appeal was accepted): the button goes green, says so for
+        a few seconds, then shows whatever warnings are left (or disappears if there are none)."""
         self._cancel_timer("warn_fx")
         self._warn_fx = "hold"
         self.warn_btn.label.configure(text=text)
@@ -5957,37 +6097,42 @@ class ChatApp(tk.Tk):
         self.warn_btn.pack(side="right", padx=(12, 0), pady=6, after=self.dnd_btn)
         self._set_timer("warn_fx", 5000, self._end_warn_fx)
 
-    def _warn_btn_rejected(self):
+    def _warn_btn_rejected(self, number: int):
         """Our appeal was rejected: the button flashes red and white six times, quickly, then settles back to yellow."""
         self._cancel_timer("warn_fx")
         self._warn_fx = "flash"
-        self.warn_btn.label.configure(text=f"⚠ Warning #{self._latest_warning['count']} · appeal rejected")
+        self.warn_btn.label.configure(text=f"⚠ Warning #{number} · appeal rejected")
         self.warn_btn.pack(side="right", padx=(12, 0), pady=6, after=self.dnd_btn)
         sequence = [self.WARN_RED, self.WARN_WHITE] * 6
         def step():
             if self._warn_fx != "flash":
                 return
             if not sequence:
-                # Flashing done: back to yellow, "appeal rejected" stays up for 3 more seconds, then the warning number.
+                # Flashing done: back to yellow, "appeal rejected" stays up for 3 more seconds, then the warning number(s).
                 self._paint_warn_btn(self.WARN_YELLOW)
                 def show_number():
-                    if self._latest_warning is not None:
-                        self._latest_warning["note_done"] = True
+                    if number in self._warnings:
+                        self._warnings[number]["note_done"] = True
                     self._end_warn_fx()
                 return self._set_timer("warn_fx", 3000, show_number)
             self._paint_warn_btn(sequence.pop(0))
             self._set_timer("warn_fx", 120, step)
         step()
 
-    def _show_warning_dialog(self):
-        """Shows our latest warning, with the Appeal button while there's still an appeal to make."""
-        warning = self._latest_warning
+    def _show_warning_dialog(self, number: int = None):
+        """Shows one of our warnings (the newest unless told which), with the Appeal button while there's still an appeal to make."""
+        if number is None and self._warnings:
+            number = max(self._warnings)
+        warning = self._warnings.get(number)
         if warning is None:
             return messagebox.showinfo("Warning", "You don't have any warnings right now.", parent=self)
-        by, count, reason = warning["by"], warning["count"], warning["reason"]
+        if self._warn_view != number:
+            self._close_popup("warning_view")  # showing a different warning than the open dialog
+        by, count, reason = warning["by"], number, warning["reason"]
         popup = self._open_dialog("warning_view", "⚠ Warning", padx=24, pady=20)
         if popup is None:
             return
+        self._warn_view = number
         tk.Label(popup, text="⚠  You have been warned", bg=BG_PANEL, fg=COLOR_PALETTE["red"], font=(CHAT_FONT[0], 14, "bold")).pack(anchor="w")
         tk.Label(popup, text=f"By {by}   ·   warning #{count}", bg=BG_PANEL, fg=FG_MUTED, font=CHAT_FONT).pack(anchor="w", pady=(6, 10))
         tk.Label(popup, text=reason, bg=BG_PANEL, fg=FG_TEXT, font=CHAT_FONT, wraplength=380, justify="left").pack(anchor="w")
@@ -6000,33 +6145,38 @@ class ChatApp(tk.Tk):
         else:
             make_button(buttons, "Appeal", lambda: self._open_warning_appeal(count, by, reason), bg=COLOR_PALETTE["blue"], hover_bg=BTN_BLUE_HOVER, padx=16, pady=5).pack(side="left", padx=(0, 8))
         make_button(buttons, "Close", lambda: self._close_popup("warning_view"), bg=BTN_NEUTRAL, hover_bg=BTN_NEUTRAL_HOVER, padx=18, pady=5).pack(side="left")
-        tk.Label(popup, text="Closing this is fine — the ⚠ button at the top of the chat brings it back, and /warnings lists them all.", bg=BG_PANEL, fg=FG_MUTED, font=(CHAT_FONT[0], 8)).pack(anchor="w", pady=(10, 0))
+        others = [n for n in sorted(self._warnings) if n != count]
+        if others:
+            tk.Label(popup, text="You also have: " + ", ".join(f"#{n}" for n in others) + " — click the ⚠ button to look at them.", bg=BG_PANEL, fg=FG_MUTED, font=(CHAT_FONT[0], 9)).pack(anchor="w", pady=(10, 0))
+        tk.Label(popup, text="Closing this is fine — the ⚠ button at the top of the chat brings it back, and /warnings lists them all.", bg=BG_PANEL, fg=FG_MUTED, font=(CHAT_FONT[0], 8)).pack(anchor="w", pady=(6, 0))
         popup.lift()
 
     def _on_warn_state(self, payload):
-        """The host tells us how our latest warning ended up: removed, or its appeal rejected."""
-        if payload["state"] == "accepted":
-            self._toast("Appeal accepted", f"Your appeal for warning #{payload['number']} was accepted — the warning was removed.")
-        elif payload["state"] == "rejected":
-            self._toast("Appeal rejected", f"Your appeal for warning #{payload['number']} was rejected — the warning stands.")
-        warning = self._latest_warning
-        if warning is None or warning["count"] != payload["number"]:
-            return  # not the warning we're showing
-        reopen = "warning_view" in self._popups
-        self._close_popup("warning_view")
-        state = payload["state"]
+        """The host tells us how one of our warnings ended up: removed, or its appeal rejected."""
+        number, state = payload["number"], payload["state"]
+        if state == "accepted":
+            self._toast("Appeal accepted", f"Your appeal for warning #{number} was accepted — the warning was removed.")
+        elif state == "rejected":
+            self._toast("Appeal rejected", f"Your appeal for warning #{number} was rejected — the warning stands.")
+        warning = self._warnings.get(number)
+        if warning is None:
+            return  # not a warning we're holding
+        viewing = "warning_view" in self._popups and self._warn_view == number
+        if viewing:
+            self._close_popup("warning_view")
         if state in ("removed", "accepted"):
-            self._latest_warning = None
+            del self._warnings[number]
+            self._appealed_warnings.discard(number)
             self._warn_btn_removed("✔ Appeal accepted" if state == "accepted" else "✔ Warning removed")
             return
         if state == "rejected":
             warning["state"] = "rejected"
-            self._appealed_warnings.add(warning["count"])
-            self._warn_btn_rejected()
+            self._appealed_warnings.add(number)
+            self._warn_btn_rejected(number)
         else:
             self._refresh_warn_button()
-        if reopen and self._latest_warning is not None:
-            self._show_warning_dialog()
+        if viewing:
+            self._show_warning_dialog(number)
 
     # ---- the "Sending your appeal…" line that becomes "Appeal sent ✔" ----
 
@@ -6118,7 +6268,7 @@ class ChatApp(tk.Tk):
             self.dnd_btn.bind(bind, lambda e: self.on_dnd_keybind_picker())
             self.dnd_btn.label.bind(bind, lambda e: self.on_dnd_keybind_picker())
 
-        self.warn_btn = make_button(top, "⚠ Warning", self._show_warning_dialog, bg=self.WARN_YELLOW[0], hover_bg=self.WARN_YELLOW[1], padx=12, pady=5)  # shown by _refresh_warn_button
+        self.warn_btn = make_button(top, "⚠ Warning", self._on_warn_btn_clicked, bg=self.WARN_YELLOW[0], hover_bg=self.WARN_YELLOW[1], padx=12, pady=5)  # shown by _refresh_warn_button
 
         body = tk.Frame(self.chat_frame, bg=BG_DARK)  # packed last — see the end of this method
 
