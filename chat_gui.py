@@ -1,6 +1,26 @@
 #!/usr/bin/env python3
 """
-chat_gui.py — v1.5.0 — ENCRYPTED instant messenger with a desktop GUI.
+chat_gui.py — v1.5.0a — ENCRYPTED instant messenger with a desktop GUI.
+
+Changes in 1.5.0a:
+- Toast notifications for moderation outcomes: a warning appeal accepted or rejected, being banned,
+  a ban appeal rejected, and being unbanned (including by an accepted appeal). Not shown while
+  Do Not Disturb is on.
+- Warnings, mutes, kicks and bans now jump to the front of everything (even if the app was
+  minimised) with a notice window — unless you were on Do Not Disturb, in which case they wait
+  quietly until you next open the window, as before.
+- Fixed: times in mute / ban messages (and the admin log, /history and /appeals) were written in the
+  HOST's time zone, so they could be hours out for everyone else. They're now sent as a duration and
+  turned into your own local time on your own computer.
+- The ban message names the host ("…the chat hosted by Richy…") instead of their IP address.
+- The ⚠ button shows "appeal rejected" for 3 seconds after its flash, then goes back to
+  "⚠ Warning #N".
+- /warning is now /warnings: it lists your warnings — current and previous, with what happened to
+  each. Admins can add a name (/warnings Bob). The host can't be warned, so /warnings tells them so.
+- Recent chats keeps one entry per room you've joined (two different rooms show as two); joining the
+  same room again just refreshes its entry.
+- Fixed: the Changelog window could show the notes typed when signing a release instead of the
+  built-in changelog. The built-in changelog now always wins.
 
 Changes in 1.5.0:
 - The "New messages" button is back to a small button (bottom right, in its own strip under the
@@ -375,7 +395,7 @@ except ImportError:
 if sys.platform == "darwin":
     ensure_installed("pyobjus", required=False)
 
-VERSION = "1.5.0"
+VERSION = "1.5.0a"
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -1411,16 +1431,55 @@ def format_until(ts: float) -> str:
         return "permanently"
     return f"{format_time(ts)} ({format_duration(ts - time.time())})"
 
-def notify_ping(pinger_name: str, root=None):
+# ---- Times that have to read correctly on EVERY computer ----
+# The host used to write "until 23:22" into messages in ITS time zone, so a guest in another zone (or whose
+# clock disagreed) saw the wrong hour. Now the host sends a token holding a duration — "{{until:3600}}" is
+# "an hour from now", "{{ago:60}}" is "a minute ago" — and each app turns it into its OWN local time as the
+# message is shown. A duration (not a clock time) also can't be thrown off by the two computers' clocks.
+_TIME_TOKEN = re.compile(r"\{\{(until|ago):(inf|\d+)\}\}")
+
+def until_token(ts: float) -> str:
+    if ts == float('inf'): return "{{until:inf}}"
+    return "{{until:%d}}" % max(0, int(ts - time.time()))
+
+def ago_token(ts: float) -> str:
+    return "{{ago:%d}}" % max(0, int(time.time() - ts))
+
+def localize_times(text: str) -> str:
+    """Turns until/ago tokens in a message into this computer's local time."""
+    if "{{" not in text: return text
+    def repl(m):
+        kind, value = m.groups()
+        if kind == "until":
+            return "permanently" if value == "inf" else format_until(time.time() + int(value))
+        return format_time(time.time() - int(value))
+    return _TIME_TOKEN.sub(repl, text)
+
+def make_ban_notice(until_ts: float, reason: str, host_name: str) -> str:
+    """What a banned person is told: 'until|reason', then the host's nickname after a \\x1f separator."""
+    reason = reason.replace("\x1f", " ")
+    return f"{until_token(until_ts)}|{reason}\x1f{host_name.replace(chr(0x1f), ' ')}"
+
+def parse_ban_notice(rest: str):
+    """-> (until text in OUR local time, reason, the host's nickname — '' from an older host)."""
+    body, _, host = rest.partition("\x1f")
+    until_str, _, reason = body.partition("|")
+    return localize_times(until_str), reason, host.strip()
+
+def notify_toast(title: str, message: str, root=None, timeout: int = 6):
+    """A desktop notification (falls back to a beep where notifications aren't available)."""
     if _plyer_notification is not None:
         try:
-            _plyer_notification.notify(title="Ping Received", message=f"{pinger_name} mentioned you!", timeout=5)
+            _plyer_notification.notify(title=title[:64], message=message[:240], timeout=timeout)
             return
         except Exception:
             pass
     if root is not None:
         try: root.bell()
         except Exception: pass
+
+def notify_ping(pinger_name: str, root=None):
+    notify_toast("Ping Received", f"{pinger_name} mentioned you!", root, timeout=5)
 
 def get_local_ip() -> str:
     try:
@@ -1528,9 +1587,10 @@ def load_recent_hosts() -> list:
     fresh = [e for e in entries if isinstance(e, dict) and e.get("last_connected", 0) >= cutoff]
     fresh.sort(key=lambda e: e.get("last_connected", 0), reverse=True)
     seen, unique = set(), []
-    for e in fresh:  # one entry per room code — the newest (its address and port are the current ones)
-        if e.get("room_code") not in seen:
-            seen.add(e.get("room_code"))
+    for e in fresh:  # one entry per room — the newest sighting (the port is different every session)
+        room = (e.get("room_code"), e.get("host_ip"))
+        if room not in seen:
+            seen.add(room)
             unique.append(e)
     if len(unique) != len(entries):
         save_recent_hosts(unique)
@@ -1540,7 +1600,9 @@ def save_recent_hosts(entries: list):
     save_json(RECENT_HOSTS_FILE, entries[:RECENT_HOSTS_MAX_ENTRIES])
 
 def remember_recent_host(room_code: str, host_ip: str, port: int):
-    entries = [e for e in load_recent_hosts() if e.get("room_code") != room_code]  # joining a room again replaces its entry (the port differs every session)
+    # A room is its code plus the host's address (the same code can exist on two networks). Joining a room you already
+    # have just refreshes that entry — the port differs every session — while a different room is added alongside it.
+    entries = [e for e in load_recent_hosts() if not (e.get("room_code") == room_code and e.get("host_ip") == host_ip)]
     entries.insert(0, {"room_code": room_code, "host_ip": host_ip, "port": port, "last_connected": time.time()})
     save_recent_hosts(entries[:RECENT_HOSTS_MAX_ENTRIES])
 
@@ -1771,6 +1833,22 @@ def perform_globalban(fingerprint: str, reason: str) -> str:
 # install time, so the in-app viewer stays complete going forward
 # without needing the whole history re-embedded on every release.
 EMBEDDED_CHANGELOG = [
+    {   "version": "1.5.0a",
+        "date": "2026-11-09",
+        "notes": (
+            "Toast notifications for moderation outcomes: a warning appeal accepted or rejected, being "
+            "banned, a ban appeal rejected, and being unbanned (not shown on Do Not Disturb). Warnings, "
+            "mutes, kicks and bans now jump to the front of everything with a notice window — unless you "
+            "were on Do Not Disturb, when they wait until you next open the window. Fixed: times in mute "
+            "and ban messages were written in the host's time zone and could be hours out; they now show "
+            "in your own local time. The ban message names the host instead of their IP address. The ⚠ "
+            "button shows 'appeal rejected' for 3 seconds after its flash, then goes back to the warning "
+            "number. /warning is now /warnings and lists your current and previous warnings (admins can "
+            "add a name; the host is told they're invincible). Recent chats keeps one entry per room "
+            "instead of replacing. Fixed: the Changelog window could show release-signing notes instead "
+            "of the built-in changelog."
+        ),
+    },
     {   "version": "1.5.0",
         "date": "2026-11-08",
         "notes": (
@@ -2210,9 +2288,11 @@ def record_changelog_entry(version: str, notes: str):
 def full_changelog() -> list:
     """Embedded history plus anything recorded locally since, deduped
     by version and sorted newest-first (letter-suffix aware)."""
-    by_version = {e["version"]: e for e in EMBEDDED_CHANGELOG}
-    for e in _load_local_changelog():
-        by_version[e["version"]] = e
+    # The built-in text is authoritative. The local file only fills in versions this build doesn't know
+    # about — it holds whatever notes came with an update's manifest (e.g. what was typed when signing the
+    # release), which must never replace the real changelog entry for the same version.
+    by_version = {e["version"]: e for e in _load_local_changelog()}
+    by_version.update({e["version"]: e for e in EMBEDDED_CHANGELOG})
     return sorted(by_version.values(), key=lambda e: _version_tuple(e["version"]), reverse=True)
 
 
@@ -2536,13 +2616,37 @@ class Hub:
         self._warn_state_to(canonical, number, state)  # "accepted" when it's the result of an appeal
         return None, canonical, number
 
+    def warnings_text(self, name: str, own: bool) -> str:
+        """Every warning `name` has had this session — current and previous — and what became of each."""
+        key = name.lower()
+        with self.lock:
+            records = sorted(((n, dict(r)) for (who, n), r in self.warn_log.items() if who == key), key=lambda item: -item[0])
+            appeals = {a["number"]: dict(a) for a in self.appeals.values() if a["kind"] == "warn" and a["who"].lower() == key}
+        if not records:
+            return "You have no warnings this session." if own else f"{name} has no warnings this session."
+        shown = records[0][1].get("name", name)
+        active = sum(1 for _, r in records if not r.get("deleted"))
+        lines = [f"{'Your warnings' if own else f'Warnings for {shown}'} (this session): {len(records)} issued, {active} active"]
+        for number, r in records:
+            if r.get("deleted"):
+                status = f"removed by {r.get('deleted_by', '?')}: {r.get('deleted_reason', 'no reason given')}"
+            else:
+                status = "ACTIVE"
+                appeal = appeals.get(number)
+                if appeal and appeal["status"] == "pending": status += " · appeal pending"
+                elif appeal and appeal["status"] == "rejected": status += " · appeal rejected"
+                elif r.get("appealed"): status += " · appealed"
+            when = f", {ago_token(r['time'])}" if r.get("time") else ""
+            lines.append(f"  #{number}  {status} — from {r['by']}{when}: \"{r['reason']}\"")
+        return "\n".join(lines)
+
     def ban_status(self, ip: str) -> dict:
         """What a banned person's app is told when it checks in."""
         with self.lock:
             self._purge_expired()
             ban, unban = self.banned_ips.get(ip), self.unbans.get(ip)
             if ban is not None:
-                return {"state": "banned", "until": format_until(ban["until"]), "by": ban.get("banned_by", ""),
+                return {"state": "banned", "until": until_token(ban["until"]), "by": ban.get("banned_by", ""),
                         "reason": ban.get("reason", ""), "appeal": ban.get("appeal_result")}
             if unban is not None:
                 return {"state": "unbanned", "by": unban["by"], "reason": unban["reason"]}
@@ -2562,10 +2666,10 @@ class Hub:
 
     # ---- moderation history ----
 
-    def record_mod(self, kind: str, target: str, by: str, reason: str = "", ip: str = None, detail: str = ""):
+    def record_mod(self, kind: str, target: str, by: str, reason: str = "", ip: str = None, detail: str = "", until: float = None):
         with self.lock:
             self.mod_log.append({"time": time.time(), "kind": kind, "target": target, "by": by,
-                                 "reason": reason, "ip": ip, "detail": detail})
+                                 "reason": reason, "ip": ip, "detail": detail, "until": until})
             del self.mod_log[:-500]
 
     def history_text(self, who: str = None, limit: int = 25) -> str:
@@ -2592,8 +2696,10 @@ class Hub:
         for e in entries:
             who_part = "" if who else f"{e['target']}  "
             detail = f" {e['detail']}" if e["detail"] else ""
+            if e.get("until") is not None:
+                detail += f" until {until_token(e['until'])}"
             reason = f": {e['reason']}" if e["reason"] else ""
-            lines.append(f"  {format_time(e['time'])}  {who_part}{e['kind'].upper()}{detail}  (by {e['by']}){reason}")
+            lines.append(f"  {ago_token(e['time'])}  {who_part}{e['kind'].upper()}{detail}  (by {e['by']}){reason}")
         return "\n".join(lines)
 
     # ---- replies ----
@@ -2736,7 +2842,7 @@ class Hub:
         reason = " ".join(reason.split())[:300] or "no reason given"
         with self.lock:
             count = self.warnings[canonical.lower()] = self.warnings.get(canonical.lower(), 0) + 1
-            self.warn_log[(canonical.lower(), count)] = {"name": canonical, "by": by, "reason": reason, "appealed": False, "deleted": False}
+            self.warn_log[(canonical.lower(), count)] = {"name": canonical, "by": by, "reason": reason, "appealed": False, "deleted": False, "time": time.time()}
         self.record_mod("warn", canonical, by, reason, detail=f"#{count}")
         self.send_private(sock, f"{WARN_PREFIX}{by}|{count}|{reason}")
         self.broadcast(f"* {canonical} has been warned *", exclude_sock=sock)
@@ -3455,6 +3561,9 @@ def _handle_guest_command(text, sock, guest_name, is_admin, hub: Hub, host_name,
         else:
             _guest_notice(hub, sock, f"Invalid color. Available: {', '.join(COLOR_PALETTE)}")
 
+    elif cmd_name == "warnings":  # anyone may ask for their own; admins can name someone else
+        _guest_notice(hub, sock, warnings_report(hub, guest_name, arg, is_admin))
+
     elif cmd_name == "mod":
         if is_admin:
             if arg.split(" ", 1)[0].lower() in MOD_COMMAND_NAMES:  # only genuine moderation commands
@@ -3631,7 +3740,7 @@ def _process_guest_message(text, sock, guest_name, hub: Hub, host_name, event_qu
 
     if hub.is_muted(sock):
         info = hub.get_info(sock)
-        hub.send_private(sock, MUTE_NOTICE_PREFIX + f"You are muted by {info['muted_by']} until {format_until(info['muted_until'])}. Reason: {info['mute_reason']}")
+        hub.send_private(sock, MUTE_NOTICE_PREFIX + f"You are muted by {info['muted_by']} until {until_token(info['muted_until'])}. Reason: {info['mute_reason']}")
         return
 
     if text.startswith(EDIT_PREFIX):
@@ -3713,7 +3822,7 @@ def _handle_ban_appeal(sock, addr, hub: Hub, payload: str):
     appeal_id = hub.register_appeal("ban", name, ip=addr[0])
     hub.admin_broadcast(format_appeal(
         f"Ban Appeal #{appeal_id}", f"{name} ({addr[0]})",
-        f"is appealing their ban (by {ban.get('banned_by', '?')}, until {format_until(ban['until'])}; reason: \"{reason}\"). "
+        f"is appealing their ban (by {ban.get('banned_by', '?')}, until {until_token(ban['until'])}; reason: \"{reason}\"). "
         f"To decide: /accept {appeal_id} [reason]  or  /reject {appeal_id} [reason]", appeal["answers"]))
     finish("Your appeal was sent to the host and admins. If they unban you, you can rejoin straight away.")
 
@@ -3757,7 +3866,7 @@ def handle_guest_connection(sock, addr, hub: Hub, host_name: str, event_queue: q
     ban_info = hub.get_ban_info(addr[0])
     if ban_info:
         reason = ban_info.get("reason") or "no reason given"
-        hub.send_private(sock, BAN_NOTICE_PREFIX + f"{format_until(ban_info['until'])}|{reason}")
+        hub.send_private(sock, BAN_NOTICE_PREFIX + make_ban_notice(ban_info["until"], reason, hub.host_name))
         sock.close()
         return
 
@@ -3858,7 +3967,7 @@ HELP_TEXT = (
     "Commands: /mute <name> <min> [reason], /unmute <name>, /kick <name> [reason], "
     "/ban <name> [min|perm] [reason], /unban <ip or name> [reason], /slowmode [sec], /admin <name>, /unadmin <name>, "
     "/warn <name> [reason], /unwarn <name> [warning #] [reason], /history [name], /appeals, "
-    "/accept <appeal #> [reason], /reject <appeal #> [reason], /color <name>, /colors, /list, /clear [lines], /warning (see your latest warning, and appeal it), /whisper <name> <msg>, "
+    "/accept <appeal #> [reason], /reject <appeal #> [reason], /color <name>, /colors, /list, /clear [lines], /warnings (your warnings — admins: /warnings <name>), /whisper <name> <msg>, "
     "/nick <new name> (you can change yours twice per chat), /help — "
     "host only: /ipban <ip> [min|perm] [reason], /rename <current name> <new name>. "
     "Ctrl+Shift+S opens the games (Snake, Flappy Bird) — in a chat or on the home screen. "
@@ -3999,9 +4108,9 @@ def _cmd_ban(arg, hub, me, reply):
     until, reason = parse_ban_args(parts)
     ip = hub.get_info(target).get("ip")
     if ip: hub.ban_ip(ip, until, me, reason)
-    until_str = format_until(until)
-    hub.record_mod("ban", hub.get_info(target).get("name", name), me, reason, ip=ip, detail=f"until {until_str}")
-    hub.eject(target, BAN_NOTICE_PREFIX + f"{until_str}|{reason}", f"* {name} has been IP banned *")
+    until_str = until_token(until)
+    hub.record_mod("ban", hub.get_info(target).get("name", name), me, reason, ip=ip, until=until)
+    hub.eject(target, BAN_NOTICE_PREFIX + make_ban_notice(until, reason, hub.host_name), f"* {name} has been IP banned *")
     hub.log_admin_action(me, f"banned {name} ({ip}) until {until_str}. Reason: {reason}")
     reply(f"Banned {name} ({ip}) until {until_str}. Reason: {reason}")
 
@@ -4012,15 +4121,15 @@ def _cmd_ipban(arg, hub, me, reply):
     ip = parts[0].strip()
     until, reason = parse_ban_args(parts)
     hub.ban_ip(ip, until, me, reason)
-    until_str = format_until(until)
+    until_str = until_token(until)
 
     # If someone is connected from that IP right now (under any name), kick
     # them too — otherwise the ban only bites on their next connection attempt.
     target = hub.find_socket_by_ip(ip)
-    hub.record_mod("ipban", hub.get_info(target).get("name", f"IP {ip}") if target else f"IP {ip}", me, reason, ip=ip, detail=f"until {until_str}")
+    hub.record_mod("ipban", hub.get_info(target).get("name", f"IP {ip}") if target else f"IP {ip}", me, reason, ip=ip, until=until)
     if target:
         target_name = hub.get_info(target).get("name", "someone")
-        hub.eject(target, BAN_NOTICE_PREFIX + f"{until_str}|{reason}", f"* {target_name} has been IP banned *")
+        hub.eject(target, BAN_NOTICE_PREFIX + make_ban_notice(until, reason, hub.host_name), f"* {target_name} has been IP banned *")
 
     hub.log_admin_action(me, f"IP-banned {ip} directly until {until_str}. Reason: {reason}")
     reply(f"IP {ip} banned until {until_str}. Reason: {reason}")
@@ -4048,6 +4157,21 @@ def _cmd_unwarn(arg, hub, me, reply):
     hub.log_admin_action(me, f"removed warning #{number} from {canonical}. Reason: {' '.join(reason.split()) or 'no reason given'}")
     reply(f"Removed warning #{number} from {canonical}.")
 
+def warnings_report(hub, requester: str, arg: str, is_admin: bool) -> str:
+    """The reply to /warnings [name]: your own warnings, or (for admins and the host) someone else's."""
+    target = arg.strip()
+    if not target:
+        if hub.is_host(requester): return "You're the host, so you're invincible!"
+        return hub.warnings_text(requester, own=True)
+    if target.lower() != requester.lower() and not (is_admin or hub.is_host(requester)):
+        return "Only admins can look up other people's warnings — /warnings on its own shows yours."
+    if hub.is_host(target):
+        return "You're the host, so you're invincible!" if target.lower() == requester.lower() else f"{target} is the host, so they can't be warned."
+    return hub.warnings_text(target, own=target.lower() == requester.lower())
+
+def _cmd_warnings(arg, hub, me, reply):
+    reply(warnings_report(hub, me, arg, is_admin=True))  # only the host (and admins, via a guest's own path) get here
+
 def _cmd_history(arg, hub, me, reply):
     reply(hub.history_text(arg.strip() or None))
 
@@ -4057,7 +4181,7 @@ def _cmd_appeals(arg, hub, me, reply):
     lines = ["Open appeals:"]
     for a in pending:
         what = "ban" if a["kind"] == "ban" else f"warning #{a['number']}"
-        lines.append(f"  #{a['id']}  {a['who']} — {what} ({format_time(a['time'])})")
+        lines.append(f"  #{a['id']}  {a['who']} — {what} ({ago_token(a['time'])})")
     lines.append("Decide with /accept <#> [reason] or /reject <#> [reason].")
     reply("\n".join(lines))
 
@@ -4095,8 +4219,8 @@ def _cmd_mute(arg, hub, me, reply):
     if target_sock:
         hub.send_private(target_sock, MUTE_NOTICE_PREFIX + f"You were muted by {me} for {minutes:g} minute(s). Reason: {reason}")
         hub.send_private(target_sock, MUTE_STATUS_PREFIX + f"1:{until}")
-    hub.log_admin_action(me, f"muted {name} until {format_until(until)}. Reason: {reason}")
-    reply(f"Muted {name} for {format_duration(minutes * 60)}, until {format_until(until)}. Reason: {reason}")
+    hub.log_admin_action(me, f"muted {name} until {until_token(until)}. Reason: {reason}")
+    reply(f"Muted {name} for {format_duration(minutes * 60)}, until {until_token(until)}. Reason: {reason}")
 
 def _cmd_unmute(arg, hub, me, reply):
     if not arg: return reply("Usage: /unmute <name>")
@@ -4132,7 +4256,7 @@ COMMAND_HANDLERS = {
     "/mute": _cmd_mute, "/unmute": _cmd_unmute, "/kick": _cmd_kick,
     "/nick": _cmd_nick, "/rename": _cmd_rename, "/warn": _cmd_warn,
     "/unwarn": _cmd_unwarn, "/history": _cmd_history, "/appeals": _cmd_appeals,
-    "/accept": _cmd_accept, "/reject": _cmd_reject,
+    "/accept": _cmd_accept, "/reject": _cmd_reject, "/warnings": _cmd_warnings,
 }
 # Commands a guest may only send if the host has made them an admin.
 MOD_COMMAND_NAMES = frozenset({"/mute", "/unmute", "/kick", "/ban", "/unban", "/ipban", "/slowmode", "/admin", "/unadmin", "/warn", "/rename",
@@ -4157,7 +4281,7 @@ GUEST_SIMPLE_EVENTS = (
     (ADMIN_NOTICE_PREFIX, "admin_status"),
     (ADMIN_LOG_PREFIX, "system"),
     (MUTE_STATUS_PREFIX, "mute_status"),
-    (MUTE_NOTICE_PREFIX, "private"),
+    (MUTE_NOTICE_PREFIX, "mute_notice"),
     (NOTICE_PREFIX, "private"),
 )
 LEAVE_PATTERN = re.compile(r"^\* (.+?) (?:left the chat|has been kicked|has been IP banned) \*$")
@@ -4188,13 +4312,13 @@ def guest_recv_loop(sock, fernet, event_queue, local_colors, colors_lock, known_
             except ValueError: pass
             return True
         if text.startswith(BAN_NOTICE_PREFIX):
-            until_str, _, reason = text[len(BAN_NOTICE_PREFIX):].partition("|")
-            put(("banned_live", {"message": f"You were banned from the chat hosted by {host_ip} until {until_str}. Reason: {reason}",
-                                 "until": until_str, "reason": reason}))
+            until_str, reason, host_name = parse_ban_notice(text[len(BAN_NOTICE_PREFIX):])
+            put(("banned_live", {"message": f"You were banned from the chat hosted by {host_name or host_ip} until {until_str}. Reason: {reason}",
+                                 "until": until_str, "reason": reason, "host_name": host_name}))
             return False
         if text.startswith(KICK_NOTICE_PREFIX):
             by, _, reason = text[len(KICK_NOTICE_PREFIX):].partition("|")
-            put(("disconnected", f"You were kicked by {by}. Reason: {reason}"))
+            put(("kicked", f"You were kicked by {by}. Reason: {reason}"))
             return False
         if text.startswith(HOST_DISCONNECT_PREFIX):
             put(("disconnected", "Host disconnected."))
@@ -4559,8 +4683,9 @@ class GuestConnection:
         except Exception: raise ConnectionError("Host disconnected unexpectedly.")
 
         if response.startswith(BAN_NOTICE_PREFIX):
-            until_str, _, reason = response[len(BAN_NOTICE_PREFIX):].partition("|")
-            raise BannedError(f"You are banned from this room until {until_str}. Reason: {reason}", until_str, reason)
+            until_str, reason, host_name = parse_ban_notice(response[len(BAN_NOTICE_PREFIX):])
+            where = f"the chat hosted by {host_name}" if host_name else "this room"
+            raise BannedError(f"You are banned from {where} until {until_str}. Reason: {reason}", until_str, reason)
         if response.startswith(NOTICE_PREFIX): raise PermissionError(response[len(NOTICE_PREFIX):])
         if not response.startswith(ROSTER_PREFIX): raise ConnectionError("Invalid handshake from host.")
 
@@ -4654,6 +4779,10 @@ class GuestConnection:
         if cmd == "/nick":
             if not arg.strip(): return put(("system", "Usage: /nick <new name>"))
             self._send(NICK_PREFIX + arg.strip())
+            return
+
+        if cmd == "/warnings":
+            self._send(CMD_PREFIX + f"warnings|{arg.strip()}")
             return
 
         if cmd == "/whisper":
@@ -4846,10 +4975,10 @@ class ChatApp(tk.Tk):
     WARN_GREEN = (BTN_GREEN, BTN_GREEN_HOVER)
     WARN_RED = (BTN_RED, BTN_RED_HOVER)
     WARN_WHITE = ("#FFFFFF", "#EEEEEE")
-    BASE_COMMANDS = ("/color", "/colors", "/list", "/clear", "/whisper", "/nick", "/warning", "/help")
+    BASE_COMMANDS = ("/color", "/colors", "/list", "/clear", "/whisper", "/nick", "/warnings", "/help")
     ADMIN_COMMANDS = ("/mute", "/unmute", "/kick", "/ban", "/unban", "/warn", "/unwarn", "/history", "/appeals",
                       "/accept", "/reject", "/slowmode", "/admin", "/unadmin")
-    PLAYER_ARG_COMMANDS = frozenset({"/mute", "/unmute", "/kick", "/ban", "/warn", "/unwarn", "/history", "/rename", "/whisper", "/admin", "/unadmin"})
+    PLAYER_ARG_COMMANDS = frozenset({"/mute", "/unmute", "/kick", "/ban", "/warn", "/unwarn", "/warnings", "/history", "/rename", "/whisper", "/admin", "/unadmin"})
     ACTIVITY_RANKED_COMMANDS = frozenset({"/mute", "/kick", "/ban", "/warn"})
     # Keys that never change the text, so they shouldn't refresh suggestions or typing state.
     NON_EDIT_KEYSYMS = frozenset({
@@ -4930,6 +5059,8 @@ class ChatApp(tk.Tk):
             "ping": lambda p: notify_ping(p, root=self),
             "file": self.render_incoming_file,
             "disconnected": self._handle_disconnected,
+            "kicked": self._on_kicked,
+            "mute_notice": self._on_mute_notice,
             "slowmode": self._on_slowmode_event,
             "admin_status": self._on_admin_status,
             "mute_status": self._on_mute_status,
@@ -5488,12 +5619,15 @@ class ChatApp(tk.Tk):
             self._set_ban_context(None)
             self._set_status(message, "ok")
             self.bell()
+            appeal_accepted = state == "unbanned" and (status.get("reason") or "").startswith("your appeal was accepted")
+            self._toast("Appeal accepted" if appeal_accepted else ("Unbanned" if state == "unbanned" else "Ban ended"), message.lstrip("✅ "))
             popup = self._open_dialog("unbanned", "Unbanned", padx=24, pady=20)
             if popup is not None:
                 tk.Label(popup, text="✅  You have been unbanned", bg=BG_PANEL, fg=COLOR_PALETTE["green"], font=(CHAT_FONT[0], 14, "bold")).pack(anchor="w")
                 tk.Label(popup, text=body.split("\n\n", 1)[1], bg=BG_PANEL, fg=FG_TEXT, font=CHAT_FONT, wraplength=380, justify="left").pack(anchor="w", pady=(10, 0))
                 make_button(popup, "OK", lambda: self._close_popup("unbanned"), bg=BTN_NEUTRAL, hover_bg=BTN_NEUTRAL_HOVER, padx=18, pady=5).pack(anchor="e", pady=(16, 0))
                 popup.lift()
+                self._raise_for_attention(popup)
             return
         appeal = (status or {}).get("appeal")
         if appeal and appeal.get("status") == "rejected" and not ctx.get("appeal_result_shown"):
@@ -5501,7 +5635,60 @@ class ChatApp(tk.Tk):
             self._refresh_ban_button()
             self._set_status(f"Your ban appeal was rejected by {appeal.get('by', 'the host')}. Reason: {appeal.get('reason', 'no reason given')}", "error")
             self.bell()
+            self._toast("Ban appeal rejected", f"Rejected by {appeal.get('by', 'the host')}. Reason: {appeal.get('reason', 'no reason given')}")
         self._set_timer("ban_poll", BAN_POLL_SECONDS * 1000, self._poll_ban_status)
+
+    def _toast(self, title: str, message: str):
+        """A desktop notification for a moderation outcome. Not shown under Do Not Disturb."""
+        if not self.dnd_active:
+            notify_toast(title, message, root=self)
+
+    def _raise_for_attention(self, popup=None):
+        """Warnings, mutes, kicks and bans jump in front of everything — even other apps, and even if this window
+        was minimised. Under Do Not Disturb they don't: they wait quietly and are there when the window is next opened."""
+        if self.dnd_active:
+            return
+        try:
+            if self.state() == "iconic": self.deiconify()
+            self.lift()
+            self.attributes("-topmost", True)
+            if popup is not None:
+                popup.lift()
+                popup.attributes("-topmost", True)
+            self.focus_force()
+            def settle():  # float on top just long enough to be seen, then behave like a normal window again
+                for w in (self, popup):
+                    try:
+                        if w is not None: w.attributes("-topmost", False)
+                    except tk.TclError:
+                        pass
+            self.after(1500, settle)
+        except tk.TclError:
+            pass
+
+    def _show_moderation_notice(self, name: str, heading: str, message: str, color: str, appeal_button: bool = False):
+        """A small notice window for being muted, kicked or banned (the warning has its own dialog)."""
+        popup = self._open_dialog(name, heading, padx=24, pady=20)
+        if popup is None:
+            return
+        tk.Label(popup, text=heading, bg=BG_PANEL, fg=color, font=(CHAT_FONT[0], 14, "bold")).pack(anchor="w")
+        tk.Label(popup, text=localize_times(message), bg=BG_PANEL, fg=FG_TEXT, font=CHAT_FONT, wraplength=400, justify="left").pack(anchor="w", pady=(10, 0))
+        buttons = tk.Frame(popup, bg=BG_PANEL)
+        buttons.pack(anchor="e", pady=(16, 0))
+        if appeal_button and self._ban_ctx:
+            make_button(buttons, "Appeal", lambda: (self._close_popup(name), self._open_ban_appeal()), bg=COLOR_PALETTE["blue"], hover_bg=BTN_BLUE_HOVER, padx=16, pady=5).pack(side="left", padx=(0, 8))
+        make_button(buttons, "OK", lambda: self._close_popup(name), bg=BTN_NEUTRAL, hover_bg=BTN_NEUTRAL_HOVER, padx=18, pady=5).pack(side="left")
+        self._raise_for_attention(popup)
+
+    def _on_kicked(self, message: str):
+        was_in_chat = self.connection is not None
+        self._handle_disconnected(message)
+        if was_in_chat:
+            self._show_moderation_notice("mod_kick", "You were kicked", message, COLOR_PALETTE["red"])
+
+    def _on_mute_notice(self, text: str):
+        self.append_private_line(text)
+        self._show_moderation_notice("mod_mute", "🔇  You were muted", text, COLOR_PALETTE["yellow"])
 
     def _on_banned(self, ctx):
         """Joining was refused because we're banned: say so, and offer to appeal."""
@@ -5518,6 +5705,8 @@ class ChatApp(tk.Tk):
             ctx = {**payload, "host_ip": conn.host, "port": conn.port, "fernet": conn.fernet, "name": self.my_name, "room_code": self._room_code}
         self._return_to_connect_screen(payload["message"], "error")
         self._set_ban_context(ctx)
+        self._toast("You were banned", payload["message"])
+        self._show_moderation_notice("mod_ban", "You were banned", payload["message"], COLOR_PALETTE["red"], appeal_button=True)
 
     def _open_ban_appeal(self):
         ctx = self._ban_ctx
@@ -5724,6 +5913,7 @@ class ChatApp(tk.Tk):
         self._warn_fx = None
         self._refresh_warn_button()
         self._show_warning_dialog()
+        self._raise_for_attention(self._popups.get("warning_view"))
 
     def _refresh_warn_button(self):
         """The ⚠ button in the top bar: there for as long as we hold a warning, so closing the pop-up
@@ -5737,7 +5927,7 @@ class ChatApp(tk.Tk):
         self._paint_warn_btn(self.WARN_YELLOW)
         number = warning["count"]
         if warning["state"] == "rejected":
-            note = " · appeal rejected"
+            note = "" if warning.get("note_done") else " · appeal rejected"  # shown for 3 s after the flash (see _warn_btn_rejected)
         elif number in self._appealed_warnings:
             note = " · appeal sent"
         else:
@@ -5778,7 +5968,13 @@ class ChatApp(tk.Tk):
             if self._warn_fx != "flash":
                 return
             if not sequence:
-                return self._end_warn_fx()
+                # Flashing done: back to yellow, "appeal rejected" stays up for 3 more seconds, then the warning number.
+                self._paint_warn_btn(self.WARN_YELLOW)
+                def show_number():
+                    if self._latest_warning is not None:
+                        self._latest_warning["note_done"] = True
+                    self._end_warn_fx()
+                return self._set_timer("warn_fx", 3000, show_number)
             self._paint_warn_btn(sequence.pop(0))
             self._set_timer("warn_fx", 120, step)
         step()
@@ -5804,11 +6000,15 @@ class ChatApp(tk.Tk):
         else:
             make_button(buttons, "Appeal", lambda: self._open_warning_appeal(count, by, reason), bg=COLOR_PALETTE["blue"], hover_bg=BTN_BLUE_HOVER, padx=16, pady=5).pack(side="left", padx=(0, 8))
         make_button(buttons, "Close", lambda: self._close_popup("warning_view"), bg=BTN_NEUTRAL, hover_bg=BTN_NEUTRAL_HOVER, padx=18, pady=5).pack(side="left")
-        tk.Label(popup, text="Closing this is fine — the ⚠ button at the top of the chat (or /warning) brings it back.", bg=BG_PANEL, fg=FG_MUTED, font=(CHAT_FONT[0], 8)).pack(anchor="w", pady=(10, 0))
+        tk.Label(popup, text="Closing this is fine — the ⚠ button at the top of the chat brings it back, and /warnings lists them all.", bg=BG_PANEL, fg=FG_MUTED, font=(CHAT_FONT[0], 8)).pack(anchor="w", pady=(10, 0))
         popup.lift()
 
     def _on_warn_state(self, payload):
         """The host tells us how our latest warning ended up: removed, or its appeal rejected."""
+        if payload["state"] == "accepted":
+            self._toast("Appeal accepted", f"Your appeal for warning #{payload['number']} was accepted — the warning was removed.")
+        elif payload["state"] == "rejected":
+            self._toast("Appeal rejected", f"Your appeal for warning #{payload['number']} was rejected — the warning stands.")
         warning = self._latest_warning
         if warning is None or warning["count"] != payload["number"]:
             return  # not the warning we're showing
@@ -6285,13 +6485,6 @@ class ChatApp(tk.Tk):
         first_word = text.split()[0].lower()
         if first_word == "/clear":
             self._handle_clear_command(text.split())
-            return "break"
-
-        if first_word == "/warning":
-            if self._latest_warning is None:
-                self.append_system_line("You don't have any warnings right now.")
-            else:
-                self._show_warning_dialog()
             return "break"
 
         if first_word == "/globalban":
@@ -7120,11 +7313,11 @@ class ChatApp(tk.Tk):
 
     def append_system_line(self, text: str):
         with self._log_append():
-            self.log.insert("end", f"* {text}\n", ("system",))
+            self.log.insert("end", f"* {localize_times(text)}\n", ("system",))
 
     def append_private_line(self, text: str):
         with self._log_append():
-            self.log.insert("end", f"[private] {text}\n", ("private",))
+            self.log.insert("end", f"[private] {localize_times(text)}\n", ("private",))
 
     # ---- reactions ----
 
