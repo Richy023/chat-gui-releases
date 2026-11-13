@@ -1,6 +1,21 @@
 #!/usr/bin/env python3
 """
-chat_gui.py — v1.5.0b — ENCRYPTED instant messenger with a desktop GUI.
+chat_gui.py — v1.5.0c — ENCRYPTED instant messenger with a desktop GUI.
+
+Changes in 1.5.0c:
+- Game leaderboards show how many people are playing right now ("● 2 playing") instead of a
+  "playing — score" tag on every row.
+- Joining by Room Code is more forgiving and clearer: spaces, dashes, line breaks and full-width
+  digits are ignored, and the error says what's actually wrong ("you've entered 5 digits", or
+  "each half has to be 000–255") instead of always saying "must be 6 digits".
+- Hosts now prefer a fixed port, so a joiner whose Wi-Fi blocks the UDP lookup can still find the
+  room with plain TCP, and connection failures explain themselves ("no answer — Wi-Fi may be
+  blocking devices from talking to each other" vs "nothing is listening there").
+- New: "Report a bug or suggest a feature" on the home screen — pick bug or suggestion, say what it
+  is, add detail if you like. The date, version and OS are added automatically. Reports are saved
+  on the computer they were written on and, if REPORT_WORKER_URL points at your report server (the
+  free Cloudflare Worker in report_worker.js), sent there too. Ctrl+Shift+B opens the report inbox
+  (password protected) — with a report server set, it shows everyone's reports.
 
 Changes in 1.5.0b:
 - Durations in /mute, /ban and /ipban now take units: 30 (minutes, as before), 90m, 2h, 7d, 2w,
@@ -346,6 +361,7 @@ import random
 import math
 import datetime
 import calendar
+import unicodedata
 import base64
 import hashlib
 import importlib
@@ -409,7 +425,7 @@ except ImportError:
 if sys.platform == "darwin":
     ensure_installed("pyobjus", required=False)
 
-VERSION = "1.5.0b"
+VERSION = "1.5.0c"
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -465,6 +481,8 @@ MAC_VIRTUAL_KEYCODE_TO_KEY = {
     0x16: "6", 0x1A: "7", 0x1C: "8", 0x19: "9",
 }
 DISCOVERY_PORT = 5005
+ENABLE_INVITE_CODES = False   # Invite Codes (a longer code holding a room's full address) are built but switched off: Room Codes only, for now
+DEFAULT_TCP_PORT = 47615   # hosts try this port first, so a joiner can reach them with TCP alone if the UDP lookup is blocked
 
 # ---- OTA updates ----
 # Point this at a JSON manifest you host over HTTPS (e.g. a raw GitHub
@@ -744,7 +762,7 @@ class GameWindowBase(tk.Toplevel):
         self._tick_job = None
         self._reported = None           # (score, playing) last sent to the room
         self._board_layout = None       # what the leaderboard's widgets were built for (see refresh_leaderboard)
-        self._board_rows, self._best_label = [], None
+        self._board_rows, self._best_label, self._playing_label = [], None, None
         self.title(self.GAME_TITLE)
         self.configure(bg=BG_DARK, padx=12, pady=12)
         self.resizable(False, False)
@@ -793,7 +811,9 @@ class GameWindowBase(tk.Toplevel):
             in_room = self.app.in_room()
             me = self.app.game_player_name().lower()
             # Our own row is always listed (even at 0), so it doesn't pop in — and resize the window — at our first flap.
-            rows = [e for e in self.app.game_boards[self.GAME_KEY].values() if e["best"] > 0 or e["playing"] or e["name"].lower() == me]
+            board = self.app.game_boards[self.GAME_KEY]
+            playing_now = sum(1 for e in board.values() if e["playing"])
+            rows = [e for e in board.values() if e["best"] > 0 or e["playing"] or e["name"].lower() == me]
             rows.sort(key=lambda e: (-e["best"], e["name"].lower()))
             rows = rows[:self.LEADERBOARD_ROWS]
             my_best = self.app.game_best(self.GAME_KEY)
@@ -801,9 +821,10 @@ class GameWindowBase(tk.Toplevel):
             if layout != self._board_layout:
                 self._board_layout = layout
                 self._rebuild_leaderboard(frame, in_room, rows, my_best)
-            for (best_label, playing_label), entry in zip(self._board_rows, rows):
+            for best_label, entry in zip(self._board_rows, rows):
                 self._set_label(best_label, f"  best {entry['best']}")
-                self._set_label(playing_label, f"   ● playing — {entry['score']}" if entry["playing"] else "")
+            if self._playing_label is not None:
+                self._set_label(self._playing_label, f"● {playing_now} playing" if in_room and playing_now else "")
             if self._best_label is not None:
                 self._set_label(self._best_label, f"Your best on this computer: {my_best}" if my_best else "\u00a0")
         except tk.TclError:
@@ -818,7 +839,11 @@ class GameWindowBase(tk.Toplevel):
         for w in frame.winfo_children(): w.destroy()
         self._board_rows, self._best_label = [], None
         title = "Leaderboard — this chat" if in_room else "Leaderboard — not in a chat"
-        tk.Label(frame, text=title, bg=BG_DARK, fg=FG_MUTED, font=BOLD_FONT).pack(anchor="w")
+        header = tk.Frame(frame, bg=BG_DARK)
+        header.pack(fill="x")
+        tk.Label(header, text=title, bg=BG_DARK, fg=FG_MUTED, font=BOLD_FONT).pack(side="left")
+        self._playing_label = tk.Label(header, text="", bg=BG_DARK, fg=COLOR_PALETTE["green"], font=CHAT_FONT)  # "● 2 playing", filled in place
+        self._playing_label.pack(side="right")
         if not rows:
             tk.Label(frame, text="No scores yet — be the first!" if in_room else "No scores yet — go on, give it a go!",
                      bg=BG_DARK, fg=FG_MUTED, font=CHAT_FONT).pack(anchor="w")
@@ -829,9 +854,7 @@ class GameWindowBase(tk.Toplevel):
             tk.Label(row, text=entry["name"], bg=BG_DARK, fg=self.app.game_name_color(entry["name"]), font=BOLD_FONT).pack(side="left", padx=(4, 0))
             best_label = tk.Label(row, text="", bg=BG_DARK, fg=FG_TEXT, font=CHAT_FONT)
             best_label.pack(side="left")
-            playing_label = tk.Label(row, text="", bg=BG_DARK, fg=COLOR_PALETTE["green"], font=CHAT_FONT)
-            playing_label.pack(side="left")
-            self._board_rows.append((best_label, playing_label))
+            self._board_rows.append(best_label)
         self._best_label = tk.Label(frame, text="\u00a0", bg=BG_DARK, fg=FG_MUTED, font=(CHAT_FONT[0], 9))  # always there: it fills in later
         self._best_label.pack(anchor="w", pady=(4, 0))
         note = "Resets when the chat is restarted." if in_room else "Join a chat and your scores show up for everyone in it."
@@ -1106,6 +1129,70 @@ BTN_NEUTRAL_HOVER = "#6D6F78"
 def derive_key(passphrase: str) -> bytes:
     digest = hashlib.sha256(passphrase.encode("utf-8")).digest()
     return base64.urlsafe_b64encode(digest)
+
+# ---- Invite Codes: the room's whole address (IPv4 + port, 48 bits) as 10 characters + 1 check character ----
+# A Room Code is only the last two numbers of the host's IP, so the joiner has to go looking for the rest — which
+# fails on networks that block broadcasts or span several subnets. An Invite Code holds the entire address, so
+# joining is just one direct connection. (Crockford's alphabet: no I, L, O or U, so a misread still decodes.)
+_INVITE_ALPHABET = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
+_INVITE_LOOKALIKES = str.maketrans({"O": "0", "I": "1", "L": "1", "U": "V"})
+
+def _invite_check(chars: str) -> str:
+    return _INVITE_ALPHABET[sum((2 * i + 1) * _INVITE_ALPHABET.index(c) for i, c in enumerate(chars)) % 32]  # odd weights: any single wrong character changes the sum
+
+def make_invite_code(ip: str, port: int) -> str:
+    a, b, c, d = (int(part) for part in ip.split("."))
+    value = (((a << 24) | (b << 16) | (c << 8) | d) << 16) | (int(port) & 0xFFFF)
+    chars = ""
+    for _ in range(10):
+        chars = _INVITE_ALPHABET[value & 31] + chars
+        value >>= 5
+    chars += _invite_check(chars)
+    return f"{chars[:4]}-{chars[4:8]}-{chars[8:]}"
+
+def parse_invite_code(cleaned: str):
+    """-> (ip, port). `cleaned` is already upper-case with the dashes and spaces gone. Raises ValueError (with a
+    message fit to show the user) if it isn't a valid Invite Code."""
+    cleaned = cleaned.translate(_INVITE_LOOKALIKES)
+    if len(cleaned) != 11 or any(ch not in _INVITE_ALPHABET for ch in cleaned):
+        raise ValueError("That doesn't look like a Room Code (6 digits) or an Invite Code (11 letters and numbers, like 7K2M-9QXA-R5B).")
+    if _invite_check(cleaned[:10]) != cleaned[10]:
+        raise ValueError("That Invite Code has a typo in it — check it against the host's screen (or have them send it again).")
+    value = 0
+    for ch in cleaned[:10]:
+        value = (value << 5) | _INVITE_ALPHABET.index(ch)
+    port, ip_int = value & 0xFFFF, value >> 16
+    if ip_int >> 32 or not 1 <= port <= 65535:
+        raise ValueError("That Invite Code isn't valid.")
+    return ".".join(str((ip_int >> shift) & 255) for shift in (24, 16, 8, 0)), port
+
+def normalize_room_input(text: str) -> str:
+    """What's in the Room Code box, with the noise taken out: spaces, dashes, dots, line breaks and invisible
+    characters are dropped, full-width / other-script digits become 0-9, letters are upper-cased."""
+    out = []
+    for ch in unicodedata.normalize("NFKC", text):
+        if ch.isdecimal(): out.append(str(unicodedata.decimal(ch)))
+        elif ch.isalpha(): out.append(ch.upper())
+    return "".join(out)
+
+def interpret_room_input(text: str):
+    """-> ("room", "123456") | ("invite", (ip, port)) | ("error", message-for-the-user)."""
+    cleaned = normalize_room_input(text)
+    if not cleaned:
+        return "error", "Enter the Room Code (or Invite Code) from the host." if ENABLE_INVITE_CODES else "Enter the Room Code from the host."
+    if ENABLE_INVITE_CODES and len(cleaned) == 11:
+        try: return "invite", parse_invite_code(cleaned)
+        except ValueError as e: return "error", str(e)
+    if cleaned.isdigit():
+        if len(cleaned) != 6:
+            return "error", f"A Room Code is 6 digits — you've entered {len(cleaned)}. (Check it against the host's screen.)"
+        if int(cleaned[:3]) > 255 or int(cleaned[3:]) > 255:
+            return "error", f"{cleaned[:3]} {cleaned[3:]} can't be a Room Code: each half has to be between 000 and 255. Check it against the host's screen."
+        return "room", cleaned
+    if not ENABLE_INVITE_CODES:
+        return "error", "A Room Code is 6 digits — numbers only. (Check it against the host's screen.)"
+    try: return "invite", parse_invite_code(cleaned)
+    except ValueError as e: return "error", str(e)
 
 def generate_room_code(local_ip: str = None) -> str:
     ip = local_ip or get_local_ip()
@@ -1621,6 +1708,92 @@ def remember_recent_host(room_code: str, host_ip: str, port: int):
     entries.insert(0, {"room_code": room_code, "host_ip": host_ip, "port": port, "last_connected": time.time()})
     save_recent_hosts(entries[:RECENT_HOSTS_MAX_ENTRIES])
 
+# ---- Bug reports and feature suggestions ----
+REPORTS_FILE = app_path("chat_gui_reports.json")
+REPORTS_KEYBIND = "<Control-Shift-KeyPress-B>"   # opens the report inbox (asks for the password)
+# The inbox "password" is deliberately light — this is a friends' app and the file is readable anyway. It's stored as a
+# SHA-256 of salt + password; to change it: python3 -c "import hashlib; print(hashlib.sha256(b'chat_gui-reports|YOURPASSWORD').hexdigest())"
+REPORTS_PASSWORD_SHA256 = "b7f6b0c151a099ce850f1da345e9e97db90b5f6cc960f5a895e17f337025c07a"
+# Optional: where reports go so you receive everyone's. Reports are always saved on the computer they were written on; with this
+# set they're also sent to YOUR report server — a free Cloudflare Worker (the code is in report_worker.js, with setup steps) — and
+# the inbox (Ctrl+Shift+B) then shows reports from everyone's computers. Paste the Worker's address between the quotes,
+# e.g. "https://chat-gui-reports.yourname.workers.dev". Leave it empty to keep reports on each computer only.
+REPORT_WORKER_URL = "https://chat-gui-reports.richardfeng023.workers.dev"
+REPORT_COOLDOWN_SECONDS = 20
+
+def _os_label() -> str:
+    system = platform.system()
+    if system == "Darwin": return f"macOS {platform.mac_ver()[0]}".strip()
+    return f"{system} {platform.release()}".strip()
+
+def new_report(kind: str, summary: str, description: str) -> dict:
+    """A report with its date, version and OS filled in automatically (no name, address or messages)."""
+    return {"id": time.time_ns(), "kind": "feature" if kind == "feature" else "bug", "summary": " ".join(summary.split())[:120],
+            "description": description.strip()[:2000], "version": VERSION, "date": time.strftime("%Y-%m-%d %H:%M"),
+            "os": _os_label(), "status": "open", "delivered": False}
+
+def load_reports() -> list:
+    return [r for r in load_json(REPORTS_FILE, list) if isinstance(r, dict)]
+
+def save_report(report: dict):
+    save_json(REPORTS_FILE, ([report] + load_reports())[:500])
+
+def update_report(report_id, **changes):
+    reports = load_reports()
+    for r in reports:
+        if r.get("id") == report_id: r.update(changes)
+    save_json(REPORTS_FILE, reports)
+
+def delete_report(report_id):
+    save_json(REPORTS_FILE, [r for r in load_reports() if r.get("id") != report_id])
+
+def format_report_text(r: dict) -> str:
+    kind = "Feature suggestion" if r.get("kind") == "feature" else "Bug report"
+    lines = [f"{kind}: {r.get('summary', '')}", f"Reported {r.get('date', '?')} · chat_gui v{r.get('version', '?')} · {r.get('os', '?')}"]
+    if r.get("description"): lines += ["", r["description"]]
+    return "\n".join(lines)
+
+def check_reports_password(attempt: str) -> bool:
+    import hmac
+    digest = hashlib.sha256(("chat_gui-reports|" + attempt).encode("utf-8")).hexdigest()
+    return hmac.compare_digest(digest, REPORTS_PASSWORD_SHA256)
+
+def report_server():
+    """The report server's address from REPORT_WORKER_URL, or None if it isn't set."""
+    url = REPORT_WORKER_URL.strip().rstrip("/")
+    return url if re.match(r"^https?://[^/\s]+", url) else None
+
+def worker_call(path: str, body: dict = None, password: str = None, timeout: float = 8):
+    """Talks to the report server. -> (HTTP status, decoded JSON or None); (None, None) if it can't be reached.
+    A `body` makes it a POST; `password` is sent as the admin key (only the inbox needs that)."""
+    base = report_server()
+    if base is None:
+        return None, None
+    headers = {"User-Agent": "chat_gui-reporter/1.0"}
+    data = None
+    if body is not None:
+        data = json.dumps(body).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    if password:
+        headers["Authorization"] = "Bearer " + password
+    request = urllib.request.Request(base + path, data=data, headers=headers, method="POST" if body is not None else "GET")
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            status, raw = response.status, response.read()
+    except urllib.error.HTTPError as e:   # the server answered, with an error status
+        status, raw = e.code, e.read()
+    except Exception:                     # offline, wrong address, blocked…
+        return None, None
+    try: return status, json.loads(raw.decode("utf-8"))
+    except ValueError: return status, None
+
+def deliver_report(report: dict) -> bool:
+    """Sends a report to the report server, if one is set. True only if the server stored it."""
+    status, data = worker_call("/report", body={
+        "id": str(report.get("id", "")), "kind": report.get("kind", "bug"), "summary": report.get("summary", ""),
+        "description": report.get("description", ""), "version": report.get("version", ""), "os": report.get("os", ""), "date": report.get("date", "")})
+    return status == 200 and isinstance(data, dict) and bool(data.get("ok"))
+
 def relative_time_str(timestamp: float) -> str:
     delta = max(0, time.time() - timestamp)
     if delta < 60: return "just now"
@@ -1848,6 +2021,17 @@ def perform_globalban(fingerprint: str, reason: str) -> str:
 # install time, so the in-app viewer stays complete going forward
 # without needing the whole history re-embedded on every release.
 EMBEDDED_CHANGELOG = [
+    {   "version": "1.5.0c",
+        "date": "2026-11-11",
+        "notes": (
+            "Game leaderboards now show how many people are playing ('● 2 playing') instead of a tag on every "
+            "row. Joining is clearer and more forgiving: spaces and dashes in a Room Code are ignored, and the "
+            "error says what's actually wrong. Hosts now prefer a fixed port so joiners whose Wi-Fi blocks the "
+            "lookup can still find them, and connection failures explain themselves. New: 'Report a bug or "
+            "suggest a feature' on the home screen (date, version and OS added automatically), with a "
+            "password-protected report inbox on Ctrl+Shift+B that can show everyone's reports."
+        ),
+    },
     {   "version": "1.5.0b",
         "date": "2026-11-10",
         "notes": (
@@ -4568,6 +4752,22 @@ def guest_recv_loop(sock, fernet, event_queue, local_colors, colors_lock, known_
 
 # ---- Connections ----
 
+def bind_host_socket() -> socket.socket:
+    """The room's listening socket. It prefers the well-known port (so a joiner on a network that blocks the UDP
+    lookup can still find the room with a plain TCP connection); if that's taken, any free port."""
+    for port in (DEFAULT_TCP_PORT, 0):
+        server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            if os.name == "nt" and port and hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+                server.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)  # (SO_REUSEADDR would let a second copy share the port on Windows)
+            else:
+                server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            server.bind(("0.0.0.0", port))
+            return server
+        except OSError:
+            server.close()
+            if port == 0: raise
+
 class HostConnection:
     def __init__(self, name, room_code, fernet, event_queue):
         self.name = name
@@ -4583,9 +4783,7 @@ class HostConnection:
         self.local_files = FileAssembler(event_queue)  # the host's own copy of files addressed to it
         self.hub.local_files = self.local_files
 
-        self.server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.server.bind(("0.0.0.0", 0))
+        self.server = bind_host_socket()
         self.tcp_port = self.server.getsockname()[1]
         self.server.listen(MAX_GUESTS)
 
@@ -5030,15 +5228,43 @@ def make_button(parent, text, command, bg, fg="white", font=BOLD_FONT, padx=14, 
     return frame
 
 
-def resolve_join_target(room_code: str, manual_target: str = None):
-    """Works out where to connect for a Join. Returns
-    (host_ip, port, unlock_prefix, error_message) — error_message is None on success."""
+def probe_tcp_hosts(ips, port: int = DEFAULT_TCP_PORT, timeout: float = 1.5):
+    """TCP-only fallback for when the UDP lookup gets no answer: is a chat host listening on the well-known
+    port at any of these addresses? Returns the first (in the order given) that accepts a connection, else None."""
+    answered = {}
+    def probe(ip):
+        try:
+            with socket.create_connection((ip, port), timeout=timeout):
+                answered[ip] = True
+        except OSError:
+            pass
+    threads = [threading.Thread(target=probe, args=(ip,), daemon=True) for ip in ips]
+    for t in threads: t.start()
+    for t in threads: t.join(timeout + 0.5)
+    return next((ip for ip in ips if answered.get(ip)), None)
+
+def friendly_connect_error(e: Exception, host_ip: str, port: int) -> str:
+    text = str(e).lower()
+    if isinstance(e, ConnectionRefusedError):
+        return (f"{host_ip}:{port} answered, but nothing is listening there — the room may have closed, or its port changed. "
+                + ("Ask the host for a fresh Invite Code (/invite)." if ENABLE_INVITE_CODES else "Check the host is still running, then try again."))
+    if isinstance(e, (socket.timeout, TimeoutError)) or "timed out" in text:
+        return (f"No answer from {host_ip}:{port}. On school or public Wi-Fi, devices are often blocked from talking to each other — "
+                "try a phone hotspot, or check you're on the same network as the host.")
+    return f"Connection failed: {e}"
+
+def resolve_join_target(room_code, manual_target: str = None):
+    """Works out where to connect for a Join. `room_code` is the 6-digit code, or the (ip, port) an Invite Code
+    carries. Returns (host_ip, port, unlock_prefix, error_message) — error_message is None on success."""
     unlock_prefix = None
     if manual_target:
         match = GRADIENT_UNLOCK_CODES.get(manual_target.strip().lower())
         if match:
             # Not a real address — a secret code. Join as if the field were empty.
             unlock_prefix, manual_target = match[1], None
+
+    if isinstance(room_code, tuple):  # an Invite Code: the whole address is in it, so there's nothing to look up
+        return room_code[0], room_code[1], unlock_prefix, None
 
     host_ip = port = None
     if manual_target:
@@ -5051,7 +5277,10 @@ def resolve_join_target(room_code: str, manual_target: str = None):
 
     if not ENABLE_WAN_RELAY and not (host_ip and port):
         if host_ip:
-            host_ip, port = discover_host(room_code, target_ip=host_ip)
+            typed_ip = host_ip
+            host_ip, port = discover_host(room_code, target_ip=typed_ip)
+            if not host_ip and probe_tcp_hosts([typed_ip]):
+                host_ip, port = typed_ip, DEFAULT_TCP_PORT
         else:
             # Fast path first: Room Code = last two octets, so try the likely address directly.
             # Try the prefix of every network we're on, not just the default-route one.
@@ -5059,14 +5288,21 @@ def resolve_join_target(room_code: str, manual_target: str = None):
             for ip in get_local_ips():
                 prefix = ".".join(ip.split(".")[:2])
                 if prefix not in prefixes: prefixes.append(prefix)
-            guesses = {f"{p}.{int(room_code[:3])}.{int(room_code[3:])}" for p in prefixes}
+            guesses = [f"{p}.{int(room_code[:3])}.{int(room_code[3:])}" for p in prefixes]
             if guesses:
-                host_ip, port = discover_host(room_code, target_ip=guesses, timeout=1.5)
+                host_ip, port = discover_host(room_code, target_ip=set(guesses), timeout=1.5)
             if not host_ip:
                 host_ip, port = discover_host(room_code)
+            if not host_ip and guesses:  # the UDP lookup got nowhere — try a plain TCP connection to the well-known port
+                if found := probe_tcp_hosts(guesses):
+                    host_ip, port = found, DEFAULT_TCP_PORT
 
     if not host_ip:
-        return None, None, unlock_prefix, f"Could not find Room {room_code}. Ensure the host is running and you are on the same Wi-Fi/network — or enter the host's IP in the 'Host IP' field."
+        return None, None, unlock_prefix, (
+            f"Could not find Room {room_code}. Check the host is running and you're on the same network. "
+            + ("Still stuck? Ask the host to type /invite in their chat and paste the Invite Code here instead of the Room Code. " if ENABLE_INVITE_CODES
+               else "Still stuck? Type the host's IP address in the 'Host IP' box. ") +
+            "(School and public Wi-Fi often block devices from finding each other — a phone hotspot gets around that.)")
     return host_ip, port, unlock_prefix, None
 
 
@@ -5077,7 +5313,7 @@ class ChatApp(tk.Tk):
     WARN_GREEN = (BTN_GREEN, BTN_GREEN_HOVER)
     WARN_RED = (BTN_RED, BTN_RED_HOVER)
     WARN_WHITE = ("#FFFFFF", "#EEEEEE")
-    BASE_COMMANDS = ("/color", "/colors", "/list", "/clear", "/whisper", "/nick", "/warnings", "/help")
+    BASE_COMMANDS = ("/color", "/colors", "/list", "/clear", "/whisper", "/nick", "/warnings") + (("/invite",) if ENABLE_INVITE_CODES else ()) + ("/help",)
     ADMIN_COMMANDS = ("/mute", "/unmute", "/kick", "/ban", "/unban", "/warn", "/unwarn", "/history", "/appeals",
                       "/accept", "/reject", "/slowmode", "/admin", "/unadmin")
     PLAYER_ARG_COMMANDS = frozenset({"/mute", "/unmute", "/kick", "/ban", "/warn", "/unwarn", "/warnings", "/history", "/rename", "/whisper", "/admin", "/unadmin"})
@@ -5119,6 +5355,8 @@ class ChatApp(tk.Tk):
         self.suggest_popup = None
         self._game_wins = {}           # game key -> its open window (they outlive chats: you can play on the home screen)
         self._game_picker = None
+        self._last_report_time = 0.0
+        self._report_login_failures = 0
         self._rainbow_instance_seq = 0
         self._job_seq = 0
         self._session_id = 0
@@ -5149,6 +5387,8 @@ class ChatApp(tk.Tk):
             "features": lambda _: self._games_context_changed(),
             "warn_state": self._on_warn_state,
             "warn_sync": self._on_warn_sync,
+            "report_result": self._on_report_result,
+            "bg_done": self._on_bg_done,
             "upload_done": self._on_upload_done,
             "upload_progress": self._on_upload_progress,
             "transfer_progress": self._on_transfer_progress,
@@ -5179,6 +5419,7 @@ class ChatApp(tk.Tk):
         self._focus_first_empty()
 
         self.bind_all(GAMES_KEYBIND, self.on_open_games)
+        self.bind_all(REPORTS_KEYBIND, self.on_open_reports)
         self.bind("<FocusIn>", self._on_focus_in)
         self.bind_all("<Button-1>", self._on_global_click, add="+")  # click-away closes the in-window pickers
         self.protocol("WM_DELETE_WINDOW", self.on_close)
@@ -5506,8 +5747,10 @@ class ChatApp(tk.Tk):
         self.recent_list_frame = tk.Frame(self.recent_frame, bg=BG_PANEL)
         self.recent_list_frame.pack(fill="x")
 
-        digits_only = (self.register(lambda p: p == "" or (p.isdigit() and len(p) <= 6)), "%P")
-        self.room_entry = field(4, "Room Code", validate_cmd=digits_only, entry_width=20)
+        # Room Code (6 digits) or Invite Code (11 letters/numbers, usually written with dashes). Spaces and dashes are
+        # allowed so a pasted "123 456" or "7K2M-9QXA-R5B" isn't rejected on the spot; it's tidied up when you connect.
+        room_chars = (self.register(lambda p: len(p) <= 20 and all((ch.isalnum() if ENABLE_INVITE_CODES else ch.isdecimal()) or ch in " -." for ch in p)), "%P")
+        self.room_entry = field(4, "Room Code", validate_cmd=room_chars, entry_width=20)
         self.regen_room_btn = make_button(card, "Refresh", self._regenerate_room_code, bg=BTN_NEUTRAL, hover_bg=BTN_NEUTRAL_HOVER, padx=8, pady=4, font=CHAT_FONT)
         self.regen_room_btn.grid(row=4, column=2, sticky="w", padx=(8, 0), pady=(6, 0))
 
@@ -5523,6 +5766,9 @@ class ChatApp(tk.Tk):
         self.appeal_btn = make_button(card, "APPEAL BAN", self._open_ban_appeal, bg=BTN_RED, hover_bg=BTN_RED_HOVER)
         self.appeal_btn.grid(row=9, column=0, columnspan=3, pady=(8, 0), sticky="ew")
         self.appeal_btn.grid_remove()
+        report_link = tk.Label(card, text="💡 Report a bug or suggest a feature", bg=BG_PANEL, fg=FG_MUTED, font=link_font, cursor="hand2")
+        report_link.grid(row=10, column=0, columnspan=3, pady=(14, 0))
+        report_link.bind("<Button-1>", lambda e: self._open_report_dialog())
 
         self.mode_var.trace_add("write", lambda *_args: self._on_mode_change())
         self._on_mode_change()
@@ -5544,7 +5790,7 @@ class ChatApp(tk.Tk):
             self.host_ip_entry.grid_remove()
             self.host_ip_entry.label.grid_remove()
         else:
-            self.room_entry.label.configure(text="Room Code (from host)")
+            self.room_entry.label.configure(text="Room Code or Invite Code (from host)" if ENABLE_INVITE_CODES else "Room Code (from host)")
             self.regen_room_btn.grid_remove()
             self.room_entry.configure(state="normal")
             self.room_entry.delete(0, "end")
@@ -5611,8 +5857,8 @@ class ChatApp(tk.Tk):
     def _validate_connect_inputs(self, name, room_code, key):
         if not name: return "Enter a display name."
         if error := nickname_error(name): return error
-        if not (len(room_code) == 6 and room_code.isdigit() and 0 <= int(room_code[:3]) <= 255 and 0 <= int(room_code[3:]) <= 255):
-            return "Room Code must be 6 digits (from the host's screen)."
+        kind, value = interpret_room_input(room_code)
+        if kind == "error": return value
         if not key: return "Enter the shared key password."
         return None
 
@@ -5656,9 +5902,14 @@ class ChatApp(tk.Tk):
                 return put(("connect_fail", f"Couldn't start: {e}"))
             return put(("connect_success", {"connection": conn, "mode": "host", "name": name, "room_code": room_code}))
 
-        host_ip, port, unlock_prefix, error = resolve_join_target(room_code, manual_target)
+        kind, value = interpret_room_input(room_code)  # already checked in _validate_connect_inputs
+        host_ip, port, unlock_prefix, error = resolve_join_target(value, manual_target)
         if error:
             return put(("connect_fail", error))
+        if kind == "invite":
+            room_code = generate_room_code(host_ip)  # the usual 6 digits, for the title bar and the Recent list
+        else:
+            room_code = value
         try:
             conn = GuestConnection(name, host_ip, port, fernet, self.event_queue)
         except BannedError as e:
@@ -5667,7 +5918,7 @@ class ChatApp(tk.Tk):
         except PermissionError as e:
             return put(("connect_fail", str(e)))
         except (OSError, ConnectionError) as e:
-            return put(("connect_fail", f"Connection failed: {e}"))
+            return put(("connect_fail", friendly_connect_error(e, host_ip, port)))
         remember_recent_host(room_code, host_ip, port)
         put(("connect_success", {"connection": conn, "mode": "join", "name": name, "room_code": room_code, "unlock_prefix": unlock_prefix}))
 
@@ -5741,6 +5992,290 @@ class ChatApp(tk.Tk):
             self.bell()
             self._toast("Ban appeal rejected", f"Rejected by {appeal.get('by', 'the host')}. Reason: {appeal.get('reason', 'no reason given')}")
         self._set_timer("ban_poll", BAN_POLL_SECONDS * 1000, self._poll_ban_status)
+
+    # ---- bug reports / feature suggestions ----
+
+    def _open_report_dialog(self):
+        popup = self._open_dialog("report", "Report a bug or suggest a feature", padx=24, pady=20)
+        if popup is None:
+            return
+        tk.Label(popup, text="💡  Report a bug or suggest a feature", bg=BG_PANEL, fg=FG_TEXT, font=(CHAT_FONT[0], 14, "bold")).pack(anchor="w")
+        kind_var = tk.StringVar(value="bug")
+        kinds = tk.Frame(popup, bg=BG_PANEL)
+        kinds.pack(anchor="w", pady=(10, 4))
+        for text, value in (("🐞 Bug report", "bug"), ("💡 Feature suggestion", "feature")):
+            tk.Radiobutton(kinds, text=text, variable=kind_var, value=value, bg=BG_PANEL, fg=FG_TEXT, selectcolor=BG_INPUT,
+                           activebackground=BG_PANEL, activeforeground=FG_TEXT, font=CHAT_FONT, cursor="hand2").pack(side="left", padx=(0, 14))
+        tk.Label(popup, text="What is it, in a sentence?", bg=BG_PANEL, fg=FG_MUTED, font=CHAT_FONT).pack(anchor="w", pady=(8, 2))
+        summary = tk.Entry(popup, width=54, bg=BG_INPUT, fg=FG_TEXT, insertbackground=FG_TEXT, relief="flat", font=CHAT_FONT,
+                           validate="key", validatecommand=(self.register(lambda p: len(p) <= 120), "%P"))
+        summary.pack(anchor="w", ipady=3)
+        tk.Label(popup, text="More detail (optional) — what happened, what you expected, how to make it happen again…", bg=BG_PANEL, fg=FG_MUTED, font=CHAT_FONT).pack(anchor="w", pady=(10, 2))
+        detail = tk.Text(popup, width=54, height=7, wrap="word", bg=BG_INPUT, fg=FG_TEXT, insertbackground=FG_TEXT, relief="flat", font=CHAT_FONT, padx=6, pady=4)
+        detail.pack(anchor="w")
+        where = "It's saved on this computer and sent to the developer." if report_server() else "It's saved on this computer."
+        tk.Label(popup, text=f"Added automatically: the date, v{VERSION} and your operating system — no name, address or messages. {where}",
+                 bg=BG_PANEL, fg=FG_MUTED, font=(CHAT_FONT[0], 8), wraplength=420, justify="left").pack(anchor="w", pady=(8, 0))
+        status = tk.Label(popup, text="", bg=BG_PANEL, fg=self.STATUS_COLORS["error"], font=CHAT_FONT)
+        status.pack(anchor="w", pady=(6, 0))
+        buttons = tk.Frame(popup, bg=BG_PANEL)
+        buttons.pack(anchor="e", pady=(8, 0))
+
+        def send():
+            if not summary.get().strip():
+                return status.configure(text="Say what it is in a sentence first.")
+            wait = REPORT_COOLDOWN_SECONDS - (time.time() - self._last_report_time)
+            if wait > 0:
+                return status.configure(text=f"One moment — you can send another in {int(wait) + 1}s.")
+            self._last_report_time = time.time()
+            report = new_report(kind_var.get(), summary.get(), detail.get("1.0", "end"))
+            save_report(report)
+            self._close_popup("report")
+            if report_server() is None:
+                return self._show_report_result(report, delivered=False, attempted=False)
+            def deliver():
+                ok = deliver_report(report)
+                if ok: update_report(report["id"], delivered=True)
+                self.event_queue.put(("report_result", {"report": report, "delivered": ok}))
+            threading.Thread(target=deliver, daemon=True).start()
+        make_button(buttons, "Send", send, bg=COLOR_PALETTE["blue"], hover_bg=BTN_BLUE_HOVER, padx=18, pady=5).pack(side="left", padx=(0, 8))
+        make_button(buttons, "Cancel", lambda: self._close_popup("report"), bg=BTN_NEUTRAL, hover_bg=BTN_NEUTRAL_HOVER, padx=18, pady=5).pack(side="left")
+        summary.focus_set()
+
+    def _on_report_result(self, payload):
+        self._show_report_result(payload["report"], payload["delivered"], attempted=True)
+
+    def _show_report_result(self, report: dict, delivered: bool, attempted: bool):
+        popup = self._open_dialog("report_done", "Thanks!", padx=24, pady=20)
+        if popup is None:
+            return
+        word = "suggestion" if report["kind"] == "feature" else "bug report"
+        tk.Label(popup, text=f"✔  Thanks — your {word} is saved", bg=BG_PANEL, fg=COLOR_PALETTE["green"], font=(CHAT_FONT[0], 14, "bold")).pack(anchor="w")
+        if delivered:
+            note = "It's been sent to the developer."
+        elif attempted:
+            note = "It's saved on this computer, but couldn't be sent to the developer just now (offline, or the network is blocking it)."
+        else:
+            note = "It's saved on this computer."
+        tk.Label(popup, text=note, bg=BG_PANEL, fg=FG_TEXT, font=CHAT_FONT, wraplength=380, justify="left").pack(anchor="w", pady=(8, 0))
+        buttons = tk.Frame(popup, bg=BG_PANEL)
+        buttons.pack(anchor="e", pady=(14, 0))
+        def copy():
+            self.clipboard_clear()
+            self.clipboard_append(format_report_text(report))
+            copy_btn.label.configure(text="Copied ✔")
+        copy_btn = make_button(buttons, "Copy report", copy, bg=BTN_NEUTRAL, hover_bg=BTN_NEUTRAL_HOVER, padx=14, pady=5)
+        copy_btn.pack(side="left", padx=(0, 8))
+        make_button(buttons, "Close", lambda: self._close_popup("report_done"), bg=COLOR_PALETTE["blue"], hover_bg=BTN_BLUE_HOVER, padx=18, pady=5).pack(side="left")
+        popup.lift()
+
+    def _run_bg(self, work, done):
+        """Runs `work()` on a background thread (so the window never freezes on the network), then calls `done(result)` on the UI thread."""
+        def runner():
+            try: result = work()
+            except Exception as e: result = e
+            self.event_queue.put(("bg_done", {"done": done, "result": result}))
+        threading.Thread(target=runner, daemon=True).start()
+
+    def _on_bg_done(self, payload):
+        try: payload["done"](payload["result"])
+        except tk.TclError: pass  # the window it was for has gone
+
+    def on_open_reports(self, event=None):
+        """Ctrl+Shift+B — the report inbox, behind a password. With a report server set, the server checks the password
+        (it's the Worker's ADMIN_KEY) and the inbox shows everyone's reports; otherwise it's this computer's reports and
+        the password is checked here."""
+        if "reports" in self._popups:
+            self._popups["reports"].lift()
+            return "break"
+        popup = self._open_dialog("reports_login", "Report inbox", padx=24, pady=20)
+        if popup is None:
+            return "break"
+        tk.Label(popup, text="🔒  Report inbox", bg=BG_PANEL, fg=FG_TEXT, font=(CHAT_FONT[0], 14, "bold")).pack(anchor="w")
+        tk.Label(popup, text="Password", bg=BG_PANEL, fg=FG_MUTED, font=CHAT_FONT).pack(anchor="w", pady=(10, 2))
+        entry = tk.Entry(popup, show="•", width=30, bg=BG_INPUT, fg=FG_TEXT, insertbackground=FG_TEXT, relief="flat", font=CHAT_FONT)
+        entry.pack(anchor="w", ipady=3)
+        status = tk.Label(popup, text="", bg=BG_PANEL, fg=self.STATUS_COLORS["error"], font=CHAT_FONT)
+        status.pack(anchor="w", pady=(6, 0))
+        busy = {"on": False}
+
+        def fail(message):
+            self._report_login_failures += 1
+            status.configure(text=message, fg=self.STATUS_COLORS["error"])
+            entry.delete(0, "end")
+
+        def opened(password, remote, note=""):
+            self._report_login_failures = 0
+            self._close_popup("reports_login")
+            self._open_reports_window(remote=remote, password=password, note=note)
+
+        def server_answered(password, result):
+            busy["on"] = False
+            code, data = result if isinstance(result, tuple) else (None, None)
+            if code == 200 and isinstance(data, dict):
+                opened(password, data.get("reports") or [])
+            elif code == 401:
+                fail("Wrong password.")
+            elif code is None:  # can't reach the server: fall back to this computer's own reports
+                if check_reports_password(password):
+                    opened(None, None, "Couldn't reach the report server — showing only the reports saved on this computer.")
+                else:
+                    status.configure(text="Couldn't reach the report server (offline? or the address is wrong).", fg=self.STATUS_COLORS["error"])
+            else:
+                status.configure(text=f"The report server answered with an error ({code}).", fg=self.STATUS_COLORS["error"])
+
+        def submit(event=None):
+            if self._report_login_failures >= 5:
+                return status.configure(text="Too many wrong tries — restart the app to try again.")
+            if busy["on"]:
+                return
+            password = entry.get()
+            if report_server():
+                busy["on"] = True
+                status.configure(text="Checking…", fg=FG_MUTED)
+                self._run_bg(lambda: worker_call("/reports", password=password), lambda result: server_answered(password, result))
+            elif check_reports_password(password):
+                opened(None, None)
+            else:
+                fail("Wrong password.")
+        entry.bind("<Return>", submit)
+        make_button(popup, "Open", submit, bg=COLOR_PALETTE["blue"], hover_bg=BTN_BLUE_HOVER, padx=18, pady=5).pack(anchor="e", pady=(8, 0))
+        entry.focus_set()
+        return "break"
+
+    def _open_reports_window(self, remote=None, password=None, note=""):
+        """The inbox. `remote` is the report server's list (None = no server: just this computer's reports); `password` is
+        the admin key, kept only for this window's server calls."""
+        win = self._open_dialog("reports", "Report inbox", padx=16, pady=14, resizable=True)
+        if win is None:
+            return
+        state = {"remote": remote}
+        show_var = tk.StringVar(value="all")
+        top = tk.Frame(win, bg=BG_PANEL)
+        top.pack(fill="x")
+        count_label = tk.Label(top, text="", bg=BG_PANEL, fg=FG_MUTED, font=CHAT_FONT)
+        count_label.pack(side="right")
+        for text, value in (("All", "all"), ("Open", "open"), ("🐞 Bugs", "bug"), ("💡 Ideas", "feature")):
+            tk.Radiobutton(top, text=text, variable=show_var, value=value, bg=BG_PANEL, fg=FG_TEXT, selectcolor=BG_INPUT, activebackground=BG_PANEL,
+                           activeforeground=FG_TEXT, font=CHAT_FONT, cursor="hand2", command=lambda: refresh()).pack(side="left", padx=(0, 10))
+        if note:
+            tk.Label(win, text=note, bg=BG_PANEL, fg=self.STATUS_COLORS["error"], font=(CHAT_FONT[0], 9), wraplength=620, justify="left").pack(anchor="w", pady=(6, 0))
+        listbox = tk.Listbox(win, width=86, height=10, bg=BG_INPUT, fg=FG_TEXT, selectbackground=COLOR_PALETTE["blue"], relief="flat", font=CHAT_FONT, activestyle="none", exportselection=False)
+        listbox.pack(fill="x", pady=(8, 8))
+        detail = tk.Text(win, width=86, height=12, wrap="word", bg=BG_INPUT, fg=FG_TEXT, relief="flat", font=CHAT_FONT, padx=8, pady=6, state="disabled")
+        detail.pack(fill="both", expand=True)
+        buttons = tk.Frame(win, bg=BG_PANEL)
+        buttons.pack(fill="x", pady=(10, 0))
+        shown = []
+
+        def all_items():
+            """The server's reports, plus any of this computer's that never reached the server (newest first)."""
+            items, seen = [], set()
+            for r in state["remote"] or []:
+                items.append(dict(r, _source="server", _stamp=(r.get("created") or 0) / 1000))
+                seen.add(str(r.get("id")))
+            for r in load_reports():
+                if state["remote"] is not None and (r.get("delivered") or str(r.get("id")) in seen):
+                    continue  # the server's copy is the one shown
+                items.append(dict(r, _source="local", _stamp=(r.get("id") or 0) / 1e9 if isinstance(r.get("id"), int) else 0))
+            return sorted(items, key=lambda r: r["_stamp"], reverse=True)
+
+        def refresh(keep_id=None):
+            nonlocal shown
+            mode = show_var.get()
+            everything = all_items()
+            shown = [r for r in everything if mode == "all" or (mode == "open" and r.get("status") != "done") or r.get("kind") == mode]
+            listbox.delete(0, "end")
+            for r in shown:
+                icon = "💡" if r.get("kind") == "feature" else "🐞"
+                done = "✔ " if r.get("status") == "done" else ""
+                listbox.insert("end", f"{icon} {done}{r.get('date', '?')}  ·  v{r.get('version', '?')}  ·  {r.get('summary', '')}")
+            count_label.configure(text=f"{len(shown)} of {len(everything)}")
+            index = next((i for i, r in enumerate(shown) if str(r.get("id")) == str(keep_id)), 0 if shown else None)
+            if index is not None:
+                listbox.selection_set(index)
+            show_selected()
+
+        def selected():
+            picked = listbox.curselection()
+            return shown[picked[0]] if picked else None
+
+        def show_selected(event=None):
+            r = selected()
+            where = "stored on the report server" if r and r["_source"] == "server" else "saved on this computer only"
+            detail.configure(state="normal")
+            detail.delete("1.0", "end")
+            detail.insert("1.0", f"{format_report_text(r)}\n\n[{r.get('status', 'open')} · {where}]" if r else "No reports here yet.")
+            detail.configure(state="disabled")
+
+        def server_failed():
+            messagebox.showerror("Report inbox", "Couldn't reach the report server — nothing was changed.", parent=win)
+
+        def toggle_done():
+            r = selected()
+            if not r:
+                return
+            new_status = "open" if r.get("status") == "done" else "done"
+            if r["_source"] == "server":
+                def finished(result):
+                    if isinstance(result, tuple) and result[0] == 200:
+                        for item in state["remote"]:
+                            if str(item.get("id")) == str(r["id"]): item["status"] = new_status
+                        refresh(keep_id=r["id"])
+                    else:
+                        server_failed()
+                self._run_bg(lambda: worker_call("/reports/status", body={"id": str(r["id"]), "status": new_status}, password=password), finished)
+            else:
+                update_report(r["id"], status=new_status)
+                refresh(keep_id=r["id"])
+
+        def remove():
+            r = selected()
+            if not r or not messagebox.askyesno("Delete report", "Delete this report for good?", parent=win):
+                return
+            if r["_source"] == "server":
+                def finished(result):
+                    if isinstance(result, tuple) and result[0] == 200:
+                        state["remote"] = [item for item in state["remote"] if str(item.get("id")) != str(r["id"])]
+                        refresh()
+                    else:
+                        server_failed()
+                self._run_bg(lambda: worker_call("/reports/delete", body={"id": str(r["id"])}, password=password), finished)
+            else:
+                delete_report(r["id"])
+                refresh()
+
+        def reload_from_server():
+            def finished(result):
+                if isinstance(result, tuple) and result[0] == 200 and isinstance(result[1], dict):
+                    state["remote"] = result[1].get("reports") or []
+                    refresh()
+                else:
+                    server_failed()
+            self._run_bg(lambda: worker_call("/reports", password=password), finished)
+
+        def copy():
+            if r := selected():
+                self.clipboard_clear()
+                self.clipboard_append(format_report_text(r))
+
+        listbox.bind("<<ListboxSelect>>", show_selected)
+        actions = [("Mark done / reopen", toggle_done, (BTN_GREEN, BTN_GREEN_HOVER)), ("Copy", copy, (BTN_NEUTRAL, BTN_NEUTRAL_HOVER)),
+                   ("Delete", remove, (BTN_RED, BTN_RED_HOVER)), ("Close", lambda: self._close_popup("reports"), (BTN_NEUTRAL, BTN_NEUTRAL_HOVER))]
+        if password:
+            actions.insert(0, ("Refresh", reload_from_server, (BTN_NEUTRAL, BTN_NEUTRAL_HOVER)))
+        for text, command, colors in actions:
+            make_button(buttons, text, command, bg=colors[0], hover_bg=colors[1], padx=14, pady=5).pack(side="left", padx=(0, 8))
+        refresh()
+
+    def _invite_code(self):
+        """This room's Invite Code — its host's address and port — or None if we're not in one."""
+        conn = self.connection
+        if isinstance(conn, HostConnection):
+            return make_invite_code(self._host_local_ip or get_local_ip(), conn.tcp_port)
+        if isinstance(conn, GuestConnection):
+            return make_invite_code(conn.host, conn.port)
+        return None
 
     def _toast(self, title: str, message: str):
         """A desktop notification for a moderation outcome. Not shown under Do Not Disturb."""
@@ -5953,8 +6488,10 @@ class ChatApp(tk.Tk):
             others = [ip for ip in getattr(self, "_host_all_ips", []) if ip != local_ip]
             extra = f" (this device also has: {', '.join(others)})" if others else ""
             self.append_system_line(
-                f"Hosting Room {room_code} on {local_ip}{extra}. Guests on your same network segment can join with just the Room Code. "
-                f"If that doesn't work, have them enter {local_ip}:{self.connection.tcp_port} in the 'Host IP' field. Type /help for commands."
+                f"Hosting Room {room_code} on {local_ip}{extra}. Guests on your same network can join with just the Room Code. "
+                + (f"If that doesn't work for someone, send them your Invite Code — {make_invite_code(local_ip, self.connection.tcp_port)} — "
+                   f"to paste into the Room Code box (/invite shows it again). Type /help for commands." if ENABLE_INVITE_CODES else
+                   f"If that doesn't work, have them enter {local_ip}:{self.connection.tcp_port} in the 'Host IP' field. Type /help for commands.")
             )
         else:
             self.append_system_line(f"You joined Room {room_code} as {name}. Type /help for commands.")
@@ -6633,6 +7170,16 @@ class ChatApp(tk.Tk):
         self._history_pos = None
 
         first_word = text.split()[0].lower()
+        if ENABLE_INVITE_CODES and first_word == "/invite":
+            code = self._invite_code()
+            if code:
+                self.clipboard_clear()
+                self.clipboard_append(code)
+                self.append_system_line(f"Invite Code: {code} (copied). Paste it into the Room Code box to join this chat directly — no searching needed.")
+            else:
+                self.append_system_line("There's no Invite Code to show — you're not in a chat.")
+            return "break"
+
         if first_word == "/clear":
             self._handle_clear_command(text.split())
             return "break"
