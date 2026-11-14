@@ -1,6 +1,21 @@
 #!/usr/bin/env python3
 """
-chat_gui.py — v1.5.0c — ENCRYPTED instant messenger with a desktop GUI.
+chat_gui.py — v1.5.0d — ENCRYPTED instant messenger with a desktop GUI.
+
+Changes in 1.5.0d:
+- Updates are checked for when the app starts, and an available update shows on the main menu as a
+  banner ("✨ Update available: v1.5.0e — Update now · What's new") instead of a pop-up. The
+  "Check for Updates" link uses the same banner. (Version letters already worked from a to z — only a
+  comment said a-d.)
+- Old update backups (chat_gui.py.bak-…) are cleaned up automatically: the newest one is kept as a
+  safety net, the rest are deleted — at launch and right after each update.
+- When a bug report or suggestion you sent is marked completed, a window tells you so and that it will
+  be released in the next update. (Your app checks quietly, at launch and every 10 minutes.)
+- Report inbox owner: tick "Tell me when a new report arrives" in the inbox and a slim bar at the top of
+  the window — in a chat or not — flashes green and white for 5 seconds for each new report. Bursts are
+  collapsed into one notice (more than 5 at once), and no more than 5 notices show per minute.
+- Report server (Worker) anti-abuse: at most 5 reports per minute and 10 per 10 minutes from one sender,
+  and 30 per minute from everyone; extras are refused. Re-deploy the updated report_worker.js.
 
 Changes in 1.5.0c:
 - Game leaderboards show how many people are playing right now ("● 2 playing") instead of a
@@ -425,7 +440,7 @@ except ImportError:
 if sys.platform == "darwin":
     ensure_installed("pyobjus", required=False)
 
-VERSION = "1.5.0c"
+VERSION = "1.5.0d"
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -1718,7 +1733,7 @@ REPORTS_PASSWORD_SHA256 = "b7f6b0c151a099ce850f1da345e9e97db90b5f6cc960f5a895e17
 # set they're also sent to YOUR report server — a free Cloudflare Worker (the code is in report_worker.js, with setup steps) — and
 # the inbox (Ctrl+Shift+B) then shows reports from everyone's computers. Paste the Worker's address between the quotes,
 # e.g. "https://chat-gui-reports.yourname.workers.dev". Leave it empty to keep reports on each computer only.
-REPORT_WORKER_URL = "https://chat-gui-reports.richardfeng023.workers.dev"
+REPORT_WORKER_URL = ""
 REPORT_COOLDOWN_SECONDS = 20
 
 def _os_label() -> str:
@@ -1833,7 +1848,7 @@ def fetch_update_manifest(manifest_url: str) -> dict:
 
 def _parse_version_segment(seg: str) -> tuple:
     """'2' -> (2, ''), '2c' -> (2, 'c'). Lets a release use a trailing
-    letter (recommended: a-d) for a small QOL patch that doesn't
+    letter (any a-z) for a small QOL patch that doesn't
     deserve a full numeric bump, while still sorting correctly against
     plain numeric versions: 1.4.2 < 1.4.2a < 1.4.2b < ... < 1.4.3."""
     seg = seg.strip()
@@ -1874,6 +1889,33 @@ def download_and_verify_update(manifest: dict) -> bytes:
     verify_update_payload(payload, manifest)
     return payload
 
+def prune_old_backups(keep: int = 1, target_path: str = None) -> int:
+    """Deletes the backups earlier updates left next to the script (chat_gui.py.bak-<timestamp>), keeping only the
+    newest `keep` of them as a safety net (use keep=0 to keep none). Only files with exactly that name are touched.
+    Also clears a half-finished update's temp file. Returns how many files were deleted."""
+    target_path = os.path.abspath(target_path or __file__)
+    folder, base = os.path.split(target_path)
+    pattern = re.compile(r"^" + re.escape(base) + r"\.bak-(\d+)$")
+    try:
+        backups = sorted(((int(m.group(1)), name) for name in os.listdir(folder) if (m := pattern.match(name))), reverse=True)
+    except OSError:
+        return 0
+    removed = 0
+    for _, name in backups[max(0, keep):]:
+        try:
+            os.remove(os.path.join(folder, name))
+            removed += 1
+        except OSError:
+            pass
+    leftover = target_path + ".update_tmp"
+    try:
+        if os.path.exists(leftover) and time.time() - os.path.getmtime(leftover) > 3600:
+            os.remove(leftover)
+            removed += 1
+    except OSError:
+        pass
+    return removed
+
 def apply_update(payload: bytes) -> str:
     """Only ever called after verify_update_payload() has already
     succeeded. Backs up the running script before overwriting it, and
@@ -1886,6 +1928,7 @@ def apply_update(payload: bytes) -> str:
     with open(tmp_path, "wb") as f:
         f.write(payload)
     os.replace(tmp_path, target_path)
+    prune_old_backups(keep=1, target_path=target_path)  # the backup just made stays; earlier ones go
     return backup_path
 
 
@@ -2021,6 +2064,18 @@ def perform_globalban(fingerprint: str, reason: str) -> str:
 # install time, so the in-app viewer stays complete going forward
 # without needing the whole history re-embedded on every release.
 EMBEDDED_CHANGELOG = [
+    {   "version": "1.5.0d",
+        "date": "2026-11-14",
+        "notes": (
+            "The app now checks for updates when it starts, and shows an available update as a banner on the main "
+            "menu (Update now / What's new) instead of a pop-up; the 'Check for Updates' link does the same. Old "
+            "update backups are deleted automatically, keeping only the newest. When a bug report or suggestion you "
+            "sent is marked completed, you get a window saying it will be released in the next update. For the "
+            "report inbox owner: a slim bar at the top of the window flashes green and white for 5 seconds when a "
+            "new report arrives (in a chat or not), with bursts collapsed. The report server also refuses floods: "
+            "5 reports a minute per sender, 30 a minute overall."
+        ),
+    },
     {   "version": "1.5.0c",
         "date": "2026-11-11",
         "notes": (
@@ -5357,6 +5412,8 @@ class ChatApp(tk.Tk):
         self._game_picker = None
         self._last_report_time = 0.0
         self._report_login_failures = 0
+        self._pending_manifest = None     # the update the banner on the main menu is offering
+        self._notice_queue, self._notice_active, self._notice_times = [], False, []
         self._rainbow_instance_seq = 0
         self._job_seq = 0
         self._session_id = 0
@@ -5418,8 +5475,16 @@ class ChatApp(tk.Tk):
         self.connect_frame.pack(fill="both", expand=True)
         self._focus_first_empty()
 
+        # The slim notice bar across the very top of the window (new-report alerts) — packed only while it has something to show.
+        self.notice_bar = tk.Label(self, text="", bg=BG_PANEL, fg=FG_TEXT, font=(CHAT_FONT[0], 10, "bold"), pady=5)
+
         self.bind_all(GAMES_KEYBIND, self.on_open_games)
         self.bind_all(REPORTS_KEYBIND, self.on_open_reports)
+        # Quiet background jobs shortly after launch, once the window is up.
+        self.after(1500, lambda: self._start_update_check(manual=False))
+        self.after(4000, self._check_my_reports)
+        self.after(6000, self._start_report_watch)
+        threading.Thread(target=prune_old_backups, daemon=True).start()
         self.bind("<FocusIn>", self._on_focus_in)
         self.bind_all("<Button-1>", self._on_global_click, add="+")  # click-away closes the in-window pickers
         self.protocol("WM_DELETE_WINDOW", self.on_close)
@@ -5703,6 +5768,13 @@ class ChatApp(tk.Tk):
         version_label = tk.Label(corner_frame, text=f"v{VERSION} — Check for Updates", bg=BG_DARK, fg=FG_MUTED, font=link_font, cursor="hand2")
         version_label.pack(anchor="e")
         version_label.bind("<Button-1>", lambda e: self.on_check_updates())
+
+        # Sits across the top of the main menu whenever there's something to say about updates (see _set_update_banner).
+        self.update_banner = tk.Frame(f, bg=BG_PANEL, padx=14, pady=8)
+        self.update_banner_label = tk.Label(self.update_banner, text="", bg=BG_PANEL, fg=FG_TEXT, font=CHAT_FONT, anchor="w", justify="left", wraplength=560)
+        self.update_banner_label.pack(side="left")
+        self.update_banner_buttons = tk.Frame(self.update_banner, bg=BG_PANEL)
+        self.update_banner_buttons.pack(side="right")
 
         tk.Label(card, text="chat_gui", font=(CHAT_FONT[0], 20, "bold"), bg=BG_PANEL, fg=FG_TEXT).grid(row=0, column=0, columnspan=3, pady=(0, 16))
 
@@ -6042,6 +6114,129 @@ class ChatApp(tk.Tk):
         make_button(buttons, "Cancel", lambda: self._close_popup("report"), bg=BTN_NEUTRAL, hover_bg=BTN_NEUTRAL_HOVER, padx=18, pady=5).pack(side="left")
         summary.focus_set()
 
+    def _check_my_reports(self):
+        """Asks the report server whether any report THIS computer sent has been marked completed. Runs at launch and every
+        10 minutes, and only does anything if there are sent reports it hasn't told you about yet."""
+        self._set_timer("report_status", 10 * 60 * 1000, self._check_my_reports)
+        if report_server() is None:
+            return
+        ids = [str(r["id"]) for r in load_reports() if r.get("delivered") and not r.get("notified")][:50]
+        if ids:
+            self._run_bg(lambda: worker_call("/status", body={"ids": ids}), self._on_my_reports_checked)
+
+    def _on_my_reports_checked(self, result):
+        code, data = result if isinstance(result, tuple) else (None, None)
+        if code != 200 or not isinstance(data, dict):
+            return
+        statuses = data.get("statuses") or {}
+        finished = [r for r in load_reports() if statuses.get(str(r.get("id"))) == "done" and not r.get("notified")]
+        if not finished:
+            return
+        for r in finished:
+            update_report(r["id"], notified=True, status="done")
+        popup_name = f"report_completed_{time.time_ns()}"
+        popup = self._open_dialog(popup_name, "Report completed", padx=24, pady=20)
+        if popup is None:
+            return
+        many = len(finished) > 1
+        tk.Label(popup, text="✔  Your report was completed" if not many else "✔  Your reports were completed", bg=BG_PANEL, fg=COLOR_PALETTE["green"], font=(CHAT_FONT[0], 14, "bold")).pack(anchor="w")
+        for r in finished[:6]:
+            icon = "💡" if r.get("kind") == "feature" else "🐞"
+            tk.Label(popup, text=f"{icon}  {r.get('summary', '')}", bg=BG_PANEL, fg=FG_TEXT, font=CHAT_FONT, wraplength=400, justify="left").pack(anchor="w", pady=(8, 0))
+        if len(finished) > 6:
+            tk.Label(popup, text=f"…and {len(finished) - 6} more", bg=BG_PANEL, fg=FG_MUTED, font=CHAT_FONT).pack(anchor="w", pady=(4, 0))
+        tk.Label(popup, text=("They've been marked as completed and will be released in the next update. " if many else
+                              "It's been marked as completed and will be released in the next update. ") + "Thanks for helping make chat_gui better!",
+                 bg=BG_PANEL, fg=FG_TEXT, font=CHAT_FONT, wraplength=400, justify="left").pack(anchor="w", pady=(12, 0))
+        make_button(popup, "OK", lambda: self._close_popup(popup_name), bg=COLOR_PALETTE["blue"], hover_bg=BTN_BLUE_HOVER, padx=18, pady=5).pack(anchor="e", pady=(14, 0))
+        popup.lift()
+
+    # ---- the inbox owner's "a new report arrived" alerts ----
+
+    def _start_report_watch(self):
+        """If this computer was told to watch for new reports (inbox → "Tell me when a new report arrives"), checks with the
+        report server once a minute. Nothing runs unless that's switched on."""
+        self._cancel_timer("report_watch")
+        if report_server() and self.settings.get("report_admin_key"):
+            self._poll_new_reports()
+
+    def _poll_new_reports(self):
+        key = self.settings.get("report_admin_key")
+        if not key or report_server() is None:
+            return
+        since = int(self.settings.get("report_last_seen") or 0)
+        self._set_timer("report_watch", 60 * 1000, self._poll_new_reports)
+        self._run_bg(lambda: worker_call(f"/reports/since?t={since}", password=key), lambda result: self._on_new_reports_polled(result, since))
+
+    def _on_new_reports_polled(self, result, since):
+        code, data = result if isinstance(result, tuple) else (None, None)
+        if code == 401:  # the inbox password was changed on the server: stop quietly, say so once
+            self._set_report_alerts(False)
+            self._queue_notice("📬 New-report alerts turned off — the inbox password has changed. Turn them on again in the inbox.")
+            return
+        if code != 200 or not isinstance(data, dict):
+            return
+        latest = int(data.get("latest") or 0)
+        if latest > int(self.settings.get("report_last_seen") or 0):
+            self.settings["report_last_seen"] = latest
+            self._save_settings()
+        if since <= 0:
+            return  # that was just finding out where "now" is
+        reports = data.get("reports") or []
+        count = int(data.get("count") or len(reports))
+        if count > 5:  # anti-abuse: a flood is one notice, not a stream of them
+            self._queue_notice(f"📬 {count} new reports arrived at once — that's unusual. Open the inbox (Ctrl+Shift+B) to look.")
+            return
+        for r in reports:
+            what = "suggestion" if r.get("kind") == "feature" else "bug report"
+            summary = str(r.get("summary", ""))
+            self._queue_notice(f"📬 New {what}: {summary[:70]}{'…' if len(summary) > 70 else ''}")
+
+    def _set_report_alerts(self, on: bool, password: str = None, baseline: int = 0):
+        """Turns the new-report alerts on (remembering the inbox password on this computer) or off."""
+        if on and password:
+            self.settings["report_admin_key"] = password
+            self.settings["report_last_seen"] = baseline
+        else:
+            self.settings.pop("report_admin_key", None)
+            self.settings.pop("report_last_seen", None)
+            self._cancel_timer("report_watch")
+        self._save_settings()
+        if on and password:
+            self._start_report_watch()
+
+    def _queue_notice(self, text: str):
+        """Shows `text` in the slim bar across the top of the window for 5 seconds, flashing green and white. At most 5
+        notices a minute; the rest are dropped (the inbox still has everything)."""
+        now = time.time()
+        self._notice_times = [t for t in self._notice_times if now - t < 60]
+        if len(self._notice_times) >= 5:
+            return
+        self._notice_times.append(now)
+        self._notice_queue.append(text)
+        if not self._notice_active:
+            self._next_notice()
+
+    def _next_notice(self):
+        if not self._notice_queue:
+            self._notice_active = False
+            self._cancel_timer("notice_flash")
+            self.notice_bar.pack_forget()
+            return
+        self._notice_active = True
+        self.notice_bar.configure(text=self._notice_queue.pop(0), fg=COLOR_PALETTE["green"])
+        frame = self.chat_frame if self.chat_frame.winfo_ismapped() else self.connect_frame  # sits above whichever screen is showing
+        try: self.notice_bar.pack(side="top", fill="x", before=frame)
+        except tk.TclError: self.notice_bar.pack(side="top", fill="x")
+        ticks = {"n": 0}
+        def flash():
+            ticks["n"] += 1
+            if ticks["n"] >= 14:  # 14 × 350 ms ≈ 5 seconds
+                return self._next_notice()
+            self.notice_bar.configure(fg="white" if ticks["n"] % 2 else COLOR_PALETTE["green"])
+            self._set_timer("notice_flash", 350, flash)
+        self._set_timer("notice_flash", 350, flash)
+
     def _on_report_result(self, payload):
         self._show_report_result(payload["report"], payload["delivered"], attempted=True)
 
@@ -6166,6 +6361,14 @@ class ChatApp(tk.Tk):
         detail.pack(fill="both", expand=True)
         buttons = tk.Frame(win, bg=BG_PANEL)
         buttons.pack(fill="x", pady=(10, 0))
+        if password:
+            alerts_var = tk.BooleanVar(value=bool(self.settings.get("report_admin_key")))
+            def alerts_toggled():
+                newest = max([int(r.get("created") or 0) for r in state["remote"] or []] or [0])
+                self._set_report_alerts(alerts_var.get(), password=password, baseline=newest)
+            tk.Checkbutton(win, text="Tell me when a new report arrives (saves the inbox password on this computer)", variable=alerts_var, command=alerts_toggled,
+                           bg=BG_PANEL, fg=FG_MUTED, selectcolor=BG_INPUT, activebackground=BG_PANEL, activeforeground=FG_TEXT,
+                           font=(CHAT_FONT[0], 9), cursor="hand2").pack(anchor="w", pady=(8, 0))
         shown = []
 
         def all_items():
@@ -7541,71 +7744,78 @@ class ChatApp(tk.Tk):
     # ---- updates ----
 
     def on_check_updates(self):
+        """The "Check for Updates" link: the same check as at launch, but it always says what it found, in the banner on the main menu."""
+        self._start_update_check(manual=True)
+
+    def _start_update_check(self, manual: bool):
         if not UPDATE_MANIFEST_URL:
-            messagebox.showinfo(
-                "Check for Updates",
-                "No update server is configured yet. Set UPDATE_MANIFEST_URL near the top of chat_gui.py to enable this.",
-            )
+            if manual:
+                self._set_update_banner("No update server is configured yet (UPDATE_MANIFEST_URL, near the top of chat_gui.py).", kind="error", hide_after=6)
             return
-        popup = self._open_dialog("update", "Check for Updates")
-        if popup is None: return
-        self._pending_manifest = None
-        self._update_status_var = tk.StringVar(value=f"Checking for updates (current: v{VERSION})...")
-        tk.Label(popup, textvariable=self._update_status_var, bg=BG_PANEL, fg=FG_TEXT, font=CHAT_FONT, wraplength=320, justify="left").pack(pady=(0, 12))
-        self._update_btn_row = tk.Frame(popup, bg=BG_PANEL)
-        self._update_btn_row.pack()
-        threading.Thread(target=self._async_check_updates, daemon=True).start()
+        if manual:
+            self._set_update_banner(f"Checking for updates (you have v{VERSION})…")
+        threading.Thread(target=self._async_check_updates, args=(manual,), daemon=True).start()
 
-    def _show_update_state(self, text, *buttons) -> bool:
-        """Sets the update dialog's message and buttons ((label, command, 'green'|'neutral'), ...).
-        Returns False if the dialog was closed in the meantime."""
-        if "update" not in self._popups:
-            return False
-        self._update_status_var.set(text)
-        for w in self._update_btn_row.winfo_children(): w.destroy()
-        colors = {"green": (BTN_GREEN, BTN_GREEN_HOVER), "neutral": (BTN_NEUTRAL, BTN_NEUTRAL_HOVER)}
-        for i, (label, command, kind) in enumerate(buttons):
-            bg, hover = colors[kind]
-            make_button(self._update_btn_row, label, command, bg=bg, hover_bg=hover, padx=12, pady=5).pack(side="left", padx=(0, 8) if i < len(buttons) - 1 else 0)
-        return True
+    def _set_update_banner(self, text, buttons=(), kind="info", hide_after=None):
+        """Shows `text` (and buttons: (label, command, 'green'|'neutral')) in the banner across the top of the main menu."""
+        self._cancel_timer("update_banner")
+        self.update_banner_label.configure(text=text, fg={"info": FG_TEXT, "ok": COLOR_PALETTE["green"], "error": COLOR_PALETTE["red"]}[kind])
+        for w in self.update_banner_buttons.winfo_children(): w.destroy()
+        palette = {"green": (BTN_GREEN, BTN_GREEN_HOVER), "neutral": (BTN_NEUTRAL, BTN_NEUTRAL_HOVER)}
+        for label, command, style in buttons:
+            bg, hover = palette[style]
+            make_button(self.update_banner_buttons, label, command, bg=bg, hover_bg=hover, padx=10, pady=3).pack(side="left", padx=(8, 0))
+        self.update_banner.place(relx=0, rely=0, relwidth=1.0)
+        self.update_banner.lift()
+        if hide_after:
+            self._set_timer("update_banner", int(hide_after * 1000), self._hide_update_banner)
 
-    def _close_update_dialog(self):
-        self._close_popup("update")
+    def _hide_update_banner(self):
+        self._cancel_timer("update_banner")
+        self.update_banner.place_forget()
 
-    def _async_check_updates(self):
+    def _async_check_updates(self, manual: bool = True):
         try:
             manifest = fetch_update_manifest(UPDATE_MANIFEST_URL)
         except Exception as e:
-            self.event_queue.put(("update_check_result", {"ok": False, "error": str(e)}))
+            self.event_queue.put(("update_check_result", {"ok": False, "error": str(e), "manual": manual}))
             return
-        self.event_queue.put(("update_check_result", {"ok": True, "manifest": manifest}))
+        self.event_queue.put(("update_check_result", {"ok": True, "manifest": manifest, "manual": manual}))
 
     def _handle_update_check_result(self, result):
-        close = ("Close", self._close_update_dialog, "neutral")
+        manual = result.get("manual", True)
+        dismiss = ("✕", self._hide_update_banner, "neutral")
         if not result["ok"]:
-            self._show_update_state(f"Couldn't check for updates:\n{result['error']}", close)
+            if manual:  # a failed check at launch stays quiet (offline, GitHub down…)
+                self._set_update_banner(f"Couldn't check for updates: {result['error']}", (dismiss,), kind="error")
             return
-
         manifest = result["manifest"]
         remote_version = manifest.get("version", "?")
         if not is_newer_version(remote_version, VERSION):
-            self._show_update_state(f"You're up to date (v{VERSION}).", close)
+            self._pending_manifest = None
+            if manual:
+                self._set_update_banner(f"✔ You're up to date (v{VERSION}).", kind="ok", hide_after=5)
             return
-
-        notes = manifest.get("notes", "")
-        notes_line = f"\n\n{notes}" if notes else ""
         self._pending_manifest = manifest
-        self._show_update_state(
-            f"Update available: v{remote_version} (you have v{VERSION}).{notes_line}\n\n"
-            "This will be signature-verified before anything is installed.",
-            ("Install & Restart", self._start_update_install, "green"),
-            ("Not now", self._close_update_dialog, "neutral"),
+        self._set_update_banner(
+            f"✨ Update available: v{remote_version} (you have v{VERSION})",
+            (("Update now", self._start_update_install, "green"), ("What's new", self._show_update_notes, "neutral"), dismiss),
         )
+
+    def _show_update_notes(self):
+        manifest = self._pending_manifest
+        if not manifest: return
+        popup = self._open_dialog("update_notes", "What's new", padx=24, pady=20)
+        if popup is None: return
+        tk.Label(popup, text=f"What's new in v{manifest.get('version', '?')}", bg=BG_PANEL, fg=FG_TEXT, font=(CHAT_FONT[0], 14, "bold")).pack(anchor="w")
+        tk.Label(popup, text=manifest.get("notes") or "(no notes for this release)", bg=BG_PANEL, fg=FG_TEXT, font=CHAT_FONT, wraplength=420, justify="left").pack(anchor="w", pady=(10, 0))
+        tk.Label(popup, text="It's signature-verified before anything is installed.", bg=BG_PANEL, fg=FG_MUTED, font=(CHAT_FONT[0], 9)).pack(anchor="w", pady=(10, 0))
+        make_button(popup, "Close", lambda: self._close_popup("update_notes"), bg=BTN_NEUTRAL, hover_bg=BTN_NEUTRAL_HOVER, padx=18, pady=5).pack(anchor="e", pady=(14, 0))
 
     def _start_update_install(self):
         if not self._pending_manifest: return
-        if self._show_update_state("Downloading and verifying update..."):
-            threading.Thread(target=self._async_install_update, args=(self._pending_manifest,), daemon=True).start()
+        self._set_update_banner("Downloading and verifying the update…")
+        threading.Thread(target=self._async_install_update, args=(self._pending_manifest,), daemon=True).start()
 
     def _async_install_update(self, manifest):
         try:
@@ -7619,13 +7829,12 @@ class ChatApp(tk.Tk):
 
     def _handle_update_apply_result(self, result):
         if not result["ok"]:
-            self._show_update_state(f"Update failed and was NOT installed:\n{result['error']}", ("Close", self._close_update_dialog, "neutral"))
+            self._set_update_banner(f"Update failed and was NOT installed: {result['error']}", (("✕", self._hide_update_banner, "neutral"),), kind="error")
             return
-        self._show_update_state(
-            f"Update installed and verified. Your previous version was backed up as:\n"
-            f"{os.path.basename(result['backup'])}\n\nRestart to apply it.",
-            ("Restart Now", self._restart_app, "green"),
-            ("Later", self._close_update_dialog, "neutral"),
+        self._pending_manifest = None
+        self._set_update_banner(
+            f"✔ Update installed and verified (your previous version is kept as {os.path.basename(result['backup'])}). Restart to use it.",
+            (("Restart now", self._restart_app, "green"), ("Later", self._hide_update_banner, "neutral")), kind="ok",
         )
 
     def _restart_app(self):
