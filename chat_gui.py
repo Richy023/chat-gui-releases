@@ -1,6 +1,17 @@
 #!/usr/bin/env python3
 """
-chat_gui.py — v1.5.0d — ENCRYPTED instant messenger with a desktop GUI.
+chat_gui.py — v1.5.0e — ENCRYPTED instant messenger with a desktop GUI.
+
+Changes in 1.5.0e:
+- The "your report was completed" window now says when it was completed ("3 minutes ago" plus the date
+  and time, in your own time zone).
+- The home-screen link is now "Report a bug, suggest a feature, or view your previous reports". It opens
+  a small menu: send a new report, or open "My previous reports" — a list of everything this computer
+  has sent, with whether each is still open or completed (and when), and a Refresh button that asks the
+  report server right now instead of waiting for the 10-minute check. Refresh can be used once every
+  30 seconds.
+- Report server: it now records when a report was marked completed. If you set up an earlier version, it
+  adds the new column to your database by itself — just re-paste report_worker.js and Deploy.
 
 Changes in 1.5.0d:
 - Updates are checked for when the app starts, and an available update shows on the main menu as a
@@ -78,289 +89,6 @@ Changes in 1.4.11b:
   scrolling area.
 - The ⚠ Warning button's rejected-appeal flash is now six quick flashes between red and white
   (about a second and a half), then it settles back to yellow.
-
-Changes in 1.4.11a:
-- The ⚠ Warning button reacts to what the admins do: yellow while you're warned (also while an
-  appeal is pending), flashes red and settles back to yellow if your appeal is rejected, and turns
-  green — "✔ Appeal accepted" or "✔ Warning removed" — for about 5 seconds before disappearing
-  when the warning is deleted.
-- Fixed: clicking a recent chat no longer fills in the Host IP box. It used to paste the
-  IP *and the port from that earlier session*, and that port is usually stale (the host picks a
-  new one each time), which gave "machine actively refused the connection". Only the Room
-  Code is filled in now; it finds the host's current address and port on its own.
-
-Changes in 1.4.11:
-- Flappy Bird! Ctrl+Shift+S now opens a small game picker (Snake or Flappy Bird; press 1 / 2
-  or click). Flappy Bird has its own live leaderboard, shared with the chat like Snake's.
-  Space, Up, W or a click flaps. The bird wears your name colour.
-- The games work from the home screen too, not only inside a chat. Off a chat the board
-  shows just you; your best score per game is remembered on this computer. Open game
-  windows now stay open as you join or leave a chat, and re-announce your score to the room.
-- Warnings: a "⚠ Warning" button now sits in the chat's top bar for as long as you have
-  a warning you haven't dealt with. Closing the warning pop-up no longer loses the Appeal
-  button — click the ⚠ button (or type /warning) to see your latest warning and appeal it
-  whenever you like. The button shows the appeal's progress, and disappears if the warning
-  is deleted. Only your latest warning is kept.
-- Sending a warning appeal now edits the "Sending your appeal…" line into "Appeal sent ✔"
-  instead of adding a second line.
-- A banned person's screen checks in with the host every 6 seconds (was 10).
-- Fixed: the "New messages" button smeared upwards as you scrolled (macOS), now shows how many
-  new messages are waiting, and disappears whenever you get back to the bottom — scrolling,
-  trackpad, dragging the scrollbar, keys or resizing — and the mouse wheel works over it.
-- Fixed: the whole Snake / Flappy Bird window flashed whenever your score went up (macOS).
-
-Changes in 1.4.10d:
-- Replying to a message now pings its author (unless they're on Do Not Disturb, in which
-  case you're told, same as an @mention; no double-ping if you also @mentioned them).
-- Unbans reach the person: a banned person's screen now checks in with the host every few
-  seconds, and when the ban is lifted (or runs out) it shows "You have been unbanned",
-  who did it and why. /unban <ip or name> [reason] takes an optional reason.
-- Appeals can be decided: every appeal gets a number. /appeals lists the open ones,
-  /accept <#> [reason] and /reject <#> [reason] close them. Accepting a ban appeal lifts the
-  ban; accepting a warning appeal deletes the warning. The person is told the outcome and
-  your reason (a rejected ban appeal shows up on their ban screen).
-- /unwarn <name> [warning # | all] [reason] deletes a warning (asks which, if there's more than one).
-- /history [name] shows moderation history for this session: warnings (and whether they
-  were removed), mutes, kicks, bans, unbans and appeal decisions. With no name, the latest
-  entries for the whole room.
-- Fixed: the "You have been warned" pop-up now closes by itself once you send an appeal.
-
-Changes in 1.4.10c:
-- Fixed: joining by Room Code could fail ("Could not find Room") while entering the host's
-  IP worked. The Room Code is built from the host's IP, and a VPN (or any extra network
-  adapter) can make the machine report a different address from the one guests reach it on.
-  The code was also only worked out once, when the Host screen opened, so a later IP change
-  (Wi-Fi reconnect, sleep/wake, DHCP renewal) left it stale. It's now re-checked when you
-  press Host and every few seconds while hosting (the title bar and chat show a new code if
-  it changes); the host answers for every address it has, guests try the Room Code on every
-  network they're on, and the host's welcome line lists any extra addresses it found.
-
-Changes in 1.4.10b:
-- Appeals: a banned person sees an APPEAL BAN button on the home screen (a short,
-  light-hearted questionnaire); the warning pop-up has an Appeal button too. Both
-  land in the admin channel (host + admins), one appeal per ban / per warning.
-- Reports: right-click a message or attachment -> Report. The admin channel gets the
-  text, author, reporter and reason. (Whisper reports go to the host only.)
-- Reply: right-click -> Reply shows a quote above your message; click it to jump back.
-- Cancel button for uploads. Big-file receivers are never kicked for being slow (they're
-  skipped for that file and told); old clients that can't take files get a notice instead
-  of a flood of unreadable chunks.
-- Mutes and temporary bans now show the date (and "(1 year)") — a one-year mute used to
-  display only a clock time. File sizes use the same units as this computer's file manager.
-- Fixed: status lines above the message box squashing the chat bar into a sliver.
-- Fixes: the host now stamps the sender's name on every message/typing/DND/reaction (a
-  modified client could impersonate anyone), whispers can't be reacted to, silent
-  half-open connections time out, stale upload events no longer leak into the next chat,
-  "X is typing" ghosts after someone leaves/renames, 4,000-character message limit.
-
-Changes in 1.4.10a:
-- Rooms hold up to 15 guests (was 4).
-- Paste an image (a screenshot, or an image copied from anywhere) into the
-  message box with Ctrl+V / Cmd+V: a small preview asks "Send?" and it goes out
-  as a normal attachment (privately if the box starts with /whisper <name>).
-  Copied files from Explorer/Finder can be sent the same way.
-- /nick now tells you how many nickname changes you have left. (The host-only
-  /rename and the two-changes-per-person rule — admins included — came in 1.4.10.)
-- The 1 GB file limit stays: a real 1 GiB transfer was tested end to end.
-
-Changes in 1.4.10:
-- Large files: sending a big file used to disconnect everyone (it went out as one
-  giant message that overflowed every recipient's send queue — anything over
-  ~300 MB). Files are now streamed in 512 KB pieces, paced to the slowest
-  recipient, and written to disk as they arrive, so the limit really is 1 GB,
-  memory stays low, chat stays instant mid-transfer, and a recipient on a bad
-  connection is dropped alone. A sender vanishing mid-transfer leaves no
-  partial file anywhere. Progress shows in the status line; downloads of big
-  files copy in the background.
-- Nicknames: /nick <name> (anyone, twice per chat, no reconnect needed) and
-  host-only /rename <current> <new>. A host rename doesn't use up the person's
-  changes but locks them out of changing it back. Admin status, colours, mutes,
-  whispers, edit rights and Snake scores follow a renamed person. Names can't
-  contain spaces or "|".
-- /warn <name> [reason] (host and admins): the person gets a warning pop-up with
-  a running count; everyone else sees "X has been warned"; the admin log records it.
-- Version strings like 1.4.10 are compared numerically (1.4.10 > 1.4.9d > 1.4.1).
-- Not compatible with 1.4.9d for file transfers — update everyone.
-
-Changes in 1.4.9d:
-- Joining: rejoining after leaving while muted no longer fails (the host sent
-  the mute status before the roster, which the joining client rejects), and a
-  join can no longer collide with someone else's message/leave in the same
-  instant. The same device reconnecting replaces its old, possibly dead,
-  session instead of hitting "Nickname already in use"; TCP keepalive makes
-  vanished peers get noticed.
-- Delivery: every connection has its own ordered send queue (Outbox), so one
-  slow/stalled person can't hold up or corrupt anyone else's messages, large
-  files can't interleave with chat on the wire, and control messages overtake
-  queued files. Receiving big files no longer stalls the receive thread
-  (this also removes the lag when deleting attachments). Unexpected receive
-  errors now disconnect cleanly instead of silently freezing your view.
-- Uploads run in the background with an "Uploading and Sending..." label.
-- Whispers are real messages: editable/deletable by their sender, private to
-  the two people involved (admins never see them; only the host is told, in
-  a separate Host Log, when one is edited or deleted), and they can
-  carry files, images and stickers (type /whisper <name>, then click the
-  attach/sticker button). Muted users can't whisper; slowmode applies.
-- Pings go to everyone @mentioned; DND users are reported in one message.
-- Emoji / sticker / suggestion pop-ups are in-window panels, not separate
-  windows (fixes the chat box seizing up until minimise/restore on macOS).
-- Snake: live leaderboard shared across the chat, cleared when the chat
-  restarts; the snake always matches your name colour.
-- Two more secret gradient name colours.
-- Not compatible with 1.4.9c for whispers and attachments — update everyone.
-
-Changes in 1.4.9c:
-- Attachments (files, images, stickers) can be deleted the same way as
-  messages: right-click -> Delete attachment. The sender can delete their
-  own; admins and the host can delete anyone's (except the host's, which
-  only the host can). A deleted attachment collapses to one line
-  ("[attachment deleted]"), the image preview / download card is removed
-  and its memory released. Admin log entries say "attachment".
-- Attachments now carry a message id (new FILE wire format — 1.4.9c and
-  1.4.9b can't exchange files; update everyone). Right-click an attachment
-  also offers "Save As...".
-- The host now drops a message/attachment whose id it has already seen.
-
-Changes in 1.4.9b:
-- Everyone can edit or delete their own messages (right-click a message).
-  Admins (and the host) can also delete other people's messages. The host
-  can't have its messages deleted by an admin. Edited messages show
-  "(edited)"; deleted ones become "[message deleted]".
-- The admin log (host + admins) records every edit (old -> new text) and
-  delete (the text that was removed), with who did it.
-- Backwards compatible: edit/delete updates are only sent to clients that
-  announced support, so 1.4.9a/1.4.8x members just keep seeing the original
-  message instead of stray protocol text.
-
-Changes in 1.4.9a:
-- Fixed the "New messages" button sometimes staying on screen while you were
-  already at the bottom of the chat (most often right after starting a room,
-  seen on macOS). The button now re-checks once the window has finished laying
-  out, and also when the window is resized.
-
-Changes in 1.4.9 (tidy-up + UI/UX efficiency pass — no protocol changes,
-so 1.4.9 interoperates with 1.4.8x):
-- Connecting no longer freezes the window (ban-list check moved off the UI
-  thread); Connect shows a "Connecting..." state; Enter connects from any
-  field; display name + DND keybind are remembered between launches.
-- Chat log only auto-scrolls when you're already at the bottom (with a
-  "New messages" jump button otherwise); trimmed past MAX_LOG_LINES.
-- Up/Down recall sent messages, Esc closes pop-ups, unread count in the
-  window title, member list only redraws when something changed, typing
-  notices only sent when the text actually changes, image thumbnails are
-  prepared off the UI thread, pickers anchor to their buttons.
-- Robustness: a bad event can't stop the UI event loop; stale events from
-  a closed session can't leak into the next one; bare "/ban" etc. show
-  usage instead of being posted as chat; host /color refreshes instantly.
-- Code: shared JSON helpers (atomic saves), table-driven moderation
-  commands and event dispatch, de-duplicated slowmode/file/unlock code.
-
-Fixes/features in 1.4.8d (and the earlier 1.4.8 patches):
-- Added a device-level global ban system, separate from the in-room
-  /ipban: a device fingerprint (shown to hosts on connect, alongside
-  their IP) can go on a signed ban list every client checks before
-  hosting/joining. Gated by possession of a private key that's never
-  distributed with the app (not a password — nothing in public source
-  can stay secret). Like any client-side check, a technical user could
-  still bypass it — a real deterrent, not an unbreakable lock. Inert
-  (zero network calls) unless explicitly configured.
-
-Fixes in 1.4.8:
-- Snake leaderboard shows every player ranked, not just a top few.
-- Fixed a real bug where an unexpected error while handling a message
-  mid-session could silently skip cleanup, leaving a "ghost" user stuck
-  in the room until the app restarted (blocked that name from
-  reconnecting the whole time).
-- Added a second secret gradient unlock (blue-toned) alongside the
-  existing one — codes intentionally not written here, same as before.
-- Host can now IP-ban someone directly by address, even if they're not
-  currently connected, via a new host-only command.
-
-Fixes in 1.4.7:
-- Rainbow name hover animation now works in the chat log too, not just
-  the sidebar — each message instance animates independently. Fixed the
-  sidebar rendering rainbow names with abnormally spaced-out letters.
-- Added Snake: press Ctrl+Shift+S to open it (single-player for now).
-  Host plays plain white, rainbow-unlocked plays a moving rainbow
-  snake, everyone else gets a random color. High scores save locally
-  and show as a small leaderboard in the game window.
-
-Fixes in 1.4.6:
-- Added a secret rainbow unlock: entering a specific hidden phrase in
-  the "Host IP" field (instead of an address) gives your name an
-  animated rainbow treatment — a static gradient in chat, and in the
-  member list it actually shifts/moves while you hover over it. Host
-  color stays plain white as always.
-
-Fixes in 1.4.5c:
-- Fixed "View Changelog" clipping into "Check for Updates" on the connect
-  screen (Mac only) — the gap was a hardcoded pixel offset that didn't
-  account for macOS rendering text taller at the same font size. Now
-  sized from actual rendered text height instead of a fixed guess.
-
-Fixes in 1.4.5b:
-- Host can now change their own color as many times as they want,
-  overriding the usual once-per-session limit that still applies to guests.
-
-Fixes in 1.4.5a:
-- Fixed a major bug where the connection handshake kept failing.
-
-Fixes/features in 1.4.5:
-- Custom sticker upload: pick an image, name it, it's converted to JPEG
-  and saved locally (chat_gui_stickers.json) so it persists across
-  sessions — no re-uploading every time. Shown as thumbnails in the
-  picker alongside the built-ins; right-click a custom one to delete it.
-- Guests now see "You joined Room ... as ..." immediately on connecting,
-  instead of a blank chat box until someone else sends a message.
-- /mute, /kick, /ban suggestions now rank whoever's sent the most
-  messages recently (last 60s) first — usually who you're about to
-  target. @ ping suggestions rank whoever's gone longest without
-  sending a message first (never-spoken users rank highest of all).
-- Fixed macOS DND keybinds: Command was being detected/labeled as Alt
-  (so a Command-based bind never actually matched a real Command press
-  on Mac — not just a display bug), and Option was corrupting the
-  captured key through its own accent/dead-key composition. Both fixed
-  via correct Mac modifier names and a stable keycode-based fallback —
-  not verified on a real Mac, worth double-checking on your end.
-
-Fixes in 1.4.4d:
-- DND keybind picker can now be reopened after already setting a
-  non-default bind once, instead of requiring an app restart.
-- A letter-key DND bind no longer also types that letter into the chat box.
-- Clicking a slash-command suggestion now actually inserts it, instead of
-  just making the suggestion box vanish — and no longer leaves the chat
-  box stuck/unresponsive on Mac afterward.
-- Fixed the room code on the host setup screen showing unreadable
-  white-on-white text (Tk's readonly-state background wasn't set).
-
-Fixes in 1.4.4a:
-- Added an in-app Changelog viewer (see the "View Changelog" link on the
-  connect screen) — shows version, install date, and release notes for
-  every version, including anything installed later via OTA.
-- Slowmode now shows a live countdown above the chat box while the input
-  is locked ("Slowmode is active, you cannot send messages for X.Xs"),
-  instead of just silently disabling it with no explanation.
-
-Fixes in 1.4.4:
-- Version strings can now carry an optional trailing letter (e.g. 1.4.2c)
-  for small QOL patches that don't warrant a full numeric bump; the
-  updater sorts these correctly (1.4.2 < 1.4.2a < ... < 1.4.2d < 1.4.3).
-- Mute now actually lifts on its own when the timer runs out, instead of
-  leaving the input box stuck disabled until an explicit /unmute.
-- Moderating the host (/mute, /unmute, /kick, /ban, /admin, /unadmin) now
-  replies "You cannot <action> the host." instead of the misleading
-  "No one named '<host>' is connected." (the host was never in the
-  guest-socket table those commands were checking).
-
-Fixes in 1.4.2:
-- Added an in-app, signature-verified update checker (see UPDATE_MANIFEST_URL below).
-- Minor UI/UX polish and cleanup pass.
-
-Fixes in 1.4.1:
-- Added 🛡️ [Admin Log] broadcasting so admins can see each other's moderation actions in real-time.
-- Optimized live suggestion evaluating with sets and comprehensions.
-- Refactored UI toggle states to DRY up Slowmode & Mute logic.
-- Optimized ping targeting string searches.
 """
 
 import sys
@@ -440,7 +168,7 @@ except ImportError:
 if sys.platform == "darwin":
     ensure_installed("pyobjus", required=False)
 
-VERSION = "1.5.0d"
+VERSION = "1.5.0e"
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -1809,6 +1537,42 @@ def deliver_report(report: dict) -> bool:
         "description": report.get("description", ""), "version": report.get("version", ""), "os": report.get("os", ""), "date": report.get("date", "")})
     return status == 200 and isinstance(data, dict) and bool(data.get("ok"))
 
+REPORT_REFRESH_COOLDOWN_SECONDS = 30   # how often "Refresh" in My previous reports may ask the server
+
+def friendly_ago(seconds: float) -> str:
+    """'just now', '3 minutes ago', '2 hours ago', '5 days ago'."""
+    seconds = max(0, int(seconds))
+    if seconds < 60: return "just now"
+    for size, unit in ((86400, "day"), (3600, "hour"), (60, "minute")):
+        if seconds >= size:
+            n = seconds // size
+            return f"{n} {unit}{'s' if n != 1 else ''} ago"
+    return "just now"
+
+def apply_report_statuses(data: dict) -> list:
+    """Records what the report server says about this computer's reports (done / reopened, and when). Returns the reports
+    that have JUST turned out to be completed and haven't been announced yet."""
+    statuses = data.get("statuses") or {}
+    completed = data.get("completed") or {}
+    server_now = data.get("now")
+    newly = []
+    for r in load_reports():
+        status = statuses.get(str(r.get("id")))
+        if status is None:
+            continue  # the server doesn't know it (deleted, or never arrived)
+        if status == "done":
+            changes = {"status": "done"}
+            when_ms = completed.get(str(r.get("id")))
+            if when_ms and server_now:  # work out WHEN on this computer's clock, from how long ago the server says it was
+                changes["completed_at"] = time.time() - max(0, (server_now - when_ms) / 1000)
+            if any(r.get(k) != v for k, v in changes.items()):
+                update_report(r["id"], **changes)
+            if not r.get("notified"):
+                newly.append(dict(r, **changes))
+        elif r.get("status") == "done":  # the developer reopened it
+            update_report(r["id"], status="open", notified=False, completed_at=None)
+    return newly
+
 def relative_time_str(timestamp: float) -> str:
     delta = max(0, time.time() - timestamp)
     if delta < 60: return "just now"
@@ -2064,6 +1828,16 @@ def perform_globalban(fingerprint: str, reason: str) -> str:
 # install time, so the in-app viewer stays complete going forward
 # without needing the whole history re-embedded on every release.
 EMBEDDED_CHANGELOG = [
+    {   "version": "1.5.0e",
+        "date": "2026-11-15",
+        "notes": (
+            "The 'your report was completed' window now says when it was completed ('3 minutes ago', plus the date "
+            "and time). The home-screen link is now 'Report a bug, suggest a feature, or view your previous reports': "
+            "it opens a menu with a new-report form and a 'My previous reports' list showing whether each report is "
+            "open or completed (and when), with a Refresh button (once every 30 seconds) that checks the report "
+            "server right away instead of waiting for the 10-minute check."
+        ),
+    },
     {   "version": "1.5.0d",
         "date": "2026-11-14",
         "notes": (
@@ -5413,6 +5187,8 @@ class ChatApp(tk.Tk):
         self._last_report_time = 0.0
         self._report_login_failures = 0
         self._pending_manifest = None     # the update the banner on the main menu is offering
+        self._reports_last_checked = 0.0  # when this computer last heard from the report server about its reports
+        self._last_force_refresh = 0.0    # when "Refresh" in My previous reports was last pressed (it's rate limited)
         self._notice_queue, self._notice_active, self._notice_times = [], False, []
         self._rainbow_instance_seq = 0
         self._job_seq = 0
@@ -5838,9 +5614,9 @@ class ChatApp(tk.Tk):
         self.appeal_btn = make_button(card, "APPEAL BAN", self._open_ban_appeal, bg=BTN_RED, hover_bg=BTN_RED_HOVER)
         self.appeal_btn.grid(row=9, column=0, columnspan=3, pady=(8, 0), sticky="ew")
         self.appeal_btn.grid_remove()
-        report_link = tk.Label(card, text="💡 Report a bug or suggest a feature", bg=BG_PANEL, fg=FG_MUTED, font=link_font, cursor="hand2")
+        report_link = tk.Label(card, text="💡 Report a bug, suggest a feature, or view your previous reports", bg=BG_PANEL, fg=FG_MUTED, font=link_font, cursor="hand2")
         report_link.grid(row=10, column=0, columnspan=3, pady=(14, 0))
-        report_link.bind("<Button-1>", lambda e: self._open_report_dialog())
+        report_link.bind("<Button-1>", lambda e: self._open_reports_menu())
 
         self.mode_var.trace_add("write", lambda *_args: self._on_mode_change())
         self._on_mode_change()
@@ -6128,12 +5904,15 @@ class ChatApp(tk.Tk):
         code, data = result if isinstance(result, tuple) else (None, None)
         if code != 200 or not isinstance(data, dict):
             return
-        statuses = data.get("statuses") or {}
-        finished = [r for r in load_reports() if statuses.get(str(r.get("id"))) == "done" and not r.get("notified")]
+        self._reports_last_checked = time.time()
+        self._announce_completed(apply_report_statuses(data))
+
+    def _announce_completed(self, finished: list):
+        """The window saying one or more of this computer's reports were completed (and when)."""
         if not finished:
             return
         for r in finished:
-            update_report(r["id"], notified=True, status="done")
+            update_report(r["id"], notified=True)
         popup_name = f"report_completed_{time.time_ns()}"
         popup = self._open_dialog(popup_name, "Report completed", padx=24, pady=20)
         if popup is None:
@@ -6143,6 +5922,8 @@ class ChatApp(tk.Tk):
         for r in finished[:6]:
             icon = "💡" if r.get("kind") == "feature" else "🐞"
             tk.Label(popup, text=f"{icon}  {r.get('summary', '')}", bg=BG_PANEL, fg=FG_TEXT, font=CHAT_FONT, wraplength=400, justify="left").pack(anchor="w", pady=(8, 0))
+            if r.get("completed_at"):
+                tk.Label(popup, text=f"Completed {friendly_ago(time.time() - r['completed_at'])} — {format_time(r['completed_at'])}", bg=BG_PANEL, fg=FG_MUTED, font=(CHAT_FONT[0], 9)).pack(anchor="w")
         if len(finished) > 6:
             tk.Label(popup, text=f"…and {len(finished) - 6} more", bg=BG_PANEL, fg=FG_MUTED, font=CHAT_FONT).pack(anchor="w", pady=(4, 0))
         tk.Label(popup, text=("They've been marked as completed and will be released in the next update. " if many else
@@ -6150,6 +5931,114 @@ class ChatApp(tk.Tk):
                  bg=BG_PANEL, fg=FG_TEXT, font=CHAT_FONT, wraplength=400, justify="left").pack(anchor="w", pady=(12, 0))
         make_button(popup, "OK", lambda: self._close_popup(popup_name), bg=COLOR_PALETTE["blue"], hover_bg=BTN_BLUE_HOVER, padx=18, pady=5).pack(anchor="e", pady=(14, 0))
         popup.lift()
+
+    # ---- the reports menu and "My previous reports" ----
+
+    def _open_reports_menu(self):
+        popup = self._open_dialog("reports_menu", "Reports", padx=24, pady=20)
+        if popup is None:
+            return
+        tk.Label(popup, text="💡  Reports", bg=BG_PANEL, fg=FG_TEXT, font=(CHAT_FONT[0], 14, "bold")).pack(anchor="w")
+        tk.Label(popup, text="Found a bug, or have an idea? Or see how the ones you sent are getting on.", bg=BG_PANEL, fg=FG_MUTED, font=CHAT_FONT, wraplength=340, justify="left").pack(anchor="w", pady=(6, 14))
+        def choose(action):
+            self._close_popup("reports_menu")
+            action()
+        make_button(popup, "📝  Send a bug report or suggestion", lambda: choose(self._open_report_dialog), bg=COLOR_PALETTE["blue"], hover_bg=BTN_BLUE_HOVER, padx=16, pady=8).pack(fill="x")
+        make_button(popup, "📂  My previous reports", lambda: choose(self._open_my_reports_window), bg=BTN_NEUTRAL, hover_bg=BTN_NEUTRAL_HOVER, padx=16, pady=8).pack(fill="x", pady=(8, 0))
+        make_button(popup, "Close", lambda: self._close_popup("reports_menu"), bg=BTN_NEUTRAL, hover_bg=BTN_NEUTRAL_HOVER, padx=16, pady=5).pack(anchor="e", pady=(14, 0))
+
+    def _open_my_reports_window(self):
+        """Everything this computer has sent: still open or completed (and when), with a rate-limited Refresh."""
+        win = self._open_dialog("my_reports", "My previous reports", padx=16, pady=14, resizable=True)
+        if win is None:
+            return
+        top = tk.Frame(win, bg=BG_PANEL)
+        top.pack(fill="x")
+        tk.Label(top, text="📂  My previous reports", bg=BG_PANEL, fg=FG_TEXT, font=(CHAT_FONT[0], 13, "bold")).pack(side="left")
+        info = tk.Label(win, text="", bg=BG_PANEL, fg=FG_MUTED, font=(CHAT_FONT[0], 9), anchor="w", justify="left", wraplength=600)
+        info.pack(fill="x", pady=(4, 6))
+        listbox = tk.Listbox(win, width=86, height=9, bg=BG_INPUT, fg=FG_TEXT, selectbackground=COLOR_PALETTE["blue"], relief="flat", font=CHAT_FONT, activestyle="none", exportselection=False)
+        listbox.pack(fill="x")
+        detail = tk.Text(win, width=86, height=9, wrap="word", bg=BG_INPUT, fg=FG_TEXT, relief="flat", font=CHAT_FONT, padx=8, pady=6, state="disabled")
+        detail.pack(fill="both", expand=True, pady=(8, 0))
+        message = tk.Label(win, text="", bg=BG_PANEL, fg=FG_MUTED, font=(CHAT_FONT[0], 9), anchor="w")
+        message.pack(fill="x", pady=(6, 0))
+        buttons = tk.Frame(win, bg=BG_PANEL)
+        buttons.pack(fill="x", pady=(6, 0))
+        shown = []
+
+        def status_text(r):
+            if r.get("status") == "done":
+                if r.get("completed_at"):
+                    return f"✔ Completed {friendly_ago(time.time() - r['completed_at'])} — {format_time(r['completed_at'])}. It will be released in the next update."
+                return "✔ Completed — it will be released in the next update."
+            if r.get("delivered"):
+                return "⏳ Sent to the developer — not completed yet."
+            if report_server() is None:
+                return "📝 Saved on this computer only — this copy of the app doesn't send reports anywhere."
+            return "📝 Saved on this computer only — it hasn't reached the developer (it was sent while offline, or the server was unreachable)."
+
+        def refresh_list(keep_id=None):
+            nonlocal shown
+            shown = load_reports()
+            listbox.delete(0, "end")
+            for r in shown:
+                mark = "✔" if r.get("status") == "done" else ("⏳" if r.get("delivered") else "📝")
+                icon = "💡" if r.get("kind") == "feature" else "🐞"
+                listbox.insert("end", f"{mark} {icon}  {r.get('date', '?')}  ·  v{r.get('version', '?')}  ·  {r.get('summary', '')}")
+            index = next((i for i, r in enumerate(shown) if r.get("id") == keep_id), 0 if shown else None)
+            if index is not None:
+                listbox.selection_set(index)
+            show_selected()
+            checked = self._reports_last_checked
+            info.configure(text=("Last checked with the report server: " + (friendly_ago(time.time() - checked) if checked else "not yet this session") + ". It also checks by itself every 10 minutes.")
+                           if report_server() else "Reports aren't being sent anywhere from this copy of the app.")
+
+        def show_selected(event=None):
+            picked = listbox.curselection()
+            r = shown[picked[0]] if picked else None
+            detail.configure(state="normal")
+            detail.delete("1.0", "end")
+            detail.insert("1.0", f"{format_report_text(r)}\n\n{status_text(r)}" if r else "You haven't sent any reports from this computer yet.")
+            detail.configure(state="disabled")
+
+        def refresh_clicked():
+            wait = REPORT_REFRESH_COOLDOWN_SECONDS - (time.time() - self._last_force_refresh)
+            if wait > 0:
+                return message.configure(text=f"Easy — you can refresh again in {int(wait) + 1}s.", fg=FG_MUTED)
+            if report_server() is None:
+                return message.configure(text="There's no report server set up, so there's nothing to check.", fg=FG_MUTED)
+            self._last_force_refresh = time.time()
+            message.configure(text="Checking…", fg=FG_MUTED)
+            ids = [str(r["id"]) for r in load_reports() if r.get("delivered")][:50]
+            if not ids:
+                return message.configure(text="None of your reports have reached the server yet, so there's nothing to check.", fg=FG_MUTED)
+            def finished(result):
+                code, data = result if isinstance(result, tuple) else (None, None)
+                if code != 200 or not isinstance(data, dict):
+                    message.configure(text="Couldn't reach the report server — try again in a bit.", fg=self.STATUS_COLORS["error"])
+                    return
+                self._reports_last_checked = time.time()
+                newly = apply_report_statuses(data)
+                keep = shown[listbox.curselection()[0]].get("id") if listbox.curselection() else None
+                refresh_list(keep_id=keep)
+                message.configure(text="Up to date." if not newly else f"{len(newly)} newly completed!", fg=COLOR_PALETTE["green"])
+                self._announce_completed(newly)
+            self._run_bg(lambda: worker_call("/status", body={"ids": ids}), finished)
+
+        def copy():
+            picked = listbox.curselection()
+            if picked:
+                self.clipboard_clear()
+                self.clipboard_append(format_report_text(shown[picked[0]]))
+                message.configure(text="Copied.", fg=FG_MUTED)
+
+        listbox.bind("<<ListboxSelect>>", show_selected)
+        make_button(buttons, "🔄 Refresh", refresh_clicked, bg=COLOR_PALETTE["blue"], hover_bg=BTN_BLUE_HOVER, padx=14, pady=5).pack(side="left", padx=(0, 8))
+        make_button(buttons, "Copy", copy, bg=BTN_NEUTRAL, hover_bg=BTN_NEUTRAL_HOVER, padx=14, pady=5).pack(side="left", padx=(0, 8))
+        make_button(buttons, "New report", lambda: (self._close_popup("my_reports"), self._open_report_dialog()), bg=BTN_NEUTRAL, hover_bg=BTN_NEUTRAL_HOVER, padx=14, pady=5).pack(side="left", padx=(0, 8))
+        make_button(buttons, "Close", lambda: self._close_popup("my_reports"), bg=BTN_NEUTRAL, hover_bg=BTN_NEUTRAL_HOVER, padx=14, pady=5).pack(side="left")
+        refresh_list()
 
     # ---- the inbox owner's "a new report arrived" alerts ----
 
@@ -6406,6 +6295,8 @@ class ChatApp(tk.Tk):
         def show_selected(event=None):
             r = selected()
             where = "stored on the report server" if r and r["_source"] == "server" else "saved on this computer only"
+            if r and r["_source"] == "server" and r.get("status") == "done" and r.get("completed"):
+                where = f"completed {friendly_ago(time.time() - r['completed'] / 1000)}, {format_time(r['completed'] / 1000)} · " + where
             detail.configure(state="normal")
             detail.delete("1.0", "end")
             detail.insert("1.0", f"{format_report_text(r)}\n\n[{r.get('status', 'open')} · {where}]" if r else "No reports here yet.")
