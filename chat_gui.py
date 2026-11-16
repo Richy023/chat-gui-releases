@@ -1,6 +1,20 @@
 #!/usr/bin/env python3
 """
-chat_gui.py — v1.5.0e — ENCRYPTED instant messenger with a desktop GUI.
+chat_gui.py — v1.5.0f — ENCRYPTED instant messenger with a desktop GUI.
+
+Changes in 1.5.0f:
+- Announcements: the publisher opens a menu with Ctrl+Shift+A and the admin password, types a message, and
+  every running copy of the app shows it as a banner across the top of the window — in a chat or on the main
+  menu. Copies refresh every 20 minutes, or on demand from "Announcements" on the main menu (once every 20
+  seconds). Mark it urgent and the banner flashes red and white, the window jumps to the front (even on
+  Do Not Disturb) and it arrives within about 2 minutes instead of waiting for the next refresh. Optionally
+  it expires after 1 hour / 1 day / 7 days. Announcements are signed with your update signing key, so
+  nobody who only learns the password can publish one. It needs the internet (it uses the report server).
+- Restore a previous version: a link on the main menu (admin password) lists the earlier versions kept on
+  this computer, or restores the last one in one click. The version you were running is kept too, so you
+  can go forward again. Backups kept: the newest 5 (was 1).
+- Old entries at the top of this file are trimmed with each release; the in-app changelog is untouched.
+- The report server's address is now filled in.
 
 Changes in 1.5.0e:
 - The "your report was completed" window now says when it was completed ("3 minutes ago" plus the date
@@ -83,12 +97,6 @@ Changes in 1.5.0:
   (each join came with a different port). A room code now appears once, with its latest address;
   repeats already saved are folded together too.
 
-Changes in 1.4.11b:
-- Fixed: the "New messages" button smeared up the screen as you scrolled (macOS). It is now a
-  bar in its own strip under the chat instead of floating over it, so nothing overlaps the
-  scrolling area.
-- The ⚠ Warning button's rejected-appeal flash is now six quick flashes between red and white
-  (about a second and a half), then it settles back to yellow.
 """
 
 import sys
@@ -168,7 +176,7 @@ except ImportError:
 if sys.platform == "darwin":
     ensure_installed("pyobjus", required=False)
 
-VERSION = "1.5.0e"
+VERSION = "1.5.0f"
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -1460,8 +1468,9 @@ REPORTS_PASSWORD_SHA256 = "b7f6b0c151a099ce850f1da345e9e97db90b5f6cc960f5a895e17
 # Optional: where reports go so you receive everyone's. Reports are always saved on the computer they were written on; with this
 # set they're also sent to YOUR report server — a free Cloudflare Worker (the code is in report_worker.js, with setup steps) — and
 # the inbox (Ctrl+Shift+B) then shows reports from everyone's computers. Paste the Worker's address between the quotes,
-# e.g. "https://chat-gui-reports.yourname.workers.dev". Leave it empty to keep reports on each computer only.
-REPORT_WORKER_URL = ""
+# e.g. "https://chat-gui-reports.yourname.workers.dev". Leave it empty to keep reports on each computer only. The same
+# server also carries announcements (Ctrl+Shift+A).
+REPORT_WORKER_URL = "https://chat-gui-reports.richardfeng023.workers.dev"
 REPORT_COOLDOWN_SECONDS = 20
 
 def _os_label() -> str:
@@ -1536,6 +1545,36 @@ def deliver_report(report: dict) -> bool:
         "id": str(report.get("id", "")), "kind": report.get("kind", "bug"), "summary": report.get("summary", ""),
         "description": report.get("description", ""), "version": report.get("version", ""), "os": report.get("os", ""), "date": report.get("date", "")})
     return status == 200 and isinstance(data, dict) and bool(data.get("ok"))
+
+ANNOUNCEMENTS_KEYBIND = "<Control-Shift-KeyPress-A>"   # the publisher's announcement menu (asks for the password)
+ANNOUNCE_REFRESH_SECONDS = 20 * 60        # how often every copy re-reads the announcement
+ANNOUNCE_URGENT_CHECK_SECONDS = 120       # …and how often it asks "is there an URGENT one?" (a tiny request) so those arrive fast
+ANNOUNCE_MANUAL_COOLDOWN_SECONDS = 20     # "Refresh" in the Announcements window
+ANNOUNCE_MAX_CHARS = 500
+
+def _announcement_signing_bytes(text: str, urgent: bool, issued: int, hours: int) -> bytes:
+    return json.dumps({"text": text, "urgent": bool(urgent), "issued": int(issued), "hours": int(hours)}, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+def sign_announcement(text: str, urgent: bool, issued: int, hours: int, privkey) -> str:
+    """Signs an announcement with the publisher's update signing key (the same key that signs releases)."""
+    return base64.b64encode(privkey.sign(_announcement_signing_bytes(text, urgent, issued, hours))).decode("ascii")
+
+def verify_announcement(data: dict):
+    """The report server's announcement, checked. -> {seq, text, urgent, issued, hours} (text is "" if there's none, or it has
+    run out), or None if its signature is bad — a forged or damaged announcement is simply ignored."""
+    seq = int(data.get("seq") or 0)
+    text = data.get("text") or ""
+    if not text:
+        return {"seq": seq, "text": "", "urgent": False, "issued": 0, "hours": 0}
+    try:
+        issued, hours, urgent = int(data["issued"]), int(data["hours"]), bool(data.get("urgent"))
+        pubkey = Ed25519PublicKey.from_public_bytes(base64.b64decode(UPDATE_PUBLIC_KEY_B64))
+        pubkey.verify(base64.b64decode(data["signature"]), _announcement_signing_bytes(text, urgent, issued, hours))
+    except Exception:
+        return None
+    if hours and time.time() * 1000 > issued + hours * 3600 * 1000:
+        text = ""
+    return {"seq": seq, "text": text, "urgent": urgent and bool(text), "issued": issued, "hours": hours}
 
 REPORT_REFRESH_COOLDOWN_SECONDS = 30   # how often "Refresh" in My previous reports may ask the server
 
@@ -1653,10 +1692,13 @@ def download_and_verify_update(manifest: dict) -> bytes:
     verify_update_payload(payload, manifest)
     return payload
 
-def prune_old_backups(keep: int = 1, target_path: str = None) -> int:
+BACKUPS_TO_KEEP = 5   # earlier versions kept next to the script (so "Restore a previous version" has something to offer)
+
+def prune_old_backups(keep: int = None, target_path: str = None) -> int:
     """Deletes the backups earlier updates left next to the script (chat_gui.py.bak-<timestamp>), keeping only the
-    newest `keep` of them as a safety net (use keep=0 to keep none). Only files with exactly that name are touched.
+    newest `keep` of them (default BACKUPS_TO_KEEP; keep=0 keeps none). Only files with exactly that name are touched.
     Also clears a half-finished update's temp file. Returns how many files were deleted."""
+    keep = BACKUPS_TO_KEEP if keep is None else keep
     target_path = os.path.abspath(target_path or __file__)
     folder, base = os.path.split(target_path)
     pattern = re.compile(r"^" + re.escape(base) + r"\.bak-(\d+)$")
@@ -1686,14 +1728,53 @@ def apply_update(payload: bytes) -> str:
     writes via a temp file + atomic replace so a crash mid-write can't
     leave a half-written, unrunnable script behind."""
     target_path = os.path.abspath(__file__)
-    backup_path = f"{target_path}.bak-{int(time.time())}"
+    stamp = int(time.time())
+    while os.path.exists(f"{target_path}.bak-{stamp}"):  # two updates in the same second must not overwrite each other's backup
+        stamp += 1
+    backup_path = f"{target_path}.bak-{stamp}"
     shutil.copy2(target_path, backup_path)
     tmp_path = f"{target_path}.update_tmp"
     with open(tmp_path, "wb") as f:
         f.write(payload)
     os.replace(tmp_path, target_path)
-    prune_old_backups(keep=1, target_path=target_path)  # the backup just made stays; earlier ones go
+    prune_old_backups(target_path=target_path)  # the backup just made stays; the oldest ones beyond BACKUPS_TO_KEEP go
     return backup_path
+
+def list_backups(target_path: str = None) -> list:
+    """The earlier versions kept next to the script, newest first: [{path, stamp, version, size}]."""
+    target_path = os.path.abspath(target_path or __file__)
+    folder, base = os.path.split(target_path)
+    pattern = re.compile(r"^" + re.escape(base) + r"\.bak-(\d+)$")
+    found = []
+    try: names = os.listdir(folder)
+    except OSError: return []
+    for name in names:
+        m = pattern.match(name)
+        if not m: continue
+        path = os.path.join(folder, name)
+        try:
+            with open(path, encoding="utf-8") as f: version = re.search(r'^VERSION = "([^"]+)"', f.read(), re.M)
+            size = os.path.getsize(path)
+        except (OSError, UnicodeDecodeError):
+            continue
+        if version: found.append({"path": path, "stamp": int(m.group(1)), "version": version.group(1), "size": size})
+    return sorted(found, key=lambda b: b["stamp"], reverse=True)
+
+def restore_from_backup(path: str) -> str:
+    """Puts a kept earlier version back as the running script (the version being replaced is backed up first, so you can
+    go forward again). Refuses anything that isn't a working copy of this app. Returns the new backup's path."""
+    try:
+        with open(path, "rb") as f: source = f.read()
+        text = source.decode("utf-8")
+    except (OSError, UnicodeDecodeError) as e:
+        raise ValueError(f"Couldn't read that backup: {e}")
+    try:
+        compile(text, "chat_gui.py", "exec")
+    except SyntaxError as e:
+        raise ValueError(f"That backup isn't a working copy of the app ({e.msg}, line {e.lineno}).")
+    if not re.search(r'^VERSION = "', text, re.M) or not re.search(r"^class ChatApp\(", text, re.M):
+        raise ValueError("That file doesn't look like chat_gui.")
+    return apply_update(source)
 
 
 # ---- Global machine ban list ----
@@ -1828,6 +1909,17 @@ def perform_globalban(fingerprint: str, reason: str) -> str:
 # install time, so the in-app viewer stays complete going forward
 # without needing the whole history re-embedded on every release.
 EMBEDDED_CHANGELOG = [
+    {   "version": "1.5.0f",
+        "date": "2026-11-16",
+        "notes": (
+            "New: announcements. The publisher can post a message that shows as a banner across the top of every "
+            "running copy of the app (in a chat or not), refreshing every 20 minutes or on demand from "
+            "'Announcements' on the main menu. Urgent ones flash red and white, jump to the front and arrive "
+            "within about 2 minutes. They're signed, so only the publisher can post one. New: 'Restore a "
+            "previous version' on the main menu (admin password) puts back the last version, or any of the "
+            "newest 5 kept on this computer."
+        ),
+    },
     {   "version": "1.5.0e",
         "date": "2026-11-15",
         "notes": (
@@ -5188,6 +5280,11 @@ class ChatApp(tk.Tk):
         self._report_login_failures = 0
         self._pending_manifest = None     # the update the banner on the main menu is offering
         self._reports_last_checked = 0.0  # when this computer last heard from the report server about its reports
+        self._announce = None             # the live announcement {seq, text, urgent, issued, hours}, or None
+        self._announce_seq_seen = -1      # the newest announcement number the server has told us about
+        self._announce_shown_seq = None   # which announcement the banner is showing right now
+        self._announce_checked = 0.0
+        self._last_announce_manual = 0.0
         self._last_force_refresh = 0.0    # when "Refresh" in My previous reports was last pressed (it's rate limited)
         self._notice_queue, self._notice_active, self._notice_times = [], False, []
         self._rainbow_instance_seq = 0
@@ -5253,13 +5350,23 @@ class ChatApp(tk.Tk):
 
         # The slim notice bar across the very top of the window (new-report alerts) — packed only while it has something to show.
         self.notice_bar = tk.Label(self, text="", bg=BG_PANEL, fg=FG_TEXT, font=(CHAT_FONT[0], 10, "bold"), pady=5)
+        # The announcement banner: above everything, on the main menu and in a chat alike, until it's dismissed.
+        self.announce_bar = tk.Frame(self, bg=COLOR_PALETTE["blue"])
+        self.announce_label = tk.Label(self.announce_bar, text="", bg=COLOR_PALETTE["blue"], fg="white", font=(CHAT_FONT[0], 10, "bold"), justify="left", anchor="w", padx=12, pady=7)
+        self.announce_label.pack(side="left", fill="x", expand=True)
+        self.announce_close = tk.Label(self.announce_bar, text="✕", bg=COLOR_PALETTE["blue"], fg="white", font=(CHAT_FONT[0], 11, "bold"), cursor="hand2", padx=12)
+        self.announce_close.pack(side="right")
+        self.announce_close.bind("<Button-1>", lambda e: self._dismiss_announcement())
+        self.announce_bar.bind("<Configure>", lambda e: self.announce_label.configure(wraplength=max(200, e.width - 70)))
 
         self.bind_all(GAMES_KEYBIND, self.on_open_games)
         self.bind_all(REPORTS_KEYBIND, self.on_open_reports)
+        self.bind_all(ANNOUNCEMENTS_KEYBIND, self.on_open_announcements_admin)
         # Quiet background jobs shortly after launch, once the window is up.
         self.after(1500, lambda: self._start_update_check(manual=False))
         self.after(4000, self._check_my_reports)
         self.after(6000, self._start_report_watch)
+        self.after(8000, self._start_announcements)
         threading.Thread(target=prune_old_backups, daemon=True).start()
         self.bind("<FocusIn>", self._on_focus_in)
         self.bind_all("<Button-1>", self._on_global_click, add="+")  # click-away closes the in-window pickers
@@ -5617,6 +5724,12 @@ class ChatApp(tk.Tk):
         report_link = tk.Label(card, text="💡 Report a bug, suggest a feature, or view your previous reports", bg=BG_PANEL, fg=FG_MUTED, font=link_font, cursor="hand2")
         report_link.grid(row=10, column=0, columnspan=3, pady=(14, 0))
         report_link.bind("<Button-1>", lambda e: self._open_reports_menu())
+        more_links = tk.Frame(card, bg=BG_PANEL)
+        more_links.grid(row=11, column=0, columnspan=3, pady=(6, 0))
+        for text, action in (("📢 Announcements", self._open_announcements_window), ("🛠 Restore a previous version", self._open_restore_flow)):
+            link = tk.Label(more_links, text=text, bg=BG_PANEL, fg=FG_MUTED, font=link_font, cursor="hand2")
+            link.pack(side="left", padx=10)
+            link.bind("<Button-1>", lambda e, action=action: action())
 
         self.mode_var.trace_add("write", lambda *_args: self._on_mode_change())
         self._on_mode_change()
@@ -5931,6 +6044,307 @@ class ChatApp(tk.Tk):
                  bg=BG_PANEL, fg=FG_TEXT, font=CHAT_FONT, wraplength=400, justify="left").pack(anchor="w", pady=(12, 0))
         make_button(popup, "OK", lambda: self._close_popup(popup_name), bg=COLOR_PALETTE["blue"], hover_bg=BTN_BLUE_HOVER, padx=18, pady=5).pack(anchor="e", pady=(14, 0))
         popup.lift()
+
+    # ---- a password prompt shared by the admin tools ----
+
+    def _ask_admin_password(self, name: str, heading: str, verify, on_ok):
+        """Asks for the admin password. `verify(password)` runs in the background and returns (True, result) or (False, message);
+        `on_ok(password, result)` then runs on the UI thread. Five wrong tries lock the admin tools until the app restarts."""
+        if name in self._popups:
+            self._popups[name].lift()
+            return
+        popup = self._open_dialog(name, heading, padx=24, pady=20)
+        if popup is None:
+            return
+        tk.Label(popup, text=f"🔒  {heading}", bg=BG_PANEL, fg=FG_TEXT, font=(CHAT_FONT[0], 14, "bold")).pack(anchor="w")
+        tk.Label(popup, text="Admin password", bg=BG_PANEL, fg=FG_MUTED, font=CHAT_FONT).pack(anchor="w", pady=(10, 2))
+        entry = tk.Entry(popup, show="•", width=30, bg=BG_INPUT, fg=FG_TEXT, insertbackground=FG_TEXT, relief="flat", font=CHAT_FONT)
+        entry.pack(anchor="w", ipady=3)
+        status = tk.Label(popup, text="", bg=BG_PANEL, fg=self.STATUS_COLORS["error"], font=CHAT_FONT)
+        status.pack(anchor="w", pady=(6, 0))
+        busy = {"on": False}
+
+        def answered(password, result):
+            busy["on"] = False
+            ok, value = result if isinstance(result, tuple) else (False, "Something went wrong.")
+            if ok:
+                self._report_login_failures = 0
+                self._close_popup(name)
+                on_ok(password, value)
+            else:
+                if value == "Wrong password.":
+                    self._report_login_failures += 1
+                    entry.delete(0, "end")
+                status.configure(text=str(value), fg=self.STATUS_COLORS["error"])
+
+        def submit(event=None):
+            if self._report_login_failures >= 5:
+                return status.configure(text="Too many wrong tries — restart the app to try again.")
+            if busy["on"]:
+                return
+            busy["on"] = True
+            password = entry.get()
+            status.configure(text="Checking…", fg=FG_MUTED)
+            self._run_bg(lambda: verify(password), lambda result: answered(password, result))
+        entry.bind("<Return>", submit)
+        make_button(popup, "Open", submit, bg=COLOR_PALETTE["blue"], hover_bg=BTN_BLUE_HOVER, padx=18, pady=5).pack(anchor="e", pady=(8, 0))
+        entry.focus_set()
+
+    # ---- restore a previous version ----
+
+    def _open_restore_flow(self):
+        self._ask_admin_password("restore_login", "Restore a previous version",
+                                 lambda pw: (True, None) if check_reports_password(pw) else (False, "Wrong password."),
+                                 lambda pw, _: self._open_restore_window())
+
+    def _open_restore_window(self):
+        win = self._open_dialog("restore", "Restore a previous version", padx=20, pady=16)
+        if win is None:
+            return
+        tk.Label(win, text="🛠  Restore a previous version", bg=BG_PANEL, fg=FG_TEXT, font=(CHAT_FONT[0], 14, "bold")).pack(anchor="w")
+        tk.Label(win, text=f"You're running v{VERSION}.", bg=BG_PANEL, fg=FG_MUTED, font=CHAT_FONT).pack(anchor="w", pady=(4, 8))
+        backups = list_backups()
+        if not backups:
+            tk.Label(win, text="There's no earlier version on this computer yet — one is saved each time the app updates itself.", bg=BG_PANEL, fg=FG_TEXT, font=CHAT_FONT, wraplength=420, justify="left").pack(anchor="w")
+            make_button(win, "OK", lambda: self._close_popup("restore"), bg=BTN_NEUTRAL, hover_bg=BTN_NEUTRAL_HOVER, padx=18, pady=5).pack(anchor="e", pady=(14, 0))
+            return
+        box = tk.Listbox(win, width=64, height=min(8, len(backups)), bg=BG_INPUT, fg=FG_TEXT, selectbackground=COLOR_PALETTE["blue"], relief="flat", font=CHAT_FONT, activestyle="none", exportselection=False)
+        box.pack(fill="x")
+        for i, b in enumerate(backups):
+            box.insert("end", f"{'★ last version  ' if i == 0 else ''}v{b['version']}   ·   replaced {format_time(b['stamp'])}   ·   {b['size'] // 1024} KB")
+        box.selection_set(0)
+        status = tk.Label(win, text="", bg=BG_PANEL, fg=FG_MUTED, font=(CHAT_FONT[0], 9), wraplength=420, justify="left")
+        status.pack(anchor="w", pady=(8, 0))
+        buttons = tk.Frame(win, bg=BG_PANEL)
+        buttons.pack(fill="x", pady=(10, 0))
+
+        def restore(index):
+            b = backups[index]
+            if not messagebox.askyesno("Restore", f"Restore v{b['version']}?\n\nv{VERSION} (what you're running now) is kept as a backup, and the app will need a restart.", parent=win):
+                return
+            try:
+                restore_from_backup(b["path"])
+            except Exception as e:
+                return status.configure(text=f"Couldn't restore it: {e}", fg=self.STATUS_COLORS["error"])
+            for w in buttons.winfo_children(): w.destroy()
+            status.configure(text=f"✔ v{b['version']} is back in place. Restart to use it. (The update banner may offer the newer version again — you can ignore it.)", fg=COLOR_PALETTE["green"])
+            make_button(buttons, "Restart now", self._restart_app, bg=BTN_GREEN, hover_bg=BTN_GREEN_HOVER, padx=14, pady=5).pack(side="left", padx=(0, 8))
+            make_button(buttons, "Later", lambda: self._close_popup("restore"), bg=BTN_NEUTRAL, hover_bg=BTN_NEUTRAL_HOVER, padx=14, pady=5).pack(side="left")
+
+        make_button(buttons, "Restore the last version", lambda: restore(0), bg=BTN_GREEN, hover_bg=BTN_GREEN_HOVER, padx=14, pady=5).pack(side="left", padx=(0, 8))
+        make_button(buttons, "Restore the selected one", lambda: restore(box.curselection()[0] if box.curselection() else 0), bg=BTN_NEUTRAL, hover_bg=BTN_NEUTRAL_HOVER, padx=14, pady=5).pack(side="left", padx=(0, 8))
+        make_button(buttons, "Cancel", lambda: self._close_popup("restore"), bg=BTN_NEUTRAL, hover_bg=BTN_NEUTRAL_HOVER, padx=14, pady=5).pack(side="left")
+
+    # ---- announcements: every copy of the app ----
+
+    def _start_announcements(self):
+        """Runs shortly after launch: read the announcement now, then every 20 minutes — plus a tiny check every 2 minutes
+        for an URGENT one, so those reach running copies quickly. (Needs the internet; works in a chat or not.)"""
+        self._refresh_announcement()
+        self._set_timer("announce_beacon", ANNOUNCE_URGENT_CHECK_SECONDS * 1000, self._check_urgent_beacon)
+
+    def _refresh_announcement(self, manual: bool = False, done=None):
+        self._set_timer("announce_full", ANNOUNCE_REFRESH_SECONDS * 1000, self._refresh_announcement)
+        if report_server() is None:
+            if done: done(False, "There's no server set up for announcements.")
+            return
+        self._run_bg(lambda: worker_call("/announcement"), lambda result: self._on_announcement(result, done))
+
+    def _check_urgent_beacon(self):
+        self._set_timer("announce_beacon", ANNOUNCE_URGENT_CHECK_SECONDS * 1000, self._check_urgent_beacon)
+        if report_server() is None:
+            return
+        def got(result):
+            code, data = result if isinstance(result, tuple) else (None, None)
+            if code == 200 and isinstance(data, dict) and data.get("urgent") and data.get("seq") != self._announce_seq_seen:
+                self._refresh_announcement()  # a new urgent announcement: fetch it now rather than at the next regular refresh
+        self._run_bg(lambda: worker_call("/announcement/beacon"), got)
+
+    def _on_announcement(self, result, done=None):
+        code, data = result if isinstance(result, tuple) else (None, None)
+        if code != 200 or not isinstance(data, dict):
+            if done: done(False, "Couldn't reach the server.")
+            return
+        self._announce_checked = time.time()
+        info = verify_announcement(data)
+        if info is None:  # not signed by the publisher: ignore it entirely
+            self._announce = None
+            self._hide_announcement_bar()
+            if done: done(False, "The announcement's signature didn't check out, so it was ignored.")
+            return
+        self._announce_seq_seen = info["seq"]
+        self._announce = info if info["text"] else None
+        if not info["text"]:
+            self._hide_announcement_bar()
+        elif info["seq"] != self.settings.get("announce_dismissed") and info["seq"] != self._announce_shown_seq:
+            self._show_announcement_bar(info["seq"], info["text"], info["urgent"])
+            if info["urgent"]:  # urgent overrides Do Not Disturb: it's the point of it
+                notify_toast("🚨 Urgent announcement", info["text"], root=self)
+                self._raise_for_attention(force=True)
+        if done: done(True, "")
+
+    def _paint_announce(self, bg: str, fg: str):
+        for w in (self.announce_bar, self.announce_label, self.announce_close):
+            w.configure(bg=bg)
+        self.announce_label.configure(fg=fg)
+        self.announce_close.configure(fg=fg)
+
+    def _show_announcement_bar(self, seq: int, text: str, urgent: bool):
+        self._announce_shown_seq = seq
+        self._cancel_timer("announce_flash")
+        self.announce_label.configure(text=("🚨 " if urgent else "📢 ") + text)
+        self._paint_announce(BTN_RED if urgent else COLOR_PALETTE["blue"], "white")
+        anchor = self.notice_bar if self.notice_bar.winfo_ismapped() else (self.chat_frame if self.chat_frame.winfo_ismapped() else self.connect_frame)
+        try: self.announce_bar.pack(side="top", fill="x", before=anchor)
+        except tk.TclError: self.announce_bar.pack(side="top", fill="x")
+        if urgent:  # flash red / white like the ⚠ button, then settle on red until it's dismissed
+            phases = [("white", BTN_RED), (BTN_RED, "white")] * 6
+            def flash():
+                if not phases:
+                    return self._paint_announce(BTN_RED, "white")
+                bg, fg = phases.pop(0)
+                self._paint_announce(bg, fg)
+                self._set_timer("announce_flash", 350, flash)
+            flash()
+
+    def _hide_announcement_bar(self):
+        self._cancel_timer("announce_flash")
+        self._announce_shown_seq = None
+        self.announce_bar.pack_forget()
+
+    def _dismiss_announcement(self):
+        if self._announce:
+            self.settings["announce_dismissed"] = self._announce["seq"]
+            self._save_settings()
+        self._hide_announcement_bar()
+
+    def _open_announcements_window(self):
+        """The main-menu 'Announcements' window: the current announcement, and a Refresh button (once every 20 seconds)."""
+        win = self._open_dialog("announcements", "Announcements", padx=24, pady=20)
+        if win is None:
+            return
+        tk.Label(win, text="📢  Announcements", bg=BG_PANEL, fg=FG_TEXT, font=(CHAT_FONT[0], 14, "bold")).pack(anchor="w")
+        body = tk.Label(win, text="", bg=BG_PANEL, fg=FG_TEXT, font=CHAT_FONT, wraplength=420, justify="left")
+        body.pack(anchor="w", pady=(10, 0))
+        meta = tk.Label(win, text="", bg=BG_PANEL, fg=FG_MUTED, font=(CHAT_FONT[0], 9), justify="left")
+        meta.pack(anchor="w", pady=(8, 0))
+        message = tk.Label(win, text="", bg=BG_PANEL, fg=FG_MUTED, font=(CHAT_FONT[0], 9))
+        message.pack(anchor="w", pady=(4, 0))
+
+        def render():
+            a = self._announce
+            body.configure(text=(("🚨 URGENT\n\n" if a["urgent"] else "") + a["text"]) if a else "No announcement right now.", fg=BTN_RED if a and a["urgent"] else FG_TEXT)
+            checked = self._announce_checked
+            meta.configure(text=(f"Published {friendly_ago(time.time() - a['issued'] / 1000)}. " if a else "") +
+                           (f"Last checked {friendly_ago(time.time() - checked)}. " if checked else "Not checked yet. ") + "It also refreshes by itself every 20 minutes.")
+
+        def refresh():
+            wait = ANNOUNCE_MANUAL_COOLDOWN_SECONDS - (time.time() - self._last_announce_manual)
+            if wait > 0:
+                return message.configure(text=f"Easy — you can refresh again in {int(wait) + 1}s.")
+            self._last_announce_manual = time.time()
+            message.configure(text="Checking…")
+            def finished(ok, why):
+                message.configure(text="Up to date." if ok else why, fg=COLOR_PALETTE["green"] if ok else self.STATUS_COLORS["error"])
+                render()
+            self._refresh_announcement(manual=True, done=finished)
+
+        buttons = tk.Frame(win, bg=BG_PANEL)
+        buttons.pack(anchor="e", pady=(14, 0))
+        make_button(buttons, "🔄 Refresh", refresh, bg=COLOR_PALETTE["blue"], hover_bg=BTN_BLUE_HOVER, padx=14, pady=5).pack(side="left", padx=(0, 8))
+        make_button(buttons, "Close", lambda: self._close_popup("announcements"), bg=BTN_NEUTRAL, hover_bg=BTN_NEUTRAL_HOVER, padx=14, pady=5).pack(side="left")
+        render()
+
+    # ---- announcements: the publisher (Ctrl+Shift+A) ----
+
+    def on_open_announcements_admin(self, event=None):
+        if report_server() is None:
+            messagebox.showinfo("Announcements", "No server is set up (REPORT_WORKER_URL), so there's nowhere to publish to.", parent=self)
+            return "break"
+        def verify(password):
+            code, data = worker_call("/announcement/admin", password=password)
+            if code == 200 and isinstance(data, dict): return True, data
+            return False, "Wrong password." if code == 401 else "Couldn't reach the server."
+        self._ask_admin_password("announce_login", "Announcements", verify, self._open_announcement_editor)
+        return "break"
+
+    def _open_announcement_editor(self, password: str, current: dict):
+        win = self._open_dialog("announce_editor", "Publish an announcement", padx=24, pady=20)
+        if win is None:
+            return
+        tk.Label(win, text="📢  Publish an announcement", bg=BG_PANEL, fg=FG_TEXT, font=(CHAT_FONT[0], 14, "bold")).pack(anchor="w")
+        live = tk.Label(win, text="", bg=BG_PANEL, fg=FG_MUTED, font=(CHAT_FONT[0], 9), wraplength=440, justify="left")
+        live.pack(anchor="w", pady=(4, 8))
+        box = tk.Text(win, width=58, height=5, wrap="word", bg=BG_INPUT, fg=FG_TEXT, insertbackground=FG_TEXT, relief="flat", font=CHAT_FONT, padx=6, pady=4)
+        box.pack(anchor="w")
+        counter = tk.Label(win, text="", bg=BG_PANEL, fg=FG_MUTED, font=(CHAT_FONT[0], 8))
+        counter.pack(anchor="e")
+        urgent_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(win, text="🚨 Urgent — flashes red, jumps to the front (even on Do Not Disturb) and arrives within about 2 minutes",
+                       variable=urgent_var, bg=BG_PANEL, fg=FG_TEXT, selectcolor=BG_INPUT, activebackground=BG_PANEL, activeforeground=FG_TEXT,
+                       font=CHAT_FONT, wraplength=440, justify="left", cursor="hand2").pack(anchor="w", pady=(6, 4))
+        hours_var = tk.IntVar(value=0)
+        row = tk.Frame(win, bg=BG_PANEL)
+        row.pack(anchor="w")
+        tk.Label(row, text="Show it for:", bg=BG_PANEL, fg=FG_MUTED, font=CHAT_FONT).pack(side="left", padx=(0, 8))
+        for text, value in (("1 hour", 1), ("1 day", 24), ("7 days", 168), ("until I clear it", 0)):
+            tk.Radiobutton(row, text=text, variable=hours_var, value=value, bg=BG_PANEL, fg=FG_TEXT, selectcolor=BG_INPUT, activebackground=BG_PANEL,
+                           activeforeground=FG_TEXT, font=CHAT_FONT, cursor="hand2").pack(side="left", padx=(0, 8))
+        status = tk.Label(win, text="", bg=BG_PANEL, fg=FG_MUTED, font=CHAT_FONT, wraplength=440, justify="left")
+        status.pack(anchor="w", pady=(10, 0))
+        buttons = tk.Frame(win, bg=BG_PANEL)
+        buttons.pack(anchor="e", pady=(8, 0))
+
+        def show_current(a):
+            live.configure(text=(f"Live now: “{a['text'][:90]}{'…' if len(a['text']) > 90 else ''}”" + ("  (urgent)" if a.get("urgent") else "")) if a and a.get("text") else "Nothing is live right now.")
+        show_current(current)
+        if current.get("text"):
+            box.insert("1.0", current["text"])
+            urgent_var.set(bool(current.get("urgent")))
+        def update_counter(event=None):
+            n = len(box.get("1.0", "end").strip())
+            counter.configure(text=f"{n} / {ANNOUNCE_MAX_CHARS}", fg=self.STATUS_COLORS["error"] if n > ANNOUNCE_MAX_CHARS else FG_MUTED)
+        box.bind("<KeyRelease>", update_counter)
+        update_counter()
+
+        def show_result(result, success_text):
+            code, data = result if isinstance(result, tuple) else (None, None)
+            if code == 200 and isinstance(data, dict):
+                status.configure(text=success_text, fg=COLOR_PALETTE["green"])
+                show_current(data)
+                self._refresh_announcement(manual=True)  # show it on this computer straight away, too
+            elif code == 401:
+                status.configure(text="The server says the password is wrong now.", fg=self.STATUS_COLORS["error"])
+            else:
+                status.configure(text="Couldn't reach the server — nothing was changed.", fg=self.STATUS_COLORS["error"])
+
+        def publish():
+            text = box.get("1.0", "end").replace("\r\n", "\n").strip()
+            if not text:
+                return status.configure(text="Type the announcement first.", fg=self.STATUS_COLORS["error"])
+            if len(text) > ANNOUNCE_MAX_CHARS:
+                return status.configure(text=f"That's {len(text)} characters — the limit is {ANNOUNCE_MAX_CHARS}.", fg=self.STATUS_COLORS["error"])
+            key = _load_local_signing_key()
+            if key is None:
+                return status.configure(text="Publishing needs your update signing key file (update_signing_key.b64) next to the app — the same one you sign releases with. "
+                                             "That's what stops anyone else posting announcements.", fg=self.STATUS_COLORS["error"])
+            issued, hours, urgent = int(time.time() * 1000), hours_var.get(), bool(urgent_var.get())
+            body = {"text": text, "urgent": urgent, "issued": issued, "hours": hours, "signature": sign_announcement(text, urgent, issued, hours, key)}
+            status.configure(text="Publishing…", fg=FG_MUTED)
+            self._run_bg(lambda: worker_call("/announcement/publish", body=body, password=password),
+                         lambda result: show_result(result, "Published ✔ — urgent ones reach running copies within about 2 minutes, others at their next refresh (within 20)." if urgent
+                                                    else "Published ✔ — running copies pick it up at their next refresh (within 20 minutes)."))
+
+        def clear():
+            if not messagebox.askyesno("Clear announcement", "Take the announcement down for everyone?", parent=win):
+                return
+            status.configure(text="Clearing…", fg=FG_MUTED)
+            self._run_bg(lambda: worker_call("/announcement/clear", body={}, password=password), lambda result: show_result(result, "Cleared ✔"))
+
+        make_button(buttons, "Publish", publish, bg=COLOR_PALETTE["blue"], hover_bg=BTN_BLUE_HOVER, padx=16, pady=5).pack(side="left", padx=(0, 8))
+        make_button(buttons, "Clear announcement", clear, bg=BTN_RED, hover_bg=BTN_RED_HOVER, padx=14, pady=5).pack(side="left", padx=(0, 8))
+        make_button(buttons, "Close", lambda: self._close_popup("announce_editor"), bg=BTN_NEUTRAL, hover_bg=BTN_NEUTRAL_HOVER, padx=14, pady=5).pack(side="left")
+        box.focus_set()
 
     # ---- the reports menu and "My previous reports" ----
 
@@ -6376,10 +6790,10 @@ class ChatApp(tk.Tk):
         if not self.dnd_active:
             notify_toast(title, message, root=self)
 
-    def _raise_for_attention(self, popup=None):
+    def _raise_for_attention(self, popup=None, force: bool = False):
         """Warnings, mutes, kicks and bans jump in front of everything — even other apps, and even if this window
         was minimised. Under Do Not Disturb they don't: they wait quietly and are there when the window is next opened."""
-        if self.dnd_active:
+        if self.dnd_active and not force:
             return
         try:
             if self.state() == "iconic": self.deiconify()
