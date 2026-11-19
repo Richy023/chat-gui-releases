@@ -1,6 +1,25 @@
 #!/usr/bin/env python3
 """
-chat_gui.py — v1.5.0f — ENCRYPTED instant messenger with a desktop GUI.
+chat_gui.py — v1.5.1 — ENCRYPTED instant messenger with a desktop GUI.
+
+Changes in 1.5.1:
+- Appearance (new): a 🎨 button in the chat, an "Appearance" link on the main menu, or Ctrl+Shift+T. Pick a theme
+  (Midnight, Graphite, Ocean, Forest, Plum, Mocha, Rose) or make your own from a background and an accent colour;
+  choose any font installed on your computer and a text size; put a picture behind the main menu. The window
+  can be resized and scrolls, so it fits short screens. It changes instantly, applies only on your computer, and is remembered after you close the app.
+- Bans, reworked: they are now saved on the host's computer, so they survive restarting the chat. A ban covers the
+  person's address AND their device, so getting a new IP no longer gets them back in. /ban and /ipban accept a
+  name (even of someone who has just left) or an IP. New: /bans lists who is banned; /unban takes the number from
+  that list, a name or an IP. The banned person still gets their ban screen, appeal and "you've been unbanned"
+  notice exactly as before.
+- Banning from the whole app (publisher only): /globalban <name or device id> [time|perm] [reason], /unglobalban and
+  /globalbans. They go through the report server (no more uploading a file by hand), for a set time or until lifted.
+  Every running copy checks every ~20 seconds; a banned device is removed from any chat at once and shown who
+  banned it for what, and until when. Needs the signing key file and the admin password.
+- Windows look: text is sharp on scaled displays (it used to be stretched, which looked pixelated), the bright
+  borders round the text boxes and the bright grey scrollbars are gone, title bars are dark, and the chat has
+  a little more breathing room. macOS keeps its native look.
+- Another secret gradient name colour (ocean blue to sea green).
 
 Changes in 1.5.0f:
 - Announcements: the publisher opens a menu with Ctrl+Shift+A and the admin password, types a message, and
@@ -88,15 +107,6 @@ Changes in 1.5.0a:
   same room again just refreshes its entry.
 - Fixed: the Changelog window could show the notes typed when signing a release instead of the
   built-in changelog. The built-in changelog now always wins.
-
-Changes in 1.5.0:
-- The "New messages" button is back to a small button (bottom right, in its own strip under the
-  chat so it still can't smear on macOS) instead of a full-width bar, and that strip no longer
-  leaves an empty gap under the chat once the button has gone.
-- Fixed: the Recent list showed the same room several times if you'd joined it more than once
-  (each join came with a different port). A room code now appears once, with its latest address;
-  repeats already saved are folded together too.
-
 """
 
 import sys
@@ -106,12 +116,14 @@ import itertools
 import socket
 import threading
 import queue
+import select
 import time
 import re
 import random
 import math
 import datetime
 import calendar
+import colorsys
 import unicodedata
 import base64
 import hashlib
@@ -126,8 +138,9 @@ import urllib.request
 import urllib.error
 import traceback
 import tkinter as tk
+import tkinter.font as tkfont
 from contextlib import contextmanager
-from tkinter import filedialog, messagebox, scrolledtext, simpledialog
+from tkinter import colorchooser, filedialog, messagebox, scrolledtext, simpledialog
 
 # FEATURE TOGGLE: WAN (Wide Area Network) / Global Room Support
 ENABLE_WAN_RELAY = False
@@ -176,7 +189,7 @@ except ImportError:
 if sys.platform == "darwin":
     ensure_installed("pyobjus", required=False)
 
-VERSION = "1.5.0f"
+VERSION = "1.5.1"
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -264,6 +277,170 @@ else:
     TITLE_FONT = ("DejaVu Sans", 11, "bold")
     EMOJI_FONT = ("Noto Color Emoji", 14)
 
+# ---- Platform polish: sharp text on Windows, dark title bars, and the text-size helper ----
+DEFAULT_FONT_FAMILY, DEFAULT_FONT_SIZE = CHAT_FONT[0], CHAT_FONT[1]
+FONT_DELTA = 0      # points the chosen text size is above the platform default (Appearance window)
+UI_SCALE = 1.0      # Windows display scaling (1.0 = 96 dpi). Pixel sizes are multiplied by it; text (points) scales by itself.
+
+def px(n) -> int:
+    return int(round(n * UI_SCALE))
+
+def fnt(size: int, *styles) -> tuple:
+    """A font in the current family, `size` points at the default text size (so it follows the chosen size)."""
+    return (CHAT_FONT[0], max(6, size + FONT_DELTA), *styles)
+
+def enable_hidpi():
+    """Windows only, and before the first window exists: tell Windows this app draws its own pixels. Without
+    this Windows renders the whole window small and stretches it up on a scaled display (125%/150%), which is
+    exactly what makes text look soft and pixelated."""
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+        try:
+            ctypes.windll.user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4))   # per-monitor v2 (Windows 10 1703+)
+        except Exception:
+            try: ctypes.windll.shcore.SetProcessDpiAwareness(2)                       # per-monitor (8.1+)
+            except Exception: ctypes.windll.user32.SetProcessDPIAware()               # system-wide (older)
+    except Exception:
+        pass
+
+def init_ui_scale(root):
+    global UI_SCALE
+    if sys.platform == "win32":
+        try: UI_SCALE = max(1.0, min(3.0, root.winfo_fpixels("1i") / 96.0))
+        except tk.TclError: UI_SCALE = 1.0
+
+def _colorref(hex_color: str) -> int:
+    r, g, b = (int(hex_color[i:i + 2], 16) for i in (1, 3, 5))
+    return r | (g << 8) | (b << 16)
+
+def style_titlebar(win):
+    """Windows 10/11: a dark title bar (and on Windows 11 one in the theme's own colours) instead of the bright
+    system one. Does nothing anywhere else, and never raises."""
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+        win.update_idletasks()
+        hwnd = ctypes.windll.user32.GetParent(win.winfo_id()) or win.winfo_id()
+        dwm = ctypes.windll.dwmapi
+        def set_attr(attr, value):
+            v = ctypes.c_uint(value)
+            return dwm.DwmSetWindowAttribute(hwnd, attr, ctypes.byref(v), ctypes.sizeof(v))
+        if set_attr(20, 1) != 0:   # DWMWA_USE_IMMERSIVE_DARK_MODE (the id was 19 before Windows 10 20H1)
+            set_attr(19, 1)
+        set_attr(35, _colorref(BG_PANEL))   # caption colour  (Windows 11 only; ignored elsewhere)
+        set_attr(36, _colorref(FG_TEXT))    # caption text
+        set_attr(34, _colorref(BG_PANEL))   # window border
+    except Exception:
+        pass
+
+class Toplevel(tk.Toplevel):
+    """tk.Toplevel that gets the same dark title bar as the main window on Windows."""
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        if sys.platform == "win32":
+            self.after_idle(self._style)
+    def _style(self):
+        try: style_titlebar(self)
+        except tk.TclError: pass
+
+class FlatScrollbar(tk.Canvas):
+    """A slim, flat scrollbar in the theme's colours. (Windows' native one is a bright grey bar that clashes with a
+    dark window.) Same interface as tk.Scrollbar for what the app uses: set() and a `command`."""
+    def __init__(self, master, command=None, bg=None, **kw):
+        super().__init__(master, width=px(11), height=1, highlightthickness=0, bd=0, bg=bg or BG_DARK, cursor="arrow", **kw)
+        self.command = command
+        self._first, self._last = 0.0, 1.0
+        self._drag = None
+        self._hover = False
+        self._thumb = self.create_polygon(0, 0, 0, 0, smooth=True, fill=BTN_NEUTRAL, outline="", state="hidden")
+        self.bind("<Configure>", lambda e: self._draw())
+        self.bind("<Enter>", lambda e: self._set_hover(True))
+        self.bind("<Leave>", lambda e: self._set_hover(False))
+        self.bind("<ButtonPress-1>", self._press)
+        self.bind("<B1-Motion>", self._motion)
+        self.bind("<ButtonRelease-1>", self._release)
+
+    def set(self, first, last):
+        self._first, self._last = float(first), float(last)
+        self._draw()
+
+    def retheme(self):
+        self._paint()
+
+    def _paint(self):
+        self.itemconfigure(self._thumb, fill=BTN_NEUTRAL_HOVER if (self._hover or self._drag) else BTN_NEUTRAL)
+
+    def _set_hover(self, on):
+        self._hover = on
+        self._paint()
+
+    def _geometry(self):
+        h, pad = max(1, self.winfo_height()), px(2)
+        span = self._last - self._first
+        avail = max(1, h - 2 * pad)
+        tlen = min(avail, max(px(28), span * avail))
+        top = pad + ((self._first / (1.0 - span)) * (avail - tlen) if span < 0.999 else 0)
+        return top, tlen, avail, span
+
+    def _draw(self):
+        top, tlen, avail, span = self._geometry()
+        if span >= 0.999:
+            self.itemconfigure(self._thumb, state="hidden")
+            return
+        w, inset = max(1, self.winfo_width()), px(2)
+        x1, x2, y1, y2, r = inset, w - inset, top, top + tlen, max(2, (w - 2 * inset) // 2)
+        pts = [x1 + r, y1, x2 - r, y1, x2, y1, x2, y1 + r, x2, y2 - r, x2, y2, x2 - r, y2, x1 + r, y2, x1, y2, x1, y2 - r, x1, y1 + r, x1, y1]
+        self.coords(self._thumb, *pts)
+        self.itemconfigure(self._thumb, state="normal")
+        self._paint()
+
+    def _press(self, event):
+        top, tlen, avail, span = self._geometry()
+        if span >= 0.999 or not self.command:
+            return
+        if top <= event.y <= top + tlen:
+            self._drag = (event.y, self._first)
+            self._paint()
+        else:
+            self.command("scroll", -1 if event.y < top else 1, "pages")
+
+    def _motion(self, event):
+        if not self._drag or not self.command:
+            return
+        top, tlen, avail, span = self._geometry()
+        room = max(1, avail - tlen)
+        start_y, start_first = self._drag
+        self.command("moveto", max(0.0, min(1.0 - span, start_first + (event.y - start_y) / room * (1.0 - span))))
+
+    def _release(self, event):
+        self._drag = None
+        self._paint()
+
+class DarkScrolledText(tk.Text):
+    """tk.Text with a FlatScrollbar beside it — the same recipe (and the same methods) as the standard
+    ScrolledText, which is where the bright native scrollbar comes from."""
+    def __init__(self, master=None, **kw):
+        self.frame = tk.Frame(master, bg=kw.get("bg") or BG_DARK)
+        self.vbar = FlatScrollbar(self.frame, bg=kw.get("bg"))
+        self.vbar.pack(side="right", fill="y")
+        kw["yscrollcommand"] = self.vbar.set
+        super().__init__(self.frame, **kw)
+        self.pack(side="left", fill="both", expand=True)
+        self.vbar.command = self.yview
+        text_meths = vars(tk.Text).keys()
+        methods = vars(tk.Pack).keys() | vars(tk.Grid).keys() | vars(tk.Place).keys()
+        for m in methods.difference(text_meths):
+            if m[0] != "_" and m not in ("config", "configure"):
+                setattr(self, m, getattr(self.frame, m))
+    def __str__(self):
+        return str(self.frame)
+
+# macOS keeps its own scrollbar (it overlays and fades, and already looks right); Windows and Linux get the flat one.
+ScrolledText = scrolledtext.ScrolledText if sys.platform == "darwin" else DarkScrolledText
+
 # Network Prefixes
 HELLO_PREFIX = "__HELLO__:"
 TYPING_START_PREFIX = "__TYPING_START__:"
@@ -292,6 +469,7 @@ RAINBOW_UNLOCK_PREFIX = "__RAINBOW_UNLOCK__:"
 BLUE_UNLOCK_PREFIX = "__BLUE_UNLOCK__:"
 EMBER_UNLOCK_PREFIX = "__EMBER_UNLOCK__:"
 AURORA_UNLOCK_PREFIX = "__AURORA_UNLOCK__:"
+VOLCANIC_UNLOCK_PREFIX = "__VOLCANIC_UNLOCK__:"
 FINGERPRINT_PREFIX = "__FINGERPRINT__:"
 EDIT_PREFIX = "__EDIT__:"          # guest -> host: "msg_id|new text"; host -> clients: "msg_id|editor|new text"
 DELETE_PREFIX = "__DELETE__:"      # guest -> host: "msg_id";          host -> clients: "msg_id|deleter"
@@ -334,6 +512,7 @@ RAINBOW_SECRET_CODE = ":prism:"
 BLUE_SECRET_CODE = ":glacier:"
 EMBER_SECRET_CODE = ":ember:"
 AURORA_SECRET_CODE = ":aurora:"
+VOLCANIC_SECRET_CODE = ":volcanic:"
 # Stored in place of a hex color for an unlocked user — every place
 # that renders a name checks GRADIENT_PALETTES for its color_value and
 # draws the matching gradient instead of a flat color.
@@ -341,13 +520,16 @@ RAINBOW_SENTINEL = "RAINBOW"
 BLUE_SENTINEL = "BLUE_GRADIENT"
 EMBER_SENTINEL = "EMBER_GRADIENT"
 AURORA_SENTINEL = "AURORA_GRADIENT"
+VOLCANIC_SENTINEL = "VOLCANIC_GRADIENT"
 RAINBOW_PALETTE = ["#FF5555", "#FFA347", "#FFE066", "#57F287", "#00C8C8", "#5B8CFF", "#C77DFF"]
 BLUE_PALETTE = ["#0B2545", "#13315C", "#134074", "#1B5299", "#3E7CB1", "#6D9DC5", "#8FC0E9"]
 EMBER_PALETTE = ["#7A1F1F", "#B3261E", "#E8472A", "#FF7A33", "#FFA94D", "#FFD166", "#FFE9A8"]    # deep red -> gold
+VOLCANIC_PALETTE = ["#2F6FE0", "#2F8BE0", "#2AA5D6", "#26BDC0", "#2ED3A0", "#4BE38A", "#86F09A"]    # ocean blue -> teal -> sea green
 AURORA_PALETTE = ["#2EE59D", "#1FD1B4", "#22B8D6", "#4C8DF0", "#7C6CF2", "#A855F7", "#D946EF"]    # green -> teal -> blue -> violet
 GRADIENT_PALETTES = {
     RAINBOW_SENTINEL: RAINBOW_PALETTE, BLUE_SENTINEL: BLUE_PALETTE,
     EMBER_SENTINEL: EMBER_PALETTE, AURORA_SENTINEL: AURORA_PALETTE,
+    VOLCANIC_SENTINEL: VOLCANIC_PALETTE,
 }
 # code -> (sentinel, unlock prefix to send once connected)
 GRADIENT_UNLOCK_CODES = {
@@ -355,6 +537,7 @@ GRADIENT_UNLOCK_CODES = {
     BLUE_SECRET_CODE: (BLUE_SENTINEL, BLUE_UNLOCK_PREFIX),
     EMBER_SECRET_CODE: (EMBER_SENTINEL, EMBER_UNLOCK_PREFIX),
     AURORA_SECRET_CODE: (AURORA_SENTINEL, AURORA_UNLOCK_PREFIX),
+    VOLCANIC_SECRET_CODE: (VOLCANIC_SENTINEL, VOLCANIC_UNLOCK_PREFIX),
 }
 
 # ---- Minigames: Snake and Flappy Bird (each person plays their own game; the leaderboards are shared live) ----
@@ -365,6 +548,7 @@ SNAKE_CELL_PX = 20
 SNAKE_TICK_MS = 130
 FLAPPY_TICK_MS = 20
 SETTINGS_FILE = app_path("chat_gui_settings.json")
+BANS_FILE = app_path("chat_gui_bans.json")   # the host's ban list — kept between sessions (1.5.1)
 
 class SnakeGame:
     """Pure game logic — no Tk, no I/O, fully deterministic given a
@@ -496,7 +680,7 @@ class FlappyGame:
                     return
 
 
-class GameWindowBase(tk.Toplevel):
+class GameWindowBase(Toplevel):
     """What every minigame window shares: the live leaderboard, the player's colour, reporting the
     score to the room (when there is one) and cleaning up. A subclass builds its canvas, calls
     _build_footer(), and implements _state() -> (score, playing)."""
@@ -806,7 +990,7 @@ class FlappyWindow(GameWindowBase):
             c.create_text(w / 2, h / 2 + 70, text="Press Space to flap", font=(CHAT_FONT[0], 13, "bold"), fill="white")
 
 
-class GamePicker(tk.Toplevel):
+class GamePicker(Toplevel):
     """Ctrl+Shift+S opens this: pick which minigame to play. Works in a chat or on the home screen."""
 
     CHOICES = (("snake", "🐍  Snake", "1"), ("flappy", "🐦  Flappy Bird", "2"))
@@ -822,7 +1006,7 @@ class GamePicker(tk.Toplevel):
         self.bind("<Escape>", lambda e: self._close())
         tk.Label(self, text="🎮  Pick a game", bg=BG_PANEL, fg=FG_TEXT, font=TITLE_FONT).pack(anchor="w")
         where = "Scores are shared with everyone in this chat." if app.in_room() else "Not in a chat — scores stay on this computer."
-        tk.Label(self, text=where, bg=BG_PANEL, fg=FG_MUTED, font=(CHAT_FONT[0], 9)).pack(anchor="w", pady=(4, 12))
+        tk.Label(self, text=where, bg=BG_PANEL, fg=FG_MUTED, font=fnt(9)).pack(anchor="w", pady=(4, 12))
         for key, label, shortcut in self.CHOICES:
             row = tk.Frame(self, bg=BG_PANEL)
             row.pack(fill="x", pady=4)
@@ -830,7 +1014,7 @@ class GamePicker(tk.Toplevel):
             best = app.game_best(key)
             tk.Label(row, text=f"  your best: {best}" if best else "", bg=BG_PANEL, fg=FG_MUTED, font=CHAT_FONT).pack(side="left")
             self.bind(shortcut, lambda e, k=key: self._pick(k))
-        tk.Label(self, text="Press 1 or 2, or click. Esc closes this.", bg=BG_PANEL, fg=FG_MUTED, font=(CHAT_FONT[0], 8)).pack(anchor="w", pady=(10, 0))
+        tk.Label(self, text="Press 1 or 2, or click. Esc closes this.", bg=BG_PANEL, fg=FG_MUTED, font=fnt(8)).pack(anchor="w", pady=(10, 0))
         self.focus_set()
 
     def _pick(self, key):
@@ -876,6 +1060,115 @@ BTN_RED = "#DA373C"
 BTN_RED_HOVER = "#A12D2F"
 BTN_NEUTRAL = "#4E5058"
 BTN_NEUTRAL_HOVER = "#6D6F78"
+
+ACCENT = "#5B8CFF"           # the UI accent (buttons, selections, banners) — separate from the blue a person can pick as a name colour
+ACCENT_HOVER = BTN_BLUE_HOVER
+
+# ---- Appearance: themes and fonts (per computer — saved in the settings file, never sent to anyone) ----
+THEME_ROLES = ("bg", "panel", "input", "text", "muted", "neutral", "neutral_hover", "accent", "accent_hover")
+_THEME_GLOBALS = {"bg": "BG_DARK", "panel": "BG_PANEL", "input": "BG_INPUT", "text": "FG_TEXT", "muted": "FG_MUTED",
+                  "neutral": "BTN_NEUTRAL", "neutral_hover": "BTN_NEUTRAL_HOVER", "accent": "ACCENT", "accent_hover": "ACCENT_HOVER"}
+
+def _rgb(h):
+    h = h.lstrip("#")
+    return tuple(int(h[i:i + 2], 16) / 255 for i in (0, 2, 4))
+
+def _hex(rgb):
+    return "#%02X%02X%02X" % tuple(max(0, min(255, round(c * 255))) for c in rgb)
+
+def _luminance(h):
+    lin = lambda c: c / 12.92 if c <= 0.03928 else ((c + 0.055) / 1.055) ** 2.4
+    r, g, b = (lin(c) for c in _rgb(h))
+    return 0.2126 * r + 0.7152 * g + 0.0722 * b
+
+def _contrast(a, b):
+    hi, lo = sorted((_luminance(a), _luminance(b)), reverse=True)
+    return (hi + 0.05) / (lo + 0.05)
+
+def _shade(h, dl):
+    hue, light, sat = colorsys.rgb_to_hls(*_rgb(h))
+    return _hex(colorsys.hls_to_rgb(hue, max(0.0, min(1.0, light + dl)), sat))
+
+def _mix(a, b, t):
+    return _hex(tuple(x + (y - x) * t for x, y in zip(_rgb(a), _rgb(b))))
+
+def _valid_hex(v) -> bool:
+    return isinstance(v, str) and re.fullmatch(r"#[0-9A-Fa-f]{6}", v) is not None
+
+def make_theme(bg: str, accent: str) -> dict:
+    """A whole palette from just a background and an accent colour. The background is kept dark (the text, status
+    colours and name colours are all tuned for a dark window) and the accent dark enough for white button text."""
+    hue, light, sat = colorsys.rgb_to_hls(*_rgb(bg))
+    bg = _hex(colorsys.hls_to_rgb(hue, max(0.09, min(0.30, light)), min(sat, 0.45)))
+    text = "#DBDEE1"
+    acc = accent.upper()
+    while _contrast(acc, "#FFFFFF") < 3.6 and _luminance(acc) > 0.02:
+        acc = _shade(acc, -0.03)
+    return {"bg": bg, "panel": _shade(bg, -0.035), "input": _shade(bg, 0.035), "text": text,
+            "muted": _mix(text, bg, 0.42), "neutral": _shade(bg, 0.10), "neutral_hover": _shade(bg, 0.19),
+            "accent": acc, "accent_hover": _shade(acc, -0.09)}
+
+THEME_PRESETS = {   # key -> (label, palette)
+    "midnight": ("Midnight", {"bg": "#313338", "panel": "#2B2D31", "input": "#383A40", "text": "#DBDEE1", "muted": "#949BA4",
+                              "neutral": "#4E5058", "neutral_hover": "#6D6F78", "accent": "#5B8CFF", "accent_hover": "#4752C4"}),
+    "graphite": ("Graphite", make_theme("#2C2C2E", "#6C8EEF")),
+    "ocean":    ("Ocean",    make_theme("#1E2D3D", "#2E9FD8")),
+    "forest":   ("Forest",   make_theme("#24302A", "#3FA86B")),
+    "plum":     ("Plum",     make_theme("#2D2535", "#B565E6")),
+    "mocha":    ("Mocha",    make_theme("#302822", "#D68A4A")),
+    "rose":     ("Rose",     make_theme("#33262B", "#E0607E")),
+}
+FONT_SIZE_RANGE = (DEFAULT_FONT_SIZE - 2, DEFAULT_FONT_SIZE + 8)
+DEFAULT_APPEARANCE = {"theme": "midnight", "custom_bg": "#313338", "custom_accent": "#5B8CFF",
+                      "font_family": "", "font_size": 0, "home_image": False}   # font "" / size 0 = the platform default
+HOME_IMAGE_FILE = app_path("chat_gui_background.jpg")
+CURRENT_THEME = dict(THEME_PRESETS["midnight"][1])
+
+def sanitize_appearance(raw) -> dict:
+    """Whatever the settings file holds -> a complete, valid appearance (a hand-edited or damaged file can't break startup)."""
+    cfg = dict(DEFAULT_APPEARANCE)
+    if not isinstance(raw, dict):
+        return cfg
+    if raw.get("theme") in THEME_PRESETS or raw.get("theme") == "custom":
+        cfg["theme"] = raw["theme"]
+    for key in ("custom_bg", "custom_accent"):
+        if _valid_hex(raw.get(key)):
+            cfg[key] = raw[key].upper()
+    if isinstance(raw.get("font_family"), str):
+        cfg["font_family"] = raw["font_family"][:80]
+    size = raw.get("font_size")
+    if isinstance(size, int) and not isinstance(size, bool) and FONT_SIZE_RANGE[0] <= size <= FONT_SIZE_RANGE[1] and size != DEFAULT_FONT_SIZE:
+        cfg["font_size"] = size
+    cfg["home_image"] = bool(raw.get("home_image")) and os.path.exists(HOME_IMAGE_FILE)
+    return cfg
+
+def theme_for(cfg: dict) -> dict:
+    if cfg["theme"] == "custom":
+        return make_theme(cfg["custom_bg"], cfg["custom_accent"])
+    return dict(THEME_PRESETS[cfg["theme"]][1])
+
+def apply_theme_globals(theme: dict):
+    """Points the module's colour constants at `theme`. Widgets built afterwards pick it up; ones already on screen
+    are recoloured by ChatApp._retheme_tree."""
+    global CURRENT_THEME
+    CURRENT_THEME = dict(theme)
+    g = globals()
+    for role, name in _THEME_GLOBALS.items():
+        g[name] = theme[role]
+
+def apply_font_globals(family: str, size: int):
+    global CHAT_FONT, BOLD_FONT, TITLE_FONT, FONT_DELTA
+    family, size = family or DEFAULT_FONT_FAMILY, size or DEFAULT_FONT_SIZE
+    FONT_DELTA = size - DEFAULT_FONT_SIZE
+    CHAT_FONT, BOLD_FONT, TITLE_FONT = (family, size), (family, size, "bold"), (family, size + 1, "bold")
+    # EMOJI_FONT is left alone: emoji come from the system's emoji font whatever text font is chosen.
+
+def system_font_families(root) -> list:
+    """Only fonts this computer actually has."""
+    try: names = set(tkfont.families(root))
+    except tk.TclError: names = set()
+    names.add(DEFAULT_FONT_FAMILY)
+    return sorted((n for n in names if n and not n.startswith("@")), key=str.lower)
 
 def derive_key(passphrase: str) -> bytes:
     digest = hashlib.sha256(passphrase.encode("utf-8")).digest()
@@ -1172,7 +1465,7 @@ def send_ban_appeal(host_ip: str, port: int, fernet, payload: dict) -> str:
     sock.settimeout(8)
     try:
         sock.connect((host_ip, port))
-        send_encrypted(sock, fernet, APPEAL_PREFIX + json.dumps(payload))
+        send_encrypted(sock, fernet, APPEAL_PREFIX + json.dumps(dict(payload, fp=get_machine_fingerprint())))
         reply = recv_message(sock, fernet)
     except (OSError, ConnectionError, InvalidToken):
         raise ConnectionError("Couldn't reach the host right now — they may be offline. Try again once they're back.")
@@ -1188,7 +1481,7 @@ def check_ban_status(host_ip: str, port: int, fernet) -> dict:
     sock.settimeout(6)
     try:
         sock.connect((host_ip, port))
-        send_encrypted(sock, fernet, BANCHECK_PREFIX + "?")
+        send_encrypted(sock, fernet, BANCHECK_PREFIX + "?|" + get_machine_fingerprint())   # an older host ignores everything after BANCHECK
         reply = recv_message(sock, fernet)
     except (OSError, ConnectionError, InvalidToken):
         raise ConnectionError("host unreachable")
@@ -1546,6 +1839,7 @@ def deliver_report(report: dict) -> bool:
         "description": report.get("description", ""), "version": report.get("version", ""), "os": report.get("os", ""), "date": report.get("date", "")})
     return status == 200 and isinstance(data, dict) and bool(data.get("ok"))
 
+APPEARANCE_KEYBIND = "<Control-Shift-KeyPress-T>"   # opens the Appearance window (themes, fonts)
 ANNOUNCEMENTS_KEYBIND = "<Control-Shift-KeyPress-A>"   # the publisher's announcement menu (asks for the password)
 ANNOUNCE_REFRESH_SECONDS = 20 * 60        # how often every copy re-reads the announcement
 ANNOUNCE_URGENT_CHECK_SECONDS = 120       # …and how often it asks "is there an URGENT one?" (a tiny request) so those arrive fast
@@ -1807,7 +2101,13 @@ def get_machine_fingerprint() -> str:
     raw = f"{uuid.getnode()}|{platform.node()}|{platform.system()}"
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
 
-def fetch_global_banlist() -> dict:
+GLOBAL_BAN_BEACON_SECONDS = 20       # how often every running copy asks the report server "has the ban list changed?" (a tiny request)
+GLOBAL_BANS_CACHE_FILE = app_path("chat_gui_globalbans_cache.json")
+GLOBAL_BAN_REASON_PREFIX = "Banned from chat_gui: "   # what a room's ban notice says when the publisher bans someone from the whole app
+
+def fetch_global_banlist_github() -> dict:
+    """The older list on GitHub — only used until the first ban is published through the report server, so bans made
+    before that aren't lost."""
     raw = _https_get(GLOBAL_BANLIST_URL, timeout=8.0)
     data = json.loads(raw.decode("utf-8"))
     if "entries" not in data or "signature" not in data:
@@ -1815,13 +2115,13 @@ def fetch_global_banlist() -> dict:
     return data
 
 def verify_global_banlist(data: dict) -> list:
-    """Returns the verified entry list, or raises ValueError. The
-    signature covers the exact JSON-serialized entries list, so a
-    tampered or appended entry fails verification rather than being
-    silently trusted."""
+    """Returns the verified entry list, or raises ValueError. The signature covers the exact JSON-serialized entries
+    list, so a tampered or appended entry fails verification rather than being silently trusted."""
     if not UPDATE_PUBLIC_KEY_B64:
         raise ValueError("No signing key configured — refusing to trust an unverifiable ban list.")
     entries = data["entries"]
+    if not isinstance(entries, list):
+        raise ValueError("Ban list is malformed.")
     payload = json.dumps(entries, sort_keys=True, separators=(",", ":")).encode("utf-8")
     try:
         pubkey = Ed25519PublicKey.from_public_bytes(base64.b64decode(UPDATE_PUBLIC_KEY_B64))
@@ -1832,30 +2132,76 @@ def verify_global_banlist(data: dict) -> list:
         raise ValueError(f"Could not verify the ban list: {e}")
     return entries
 
-def check_global_ban() -> dict:
-    """Returns a matching ban entry {fingerprint, reason, date} if this
-    machine is banned, or None. Fails OPEN: any network/parse/
-    verification problem is treated as 'not banned' rather than
-    locking out an innocent person over a network hiccup — this was
-    never meant to be a hard security gate, just a real deterrent."""
+def fetch_global_bans() -> dict:
+    """The verified global ban list -> {"entries", "signature", "seq", "skew", "source"}. `skew` is how far the report
+    server's clock is ahead of this computer's, so a ban's end time means the same on every computer.
+    Raises if nothing could be read or the signature is bad."""
+    if report_server() is not None:
+        code, data = worker_call("/bans", timeout=8)
+        if code != 200 or not isinstance(data, dict):
+            raise ConnectionError("couldn't reach the report server")
+        now_ms = data.get("now")
+        skew = (now_ms / 1000.0 - time.time()) if isinstance(now_ms, (int, float)) else 0.0
+        if data.get("published"):
+            return {"entries": verify_global_banlist(data), "signature": data["signature"], "seq": int(data.get("seq", 0)), "skew": skew, "source": "worker"}
+        if not GLOBAL_BANLIST_URL:
+            return {"entries": [], "signature": "", "seq": int(data.get("seq", 0)), "skew": skew, "source": "worker"}
+        legacy = fetch_global_banlist_github()   # nothing published here yet: the old list still applies
+        return {"entries": verify_global_banlist(legacy), "signature": legacy["signature"], "seq": int(data.get("seq", 0)), "skew": skew, "source": "github"}
     if not GLOBAL_BANLIST_URL:
-        return None
+        raise ConnectionError("no ban list is configured")
+    legacy = fetch_global_banlist_github()
+    return {"entries": verify_global_banlist(legacy), "signature": legacy["signature"], "seq": 0, "skew": 0.0, "source": "github"}
+
+def save_global_bans_cache(info: dict):
+    save_json(GLOBAL_BANS_CACHE_FILE, {"entries": info["entries"], "signature": info.get("signature", ""), "skew": info.get("skew", 0.0)})
+
+def load_global_bans_cache():
+    """The last list this computer verified, so a ban still holds with no internet. Re-verified every time it's read."""
+    data = load_json(GLOBAL_BANS_CACHE_FILE, dict)
     try:
-        entries = verify_global_banlist(fetch_global_banlist())
+        return {"entries": verify_global_banlist({"entries": data.get("entries"), "signature": data.get("signature", "")}),
+                "skew": float(data.get("skew", 0.0)), "seq": None, "source": "cache"}
     except Exception:
         return None
-    my_fp = get_machine_fingerprint()
-    for entry in entries:
-        if entry.get("fingerprint") == my_fp:
+
+def _ban_entry_expired(entry: dict, now: float) -> bool:
+    until = entry.get("until")
+    return isinstance(until, (int, float)) and not isinstance(until, bool) and until <= now
+
+def global_ban_match(entries, fingerprint: str, now: float):
+    """The entry banning this device right now, or None. An entry with no end time (all the older ones) is permanent."""
+    for entry in entries or []:
+        if isinstance(entry, dict) and entry.get("fingerprint") == fingerprint and not _ban_entry_expired(entry, now):
             return entry
     return None
 
+def global_ban_until_text(entry: dict, skew: float = 0.0) -> str:
+    until = entry.get("until")
+    if not isinstance(until, (int, float)) or isinstance(until, bool):
+        return "permanently — until the publisher lifts it"
+    return format_until(until - skew)
+
+def global_ban_message(entry: dict, skew: float = 0.0) -> str:
+    return (f"This device has been banned from chat_gui. Reason: {entry.get('reason') or 'no reason given'}. "
+            f"Banned until: {global_ban_until_text(entry, skew)}.")
+
+def check_global_ban():
+    """-> (matching ban entry or None, clock skew). Fails OPEN: if the list can't be read (no internet, server down) we use the last
+    verified copy, and with none of that we treat the device as not banned — this is a deterrent, not a hard security gate."""
+    try:
+        info = fetch_global_bans()
+        save_global_bans_cache(info)
+    except Exception:
+        info = load_global_bans_cache()
+    if not info:
+        return None, 0.0
+    return global_ban_match(info["entries"], get_machine_fingerprint(), time.time() + info.get("skew", 0.0)), info.get("skew", 0.0)
+
 def _load_local_signing_key():
-    """Loads the Ed25519 PRIVATE key from a local file that is never
-    distributed with the app (see sign_release.py's own warnings about
-    this same file). Returns None if it isn't present — which is the
-    normal, expected case for literally everyone except the person who
-    holds it, and is exactly what makes /globalban only usable by them."""
+    """Loads the Ed25519 PRIVATE key from a local file that is never distributed with the app (see sign_release.py's own
+    warnings about this same file). Returns None if it isn't present — which is the normal, expected case for literally
+    everyone except the person who holds it, and is exactly what makes /globalban only usable by them."""
     try:
         with open(GLOBAL_BANLIST_SIGNING_KEY_FILE) as f:
             key_bytes = base64.b64decode(f.read().strip())
@@ -1868,37 +2214,92 @@ def sign_global_banlist(entries: list, privkey: Ed25519PrivateKey) -> dict:
     signature = base64.b64encode(privkey.sign(payload)).decode("ascii")
     return {"entries": entries, "signature": signature}
 
-def perform_globalban(fingerprint: str, reason: str) -> str:
-    """Composes and signs an updated global ban list, gated purely by
-    local possession of the private signing key. MUST be invoked
-    directly by the local UI layer (never routed over the network to
-    run on someone else's machine) — the key check is only meaningful
-    against the filesystem of whoever actually typed the command, and
-    a guest's mod commands normally execute on the HOST's machine, not
-    their own, which would silently check the wrong computer."""
+def run_global_ban_command(cmd: str, arg: str, lookup, password):
+    """The publisher's /globalban, /unglobalban and /globalbans. Runs on a background thread (it talks to the network).
+    `lookup(name)` -> (ip, fingerprint, name) for someone this room knows, or None. Gated purely by local possession of
+    the signing key, so it must run on the computer of whoever typed it (never on a host for a guest).
+    -> (text to show, details of a ban to carry out in the room right now or None, True if the password was wrong)"""
     privkey = _load_local_signing_key()
     if privkey is None:
-        return "This command requires the signing key file, which only the app's publisher has."
+        return "This command requires the signing key file, which only the app's publisher has.", None, False
+    try:
+        info = fetch_global_bans()
+    except Exception as e:
+        return f"Couldn't read the current global ban list, so I stopped rather than risk dropping bans. ({e})", None, False
+    skew = info.get("skew", 0.0)
+    now = time.time() + skew
+    entries = [e for e in info["entries"] if isinstance(e, dict) and not _ban_entry_expired(e, now)]
 
-    if not fingerprint:
-        return "Usage: /globalban <fingerprint> [reason]"
+    def listing():
+        if not entries:
+            return "No one is banned from the whole app."
+        lines = [f"Banned from the whole app ({len(entries)}):"]
+        for n, e in enumerate(entries, 1):
+            who = e.get("name") or "(unnamed)"
+            lines.append(f"  #{n}  {who}  (device {str(e.get('fingerprint', ''))[:8]}) — {global_ban_until_text(e, skew)}: {e.get('reason') or 'no reason given'}")
+        lines.append("Lift one with /unglobalban <#, name or device id>.")
+        return "\n".join(lines)
 
-    entries = []
-    if GLOBAL_BANLIST_URL:
-        try:
-            entries = verify_global_banlist(fetch_global_banlist())
-        except Exception as e:
-            return f"Could not fetch/verify the current ban list — aborting rather than risk silently dropping existing entries. ({e})"
+    def publish(new_entries):
+        code, data = worker_call("/bans/publish", body=sign_global_banlist(new_entries, privkey), password=password, timeout=15)
+        if code == 200 and isinstance(data, dict) and data.get("ok"):
+            return None
+        if code == 401:
+            return "Wrong password."
+        return "The report server didn't accept the new list." if code else "Couldn't reach the report server."
 
-    entries = [e for e in entries if e.get("fingerprint") != fingerprint]
-    entries.append({"fingerprint": fingerprint, "reason": reason, "date": time.strftime("%Y-%m-%d")})
+    if cmd == "/globalbans":
+        return listing(), None, False
 
-    signed = sign_global_banlist(entries, privkey)
-    out_path = app_path("global_banlist_signed.json")
-    if not save_json(out_path, signed, indent=2):
-        return "Signed the ban list but couldn't write it to disk."
+    if cmd == "/globalban":
+        parts = arg.split(maxsplit=2)
+        if not parts:
+            return "Usage: /globalban <name or device id> [time|perm] [reason]   (time: 30, 2h, 7d, 1y …)", None, False
+        token = parts[0].strip()
+        if re.fullmatch(r"[0-9a-fA-F]{16}", token):
+            fp, name = token.lower(), ""
+            known = lookup(token) if lookup else None
+        else:
+            found = lookup(token) if lookup else None
+            if found is None:
+                return (f"I don't know '{token}'. Use a name from this room (as host), or paste their device id — the 16 characters "
+                        f"in '…device fingerprint: …' when they joined."), None, False
+            fp, name = found[1], found[2] or token
+            if not fp:
+                return f"I know {name} but don't have their device id (they may be on an older version). Ask them for it, or ban them in the room with /ban.", None, False
+        if fp == get_machine_fingerprint():
+            return "That's this computer — I won't ban you from your own app.", None, False
+        until, reason = parse_ban_args(parts)
+        entry = {"id": os.urandom(3).hex(), "fingerprint": fp, "name": name, "reason": reason, "date": time.strftime("%Y-%m-%d"),
+                 "until": None if until == float("inf") else int(until + skew)}
+        error = publish([e for e in entries if e.get("fingerprint") != fp] + [entry])
+        if error:
+            return error, None, error == "Wrong password."
+        who = name or f"device {fp[:8]}"
+        text = (f"{who} is now banned from the whole app — {global_ban_until_text(entry, skew)}. Reason: {reason}. "
+                f"Every running copy acts on it within about {GLOBAL_BAN_BEACON_SECONDS} seconds: anyone in a chat is removed and shown the reason.")
+        return text, {"fp": fp, "name": name or who, "until": until, "reason": reason}, False
 
-    return f"Signed a global ban for fingerprint {fingerprint}. Upload {os.path.basename(out_path)} to wherever GLOBAL_BANLIST_URL points to make it live ({len(entries)} total entries)."
+    if cmd == "/unglobalban":
+        token = arg.strip().split(maxsplit=1)[0] if arg.strip() else ""
+        if not token:
+            return "Usage: /unglobalban <# from /globalbans, name or device id>", None, False
+        index = int(token.lstrip("#")) - 1 if token.lstrip("#").isdigit() else None
+        target = None
+        if index is not None and 0 <= index < len(entries):
+            target = entries[index]
+        else:
+            low = token.lower()
+            target = next((e for e in entries if (e.get("name") or "").lower() == low or e.get("id") == low
+                           or (len(low) >= 6 and str(e.get("fingerprint", "")).startswith(low))), None)
+        if target is None:
+            return f"'{token}' isn't banned from the whole app. /globalbans shows who is.", None, False
+        error = publish([e for e in entries if e is not target])
+        if error:
+            return error, None, error == "Wrong password."
+        return (f"{target.get('name') or 'device ' + str(target.get('fingerprint', ''))[:8]} can use the app again. "
+                f"Running copies notice within about {GLOBAL_BAN_BEACON_SECONDS} seconds."), None, False
+    return "Unknown command.", None, False
 
 
 # ---- Changelog ----
@@ -1909,6 +2310,18 @@ def perform_globalban(fingerprint: str, reason: str) -> str:
 # install time, so the in-app viewer stays complete going forward
 # without needing the whole history re-embedded on every release.
 EMBEDDED_CHANGELOG = [
+    {   "version": "1.5.1",
+        "date": "2026-11-18",
+        "notes": (
+            "New: Appearance. Themes (or your own colours), any font installed on your computer, text size, and a "
+            "picture behind the main menu - from the 🎨 button, the main menu, or Ctrl+Shift+T. Saved on your computer "
+            "only. Reworked bans: saved between sessions, they cover the person's device as well as their address, "
+            "/ban takes a name or an IP, and there is now /bans (list) and /unban <number, name or IP>. "
+            "Publisher only: /globalban, /unglobalban and /globalbans ban a device from the whole app, for a set time "
+            "or until lifted, through the report server. Windows: sharp text on scaled displays, no more bright borders and scrollbars, dark "
+            "title bars. Plus one more secret gradient name colour."
+        ),
+    },
     {   "version": "1.5.0f",
         "date": "2026-11-16",
         "notes": (
@@ -2480,6 +2893,8 @@ class Hub:
         self.appeal_seq = 0
         self.mod_log = []         # moderation history for /history (this session only)
         self.ip_names = {}        # ip -> names seen joining from that address
+        self.known_devices = {}   # name.lower() -> {"name", "ip", "fp"}: who joined from where this session (so /ban works on someone who just left)
+        self._load_bans()
 
     # ---- identity helpers ----
 
@@ -2646,6 +3061,7 @@ class Hub:
             if ban is None or ban.get("appealed"):
                 return False
             ban["appealed"] = True
+            self._save_bans()
             return True
 
     def mark_warning_appealed(self, name: str, number) -> dict:
@@ -2712,6 +3128,7 @@ class Hub:
                     ban = self.banned_ips.get(a["ip"])
                     if ban is not None:
                         ban["appeal_result"] = {"status": "rejected", "by": by, "reason": reason}
+                        self._save_bans()
                 extra = " The ban stays; they'll see your reason on their ban screen."
         else:
             if accept:
@@ -2789,11 +3206,13 @@ class Hub:
             lines.append(f"  #{number}  {status} — from {r['by']}{when}: \"{r['reason']}\"")
         return "\n".join(lines)
 
-    def ban_status(self, ip: str) -> dict:
+    def ban_status(self, ip: str, fp=None) -> dict:
         """What a banned person's app is told when it checks in."""
         with self.lock:
             self._purge_expired()
-            ban, unban = self.banned_ips.get(ip), self.unbans.get(ip)
+            key = self._find_ban_key(ip, fp)
+            ban = self.banned_ips.get(key) if key is not None else None
+            unban = next((u for u in self.unbans.values() if u.get("ip") == ip or (fp and u.get("fp") == fp)), None)
             if ban is not None:
                 return {"state": "banned", "until": until_token(ban["until"]), "by": ban.get("banned_by", ""),
                         "reason": ban.get("reason", ""), "appeal": ban.get("appeal_result")}
@@ -2802,15 +3221,40 @@ class Hub:
             return {"state": "free"}  # the ban ran out (or was cleared some other way)
 
     def resolve_ban_target(self, token: str):
-        """An IP, or the name of someone banned from an address we saw them join from -> the banned IP."""
+        """What someone typed -> the key of a current ban. Accepts the number from /bans (#2 or 2), an address, the name
+        of the banned person (as they were called, or as we saw them join), or the start of a device fingerprint."""
+        token = token.strip()
+        entries = self.bans_list()
         with self.lock:
-            self._purge_expired()
             if token in self.banned_ips:
                 return token
+            if token.lstrip("#").isdigit() and 1 <= int(token.lstrip("#")) <= len(entries):
+                return entries[int(token.lstrip("#")) - 1][0]
             lowered = token.lower()
-            for ip in self.banned_ips:
-                if any(n.lower() == lowered for n in self.ip_names.get(ip, [])):
-                    return ip
+            for key, ban in self.banned_ips.items():
+                names = ([ban["name"]] if ban.get("name") else []) + list(self.ip_names.get(key, []))
+                if any(n.lower() == lowered for n in names):
+                    return key
+                if len(lowered) >= 6 and (ban.get("fp") or "").startswith(lowered):
+                    return key
+        return None
+
+    def find_device(self, token: str):
+        """A name (connected now, or seen joining this session) or an address -> (ip, fingerprint, name), else None."""
+        lowered = token.lower()
+        sock = self.find_socket_by_name(token)
+        if sock is not None:
+            info = self.get_info(sock)
+            return info.get("ip"), info.get("fingerprint"), info.get("name", token)
+        with self.lock:
+            seen = self.known_devices.get(lowered)
+            if seen:
+                return seen["ip"], seen.get("fp"), seen["name"]
+            if token in self.ip_names:
+                names = self.ip_names[token]
+                return token, next((d["fp"] for d in self.known_devices.values() if d["ip"] == token and d.get("fp")), None), (names[-1] if names else None)
+        if re.fullmatch(r"\d{1,3}(\.\d{1,3}){3}", token):
+            return token, None, None
         return None
 
     # ---- moderation history ----
@@ -3118,6 +3562,7 @@ class Hub:
             self.outboxes[sock] = outbox
             names = self.ip_names.setdefault(ip, [])
             if name not in names: names.append(name)
+            self.known_devices[name.lower()] = {"name": name, "ip": ip, "fp": None}
             self.clients[sock] = {
                 "name": name, "ip": ip, "muted_until": 0.0,
                 "muted_by": None, "mute_reason": None, "kicked": False,
@@ -3159,6 +3604,8 @@ class Hub:
         with self.lock:
             if sock in self.clients:
                 self.clients[sock]["fingerprint"] = fingerprint
+                seen = self.known_devices.get(self.clients[sock]["name"].lower())
+                if seen: seen["fp"] = fingerprint
 
     def _find_socket(self, predicate):
         with self.lock:
@@ -3210,36 +3657,109 @@ class Hub:
         now = time.time()
         for k in [k for k, v in self.ghost_mutes.items() if now >= v["muted_until"]]:
             del self.ghost_mutes[k]
-        for ip in [ip for ip, info in self.banned_ips.items() if now >= info["until"]]:
+        expired = [ip for ip, info in self.banned_ips.items() if now >= info["until"]]
+        for ip in expired:
             del self.banned_ips[ip]
+        if expired:
+            self._save_bans()
 
     # ---- bans ----
 
-    def is_ip_banned(self, ip):
-        return self.get_ban_info(ip) is not None
+    def is_ip_banned(self, ip, fp=None):
+        return self.get_ban_info(ip, fp) is not None
 
-    def get_ban_info(self, ip):
+    def _find_ban_key(self, ip, fp=None):
+        """Caller holds the lock (and has purged). A ban applies to a device if it's at the banned address OR has the
+        banned device fingerprint. Address alone isn't enough on networks that hand out new addresses, and the
+        fingerprint alone isn't enough when it can't be read (older versions) — so either one counts."""
+        if ip in self.banned_ips:
+            return ip
+        if fp:
+            for key, ban in self.banned_ips.items():
+                if ban.get("fp") and ban["fp"] == fp:
+                    return key
+        return None
+
+    def get_ban_info(self, ip, fp=None):
         with self.lock:
             self._purge_expired()
-            info = self.banned_ips.get(ip)
-            return dict(info) if info else None
+            key = self._find_ban_key(ip, fp)
+            return dict(self.banned_ips[key], key=key) if key is not None else None
 
-    def ban_ip(self, ip, until, by, reason):
+    def ban_ip(self, ip, until, by, reason, fp=None, name=None):
+        """Bans an address (and, when known, the device fingerprint and name seen with it). Kept on disk."""
         with self.lock:
-            self.banned_ips[ip] = {"until": until, "banned_by": by, "reason": reason}
-            self.unbans.pop(ip, None)  # a fresh ban cancels any earlier "you were unbanned" note
+            old = self.banned_ips.get(ip, {})
+            self.banned_ips[ip] = {"until": until, "banned_by": by, "reason": reason, "fp": fp or old.get("fp"),
+                                   "name": name or old.get("name"), "created": time.time()}
+            self.unbans = {k: v for k, v in self.unbans.items() if k != ip and not (fp and v.get("fp") == fp)}  # a fresh ban cancels any earlier "you were unbanned" note
+            self._save_bans()
 
     def unban_ip(self, ip, by: str = "", reason: str = "", log: bool = True):
         """Lifts a ban and remembers who and why, so the banned person's app can be told."""
         reason = " ".join(reason.split())[:300] or "no reason given"
         with self.lock:
-            if self.banned_ips.pop(ip, None) is None:
+            ban = self.banned_ips.pop(ip, None)
+            if ban is None:
                 return False
-            self.unbans[ip] = {"by": by or "the host", "reason": reason, "time": time.time()}
-            names = list(self.ip_names.get(ip, []))
+            self.unbans[ip] = {"by": by or "the host", "reason": reason, "time": time.time(), "ip": ip, "fp": ban.get("fp")}
+            names = [ban["name"]] if ban.get("name") else list(self.ip_names.get(ip, []))
+            self._save_bans()
         if log:
             self.record_mod("unban", names[-1] if names else f"IP {ip}", by or "the host", reason, ip=ip)
         return True
+
+    def ban_label(self, key) -> str:
+        """Who a ban is for, in words: the name we know them by, else the address."""
+        with self.lock:
+            ban = self.banned_ips.get(key, {})
+            names = [ban["name"]] if ban.get("name") else list(self.ip_names.get(key, []))
+        return names[-1] if names else f"IP {key}"
+
+    def bans_list(self) -> list:
+        """Active bans, oldest first, as (key, record) — the numbering /bans shows and /unban # accepts."""
+        with self.lock:
+            self._purge_expired()
+            return sorted(((k, dict(v)) for k, v in self.banned_ips.items()), key=lambda kv: kv[1].get("created", 0))
+
+    def bans_text(self) -> str:
+        entries = self.bans_list()
+        if not entries:
+            return "No one is banned."
+        lines = [f"Active bans ({len(entries)}):"]
+        for n, (key, ban) in enumerate(entries, 1):
+            who = ban.get("name") or next(iter(self.ip_names.get(key, [])), None)
+            device = f" · device {ban['fp'][:8]}" if ban.get("fp") else ""
+            when = f", {ago_token(ban['created'])}" if ban.get("created") else ""
+            lines.append(f"  #{n}  {who + '  ' if who else ''}({key}{device}) — until {until_token(ban['until'])}"
+                         f"  (by {ban.get('banned_by', '?')}{when}): {ban.get('reason') or 'no reason given'}")
+        lines.append("Lift one with /unban <#, name or IP> [reason].")
+        return "\n".join(lines)
+
+    # ---- the ban list on disk ----
+
+    def _load_bans(self):
+        for rec in load_json(BANS_FILE, dict).get("bans", []):
+            try:
+                ip = str(rec["ip"])
+                until = float("inf") if rec.get("until") is None else float(rec["until"])
+                if time.time() >= until:
+                    continue
+                self.banned_ips[ip] = {"until": until, "banned_by": str(rec.get("banned_by", "the host")), "reason": str(rec.get("reason", "")),
+                                       "fp": rec.get("fp") or None, "name": rec.get("name") or None, "created": float(rec.get("created", 0)),
+                                       **({"appealed": True} if rec.get("appealed") else {})}
+            except (KeyError, TypeError, ValueError):
+                continue
+
+    def _save_bans(self):
+        """Caller holds the lock. Written every time the list changes, so a crash or a restart never loses a ban."""
+        bans = []
+        for ip, ban in self.banned_ips.items():
+            rec = {"ip": ip, "until": None if ban["until"] == float("inf") else ban["until"], "banned_by": ban.get("banned_by"),
+                   "reason": ban.get("reason"), "fp": ban.get("fp"), "name": ban.get("name"), "created": ban.get("created", 0)}
+            if ban.get("appealed"): rec["appealed"] = True
+            bans.append(rec)
+        save_json(BANS_FILE, {"version": 1, "bans": bans}, indent=1)
 
     # ---- mutes / slowmode ----
 
@@ -3961,17 +4481,20 @@ def _handle_ban_appeal(sock, addr, hub: Hub, payload: str):
         hub.send_private(sock, NOTICE_PREFIX + text)
         sock.close()
 
-    ban = hub.get_ban_info(addr[0])
+    try: appeal_fp = str(json.loads(payload).get("fp") or "").strip()[:64] or None
+    except (ValueError, AttributeError): appeal_fp = None
+    ban = hub.get_ban_info(addr[0], appeal_fp)
     if ban is None:
         return finish("You aren't banned any more — just try joining again.")
     appeal = parse_appeal(payload)
     if appeal is None or appeal["kind"] != "ban":
         return finish("That appeal couldn't be read.")
-    if not hub.mark_ban_appealed(addr[0]):
+    key = ban["key"]   # the ban's own record (it may have been made from a different address than this one)
+    if not hub.mark_ban_appealed(key):
         return finish("You've already appealed this ban — the admins have it. Hang tight!")
     name = str(json.loads(payload).get("name", "Someone"))[:30]
     reason = ban.get("reason") or "no reason given"
-    appeal_id = hub.register_appeal("ban", name, ip=addr[0])
+    appeal_id = hub.register_appeal("ban", name, ip=key)
     hub.admin_broadcast(format_appeal(
         f"Ban Appeal #{appeal_id}", f"{name} ({addr[0]})",
         f"is appealing their ban (by {ban.get('banned_by', '?')}, until {until_token(ban['until'])}; reason: \"{reason}\"). "
@@ -3992,6 +4515,21 @@ def _handle_warning_appeal(payload: str, sock, guest_name: str, hub: Hub):
         f"To decide: /accept {appeal_id} [reason]  or  /reject {appeal_id} [reason]", appeal["answers"]))
     _guest_notice(hub, sock, APPEAL_SENT_TEXT)
 
+def _peek_fingerprint(sock, hub: Hub, wait: float = 0.6):
+    """A 1.5.1+ client sends its device fingerprint right behind its hello. Reading it first lets the host check the
+    ban list by device as well as by address. Older clients send nothing yet, so this just times out for them."""
+    try:
+        if not select.select([sock], [], [], wait)[0]:
+            return None
+        sock.settimeout(5)
+        frame = recv_message(sock, hub.fernet)
+        sock.settimeout(None)
+    except (OSError, ConnectionError, InvalidToken):
+        return None
+    if frame.startswith(FINGERPRINT_PREFIX):
+        return frame[len(FINGERPRINT_PREFIX):].strip()[:64] or None
+    return None
+
 def handle_guest_connection(sock, addr, hub: Hub, host_name: str, event_queue: queue.Queue):
     try:
         sock.settimeout(10)  # a real client speaks immediately; don't let silent connections pile up
@@ -4011,11 +4549,13 @@ def handle_guest_connection(sock, addr, hub: Hub, host_name: str, event_queue: q
         return
 
     if first.startswith(BANCHECK_PREFIX):  # a banned person's screen asking whether the ban is still on
-        hub.send_private(sock, BANSTATUS_PREFIX + json.dumps(hub.ban_status(addr[0])))
+        check_fp = first[len(BANCHECK_PREFIX):].partition("|")[2].strip()[:64] or None
+        hub.send_private(sock, BANSTATUS_PREFIX + json.dumps(hub.ban_status(addr[0], check_fp)))
         sock.close()
         return
 
-    ban_info = hub.get_ban_info(addr[0])
+    fingerprint = _peek_fingerprint(sock, hub) if first.startswith(HELLO_PREFIX) else None
+    ban_info = hub.get_ban_info(addr[0], fingerprint)
     if ban_info:
         reason = ban_info.get("reason") or "no reason given"
         hub.send_private(sock, BAN_NOTICE_PREFIX + make_ban_notice(ban_info["until"], reason, hub.host_name))
@@ -4049,6 +4589,9 @@ def handle_guest_connection(sock, addr, hub: Hub, host_name: str, event_queue: q
         return
 
     hub.add_client(sock, guest_name, addr[0])
+    if fingerprint:
+        hub.set_fingerprint(sock, fingerprint)
+        event_queue.put(("system", f"{guest_name}'s device fingerprint: {fingerprint}"))
 
     # Everything from here on is inside try/finally so that *any* failure still
     # removes the guest — otherwise a "ghost" would block the name until restart.
@@ -4117,12 +4660,12 @@ def host_accept_loop(server: socket.socket, hub: Hub, host_name: str, event_queu
 
 HELP_TEXT = (
     "Commands: /mute <name> <time> [reason], /unmute <name>, /kick <name> [reason], "
-    "/ban <name> [time|perm] [reason], /unban <ip or name> [reason], /slowmode [sec], /admin <name>, /unadmin <name>, "
+    "/ban <name or ip> [time|perm] [reason], /unban <#, name or ip> [reason], /bans (who is banned), /slowmode [sec], /admin <name>, /unadmin <name>, "
     "/warn <name> [reason], /unwarn <name> [warning #] [reason], /history [name], /appeals, "
     "/accept <appeal #> [reason], /reject <appeal #> [reason], /color <name>, /colors, /list, /clear [lines], /warnings (your warnings — admins: /warnings <name>), /whisper <name> <msg>, "
     "/nick <new name> (you can change yours twice per chat), /help — "
     "Times: 30 (minutes), 90m, 2h, 7d, 2w, 3mo, 1y. "
-    "host only: /ipban <ip> [time|perm] [reason], /rename <current name> <new name>. "
+    "host only: /rename <current name> <new name>. "
     "Ctrl+Shift+S opens the games (Snake, Flappy Bird) — in a chat or on the home screen. "
     "Paste an image with Ctrl+V (Cmd+V on Mac) to send it. "
     "Right-click a message to reply to it, or report it to the admins. "
@@ -4278,54 +4821,53 @@ def _cmd_slowmode(arg, hub, me, reply):
     hub.log_admin_action(me, f"set slowmode to {hub.slowmode_delay:g}s.")
     reply(f"Slowmode has been {status}.")
 
-def _cmd_ban(arg, hub, me, reply):
+def _do_ban(arg, hub, me, reply, usage, address_only=False):
     parts = arg.split(maxsplit=2)
-    if not parts: return reply("Usage: /ban <name> [time|perm] [reason]   (time: 30, 2h, 7d, 1y …)")
-    name = parts[0]
-    if hub.is_host(name): return reply("You cannot ban the host.")
-    target = hub.find_socket_by_name(name)
-    if not target:
-        return reply(f"No one named '{name}' is connected.")
-
+    if not parts: return reply(usage)
+    token = parts[0].strip()
+    if hub.is_host(token): return reply("You cannot ban the host.")
+    device = hub.find_device(token)
+    if device is None or not device[0]:
+        return reply(f"I don't know '{token}' — they aren't connected and haven't joined this session. "
+                     f"Use their IP address (/ipban <ip>) if you have it.")
+    ip, fp, name = device
     until, reason = parse_ban_args(parts)
-    ip = hub.get_info(target).get("ip")
-    if ip: hub.ban_ip(ip, until, me, reason)
+    hub.ban_ip(ip, until, me, reason, fp=fp, name=name)
     until_str = until_token(until)
-    hub.record_mod("ban", hub.get_info(target).get("name", name), me, reason, ip=ip, until=until)
-    hub.eject(target, BAN_NOTICE_PREFIX + make_ban_notice(until, reason, hub.host_name), f"* {name} has been IP banned *")
-    hub.log_admin_action(me, f"banned {name} ({ip}) until {until_str}. Reason: {reason}")
-    reply(f"Banned {name} ({ip}) until {until_str}. Reason: {reason}")
+    who = name or f"IP {ip}"
+    hub.record_mod("ban", who, me, reason, ip=ip, until=until)
+    # Everyone connected from that address or that device goes too (a second window, a new nickname).
+    removed = set()
+    for _ in range(5):
+        target = hub.find_socket_by_ip(ip) or (hub._find_socket(lambda info: fp and info.get("fingerprint") == fp) if fp else None)
+        if target is None or target in removed: break
+        removed.add(target)
+        tname = hub.get_info(target).get("name", "someone")
+        hub.eject(target, BAN_NOTICE_PREFIX + make_ban_notice(until, reason, hub.host_name), f"* {tname} has been banned *")
+    hub.log_admin_action(me, f"banned {who} ({ip}) until {until_str}. Reason: {reason}")
+    reply(f"Banned {who} ({ip}{' · device ' + fp[:8] if fp else ''}) until {until_str}. Reason: {reason}. It's saved, so it survives a restart. /bans lists bans; /unban lifts one.")
+
+def _cmd_ban(arg, hub, me, reply):
+    _do_ban(arg, hub, me, reply, "Usage: /ban <name or ip> [time|perm] [reason]   (time: 30, 2h, 7d, 1y …)")
 
 def _cmd_ipban(arg, hub, me, reply):
     if not hub.is_host(me): return reply("Only the host can use /ipban.")
-    parts = arg.split(maxsplit=2)
-    if not parts: return reply("Usage: /ipban <ip> [time|perm] [reason]   (time: 30, 2h, 7d, 1y …)")
-    ip = parts[0].strip()
-    until, reason = parse_ban_args(parts)
-    hub.ban_ip(ip, until, me, reason)
-    until_str = until_token(until)
-
-    # If someone is connected from that IP right now (under any name), kick
-    # them too — otherwise the ban only bites on their next connection attempt.
-    target = hub.find_socket_by_ip(ip)
-    hub.record_mod("ipban", hub.get_info(target).get("name", f"IP {ip}") if target else f"IP {ip}", me, reason, ip=ip, until=until)
-    if target:
-        target_name = hub.get_info(target).get("name", "someone")
-        hub.eject(target, BAN_NOTICE_PREFIX + make_ban_notice(until, reason, hub.host_name), f"* {target_name} has been IP banned *")
-
-    hub.log_admin_action(me, f"IP-banned {ip} directly until {until_str}. Reason: {reason}")
-    reply(f"IP {ip} banned until {until_str}. Reason: {reason}")
+    _do_ban(arg, hub, me, reply, "Usage: /ipban <ip or name> [time|perm] [reason]   (time: 30, 2h, 7d, 1y …)", address_only=True)
 
 def _cmd_unban(arg, hub, me, reply):
     parts = arg.split(maxsplit=1)
-    if not parts: return reply("Usage: /unban <ip or name> [reason]")
+    if not parts: return reply("Usage: /unban <# from /bans, name or ip> [reason]")
     reason = parts[1] if len(parts) > 1 else ""
-    ip = hub.resolve_ban_target(parts[0])
-    if ip is None or not hub.unban_ip(ip, me, reason):
-        return reply(f"'{parts[0]}' is not currently banned.")
-    hub.broadcast(f"* IP {ip} has been unbanned *")
-    hub.log_admin_action(me, f"unbanned IP: {ip}. Reason: {' '.join(reason.split()) or 'no reason given'}")
-    reply(f"Unbanned IP: {ip}. If they're on their ban screen, they'll be told.")
+    key = hub.resolve_ban_target(parts[0])
+    label = hub.ban_label(key) if key is not None else None
+    if key is None or not hub.unban_ip(key, me, reason):
+        return reply(f"'{parts[0]}' isn't banned. /bans shows who is.")
+    hub.broadcast(f"* {label} has been unbanned *")
+    hub.log_admin_action(me, f"unbanned {label} ({key}). Reason: {' '.join(reason.split()) or 'no reason given'}")
+    reply(f"Unbanned {label} ({key}). If they're on their ban screen, they'll be told.")
+
+def _cmd_bans(arg, hub, me, reply):
+    reply(hub.bans_text())
 
 def _cmd_unwarn(arg, hub, me, reply):
     usage = "Usage: /unwarn <name> [warning # | all] [reason]"
@@ -4455,14 +4997,14 @@ def _cmd_kick(arg, hub, me, reply):
 COMMAND_HANDLERS = {
     "/help": _cmd_help, "/list": _cmd_list, "/colors": _cmd_colors, "/color": _cmd_color,
     "/whisper": _cmd_whisper, "/admin": _cmd_admin, "/unadmin": _cmd_unadmin,
-    "/slowmode": _cmd_slowmode, "/ban": _cmd_ban, "/ipban": _cmd_ipban, "/unban": _cmd_unban,
+    "/slowmode": _cmd_slowmode, "/ban": _cmd_ban, "/ipban": _cmd_ipban, "/unban": _cmd_unban, "/unipban": _cmd_unban, "/bans": _cmd_bans,
     "/mute": _cmd_mute, "/unmute": _cmd_unmute, "/kick": _cmd_kick,
     "/nick": _cmd_nick, "/rename": _cmd_rename, "/warn": _cmd_warn,
     "/unwarn": _cmd_unwarn, "/history": _cmd_history, "/appeals": _cmd_appeals,
     "/accept": _cmd_accept, "/reject": _cmd_reject, "/warnings": _cmd_warnings,
 }
 # Commands a guest may only send if the host has made them an admin.
-MOD_COMMAND_NAMES = frozenset({"/mute", "/unmute", "/kick", "/ban", "/unban", "/ipban", "/slowmode", "/admin", "/unadmin", "/warn", "/rename",
+MOD_COMMAND_NAMES = frozenset({"/mute", "/unmute", "/kick", "/ban", "/unban", "/unipban", "/bans", "/ipban", "/slowmode", "/admin", "/unadmin", "/warn", "/rename",
                            "/unwarn", "/history", "/appeals", "/accept", "/reject"})
 
 def run_mod_command(msg: str, hub: Hub, my_name: str, reply_func) -> bool:
@@ -4895,6 +5437,9 @@ class GuestConnection:
 
     def _handshake(self):
         send_encrypted(self.sock, self.fernet, HELLO_PREFIX + self.name)
+        # Right behind the hello, so a host can check this device against its ban list before letting us in. (An older
+        # host just reads it as the first message after joining, as it always did.)
+        send_encrypted(self.sock, self.fernet, FINGERPRINT_PREFIX + get_machine_fingerprint())
         try:
             length = int.from_bytes(recv_exact(self.sock, MSG_LEN_BYTES), "big")
             if length == 0xFFFFFFFF: raise PermissionError("Password is incorrect.")
@@ -4924,7 +5469,6 @@ class GuestConnection:
             args=(self.sock, self.fernet, self.event_queue, self.local_colors, self.colors_lock, self.known_names, self.host, self.closing, self.host_features, self.assembler),
             daemon=True,
         ).start()
-        self._send(FINGERPRINT_PREFIX + get_machine_fingerprint(), report=False)
         self._send(FEATURES_PREFIX + ",".join(sorted(HOST_FEATURES)), report=False)
         if unlock_prefix:
             self._send(unlock_prefix + "1", report=False)
@@ -5109,11 +5653,11 @@ class GuestConnection:
         self.assembler.close()
 
 
-def make_button(parent, text, command, bg, fg="white", font=BOLD_FONT, padx=14, pady=6, hover_bg=None):
+def make_button(parent, text, command, bg, fg="white", font=None, padx=14, pady=6, hover_bg=None):
     """A flat, label-based button (native Tk buttons ignore bg colors on macOS).
     The returned frame has: .label, .base_bg, .disabled, .paint(color), .set_enabled(bool)."""
     frame = tk.Frame(parent, bg=bg, cursor="hand2")
-    label = tk.Label(frame, text=text, bg=bg, fg=fg, font=font, padx=padx, pady=pady)
+    label = tk.Label(frame, text=text, bg=bg, fg=fg, font=font or BOLD_FONT, padx=padx, pady=pady)
     label.pack(fill="both", expand=True)
 
     frame.label = label
@@ -5235,7 +5779,7 @@ class ChatApp(tk.Tk):
     WARN_RED = (BTN_RED, BTN_RED_HOVER)
     WARN_WHITE = ("#FFFFFF", "#EEEEEE")
     BASE_COMMANDS = ("/color", "/colors", "/list", "/clear", "/whisper", "/nick", "/warnings") + (("/invite",) if ENABLE_INVITE_CODES else ()) + ("/help",)
-    ADMIN_COMMANDS = ("/mute", "/unmute", "/kick", "/ban", "/unban", "/warn", "/unwarn", "/history", "/appeals",
+    ADMIN_COMMANDS = ("/mute", "/unmute", "/kick", "/ban", "/unban", "/bans", "/warn", "/unwarn", "/history", "/appeals",
                       "/accept", "/reject", "/slowmode", "/admin", "/unadmin")
     PLAYER_ARG_COMMANDS = frozenset({"/mute", "/unmute", "/kick", "/ban", "/warn", "/unwarn", "/warnings", "/history", "/rename", "/whisper", "/admin", "/unadmin"})
     ACTIVITY_RANKED_COMMANDS = frozenset({"/mute", "/kick", "/ban", "/warn"})
@@ -5255,9 +5799,22 @@ class ChatApp(tk.Tk):
 
     def __init__(self):
         super().__init__()
+        init_ui_scale(self)
         self.settings = load_json(SETTINGS_FILE, dict)
-        self.geometry("900x600")
-        self.minsize(640, 420)
+        self._home_src = None            # the home-screen picture, opened once (see _apply_home_picture)
+        self._home_photo = None
+        self._appearance_built = False   # True once every widget exists, so a theme change knows to recolour them
+        self._gban_entries = None        # the verified global ban list (see _global_ban_tick)
+        self._gban_skew = 0.0            # how far the report server's clock is ahead of ours
+        self._gban_seq_seen = None       # the list number we last read; None = not read yet this run
+        self._gban_entry = None          # the entry banning THIS device right now, or None
+        self._gban_overlay = None
+        self._gban_pw = None             # the publisher's admin password, for this run only
+        self._load_appearance()          # themes and fonts first: every widget below is built in them
+        if sys.platform == "win32":
+            self.after_idle(lambda: style_titlebar(self))
+        self.geometry(f"{px(900)}x{px(600)}")
+        self.minsize(px(640), px(420))
         self.configure(bg=BG_DARK)
 
         # connection
@@ -5349,17 +5906,18 @@ class ChatApp(tk.Tk):
         self._focus_first_empty()
 
         # The slim notice bar across the very top of the window (new-report alerts) — packed only while it has something to show.
-        self.notice_bar = tk.Label(self, text="", bg=BG_PANEL, fg=FG_TEXT, font=(CHAT_FONT[0], 10, "bold"), pady=5)
+        self.notice_bar = tk.Label(self, text="", bg=BG_PANEL, fg=FG_TEXT, font=fnt(10, "bold"), pady=5)
         # The announcement banner: above everything, on the main menu and in a chat alike, until it's dismissed.
-        self.announce_bar = tk.Frame(self, bg=COLOR_PALETTE["blue"])
-        self.announce_label = tk.Label(self.announce_bar, text="", bg=COLOR_PALETTE["blue"], fg="white", font=(CHAT_FONT[0], 10, "bold"), justify="left", anchor="w", padx=12, pady=7)
+        self.announce_bar = tk.Frame(self, bg=ACCENT)
+        self.announce_label = tk.Label(self.announce_bar, text="", bg=ACCENT, fg="white", font=fnt(10, "bold"), justify="left", anchor="w", padx=12, pady=7)
         self.announce_label.pack(side="left", fill="x", expand=True)
-        self.announce_close = tk.Label(self.announce_bar, text="✕", bg=COLOR_PALETTE["blue"], fg="white", font=(CHAT_FONT[0], 11, "bold"), cursor="hand2", padx=12)
+        self.announce_close = tk.Label(self.announce_bar, text="✕", bg=ACCENT, fg="white", font=fnt(11, "bold"), cursor="hand2", padx=12)
         self.announce_close.pack(side="right")
         self.announce_close.bind("<Button-1>", lambda e: self._dismiss_announcement())
         self.announce_bar.bind("<Configure>", lambda e: self.announce_label.configure(wraplength=max(200, e.width - 70)))
 
         self.bind_all(GAMES_KEYBIND, self.on_open_games)
+        self.bind_all(APPEARANCE_KEYBIND, lambda e: self._open_appearance())
         self.bind_all(REPORTS_KEYBIND, self.on_open_reports)
         self.bind_all(ANNOUNCEMENTS_KEYBIND, self.on_open_announcements_admin)
         # Quiet background jobs shortly after launch, once the window is up.
@@ -5371,6 +5929,13 @@ class ChatApp(tk.Tk):
         self.bind("<FocusIn>", self._on_focus_in)
         self.bind_all("<Button-1>", self._on_global_click, add="+")  # click-away closes the in-window pickers
         self.protocol("WM_DELETE_WINDOW", self.on_close)
+        self._appearance_built = True
+        self._apply_home_picture()
+        cached = load_global_bans_cache()   # a ban holds even with no internet
+        if cached:
+            self._gban_entries, self._gban_skew = cached["entries"], cached["skew"]
+            self.after(200, self._evaluate_global_ban)
+        self.after(1200, self._global_ban_tick)
         self.after(50, self.poll_queue)
 
     def _init_session_state(self):
@@ -5445,7 +6010,7 @@ class ChatApp(tk.Tk):
             except tk.TclError:
                 pass
             return None
-        popup = tk.Toplevel(self)
+        popup = Toplevel(self)
         popup.title(title)
         popup.configure(bg=BG_PANEL, padx=padx, pady=pady)
         popup.resizable(resizable, resizable)
@@ -5631,6 +6196,426 @@ class ChatApp(tk.Tk):
         )
         save_json(SETTINGS_FILE, self.settings)
 
+
+    # ------------------------------------------------------------------
+    # Appearance: themes, fonts, home picture  (this computer only)
+    # ------------------------------------------------------------------
+
+    _COLOR_OPTIONS = ("background", "foreground", "activebackground", "activeforeground", "highlightbackground", "highlightcolor",
+                      "selectbackground", "selectforeground", "selectcolor", "troughcolor", "readonlybackground",
+                      "disabledbackground", "disabledforeground", "insertbackground")
+    # The accent only ever appears as a *background* (buttons, banners, selections, the focus ring). A name or status colour
+    # can be exactly the same blue as text, so text colours never follow the accent.
+    _ACCENT_OPTIONS = frozenset({"background", "activebackground", "selectbackground", "highlightcolor"})
+    _TAG_COLOR_OPTIONS = ("foreground", "background", "selectforeground", "selectbackground", "underlinefg", "overstrikefg")
+
+    def _load_appearance(self):
+        """Runs before any widget exists: puts the saved theme and font into the module's constants."""
+        self.appearance = sanitize_appearance(self.settings.get("appearance"))
+        apply_theme_globals(theme_for(self.appearance))
+        apply_font_globals(self.appearance["font_family"], self.appearance["font_size"])
+        self._setup_option_db()
+
+    def _setup_option_db(self):
+        """Defaults for widgets created from now on: a thin border that matches the field (so the bright system border
+        around every text box is gone) and turns into an accent ring when the field has focus. (macOS already looks right.)"""
+        if sys.platform == "darwin":
+            return
+        add = lambda pattern, value: self.option_add(pattern, value, 60)
+        for kind in ("Entry", "Text", "Listbox", "Spinbox"):
+            add(f"*{kind}.highlightThickness", 1)
+            add(f"*{kind}.highlightBackground", BG_INPUT)
+            add(f"*{kind}.highlightColor", ACCENT)
+        for kind in ("Radiobutton", "Checkbutton"):
+            add(f"*{kind}.highlightThickness", 0)
+            add(f"*{kind}.borderWidth", 0)
+
+    def _apply_appearance(self, new_cfg, save=True):
+        """Switches theme/font/picture right now, on screen, and remembers the choice."""
+        cfg = sanitize_appearance(new_cfg)
+        old_theme, old_family, old_delta = dict(CURRENT_THEME), CHAT_FONT[0], FONT_DELTA
+        new_theme = theme_for(cfg)
+        apply_theme_globals(new_theme)
+        apply_font_globals(cfg["font_family"], cfg["font_size"])
+        self.appearance = cfg
+        self._setup_option_db()
+        if self._appearance_built:
+            full = {old_theme[r].lower(): new_theme[r] for r in THEME_ROLES if old_theme[r].lower() != new_theme[r].lower()}
+            plain = {k: v for k, v in full.items() if k not in (old_theme["accent"].lower(), old_theme["accent_hover"].lower())}
+            remap = None
+            if CHAT_FONT[0] != old_family or FONT_DELTA != old_delta:
+                remap = self._font_remapper(old_family, CHAT_FONT[0], FONT_DELTA - old_delta)
+            if full or remap:
+                self._retheme_tree(self, full, plain, remap)
+            self._apply_home_picture()
+            self._restyle_titlebars()
+        if save:
+            self.settings["appearance"] = cfg
+            save_json(SETTINGS_FILE, self.settings)
+
+    def _restyle_titlebars(self):
+        if sys.platform != "win32":
+            return
+        for win in [self] + [w for w in self.winfo_children() if isinstance(w, tk.Toplevel)]:
+            try: style_titlebar(win)
+            except tk.TclError: pass
+
+    def _font_remapper(self, old_family, new_family, delta):
+        """-> a function mapping any Tk font spec to (new family, resized, same bold/italic), or None when the spec isn't
+        in the old text font (emoji and other special fonts are left alone)."""
+        cache = {}
+        try: actual_old = str(self.tk.call("font", "actual", (old_family, 10), "-family"))
+        except tk.TclError: actual_old = old_family
+        def remap(spec):
+            spec = str(spec)
+            if not spec:
+                return None
+            if spec in cache:
+                return cache[spec]
+            result = None
+            try:
+                parts = self.tk.splitlist(self.tk.call("font", "actual", spec))
+                info = dict(zip(parts[0::2], parts[1::2]))
+            except (tk.TclError, ValueError):
+                info = {}
+            if str(info.get("-family")) == actual_old:
+                try: size = int(info.get("-size", 0))
+                except ValueError: size = 0
+                if size > 0:
+                    styles = []
+                    if str(info.get("-weight")) == "bold": styles.append("bold")
+                    if str(info.get("-slant")) == "italic": styles.append("italic")
+                    if str(info.get("-underline")) == "1": styles.append("underline")
+                    if str(info.get("-overstrike")) == "1": styles.append("overstrike")
+                    result = (new_family, max(6, size + delta), *styles)
+            cache[spec] = result
+            return result
+        return remap
+
+    def _retheme_tree(self, widget, full, plain, remap_font):
+        if getattr(widget, "_no_retheme", False):   # e.g. the theme swatches, which show other themes' colours on purpose
+            return
+        self._retheme_widget(widget, full, plain, remap_font)
+        for child in widget.winfo_children():
+            self._retheme_tree(child, full, plain, remap_font)
+
+    def _retheme_widget(self, widget, full, plain, remap_font):
+        try: keys = set(widget.keys())
+        except (tk.TclError, AttributeError): keys = set()
+        if full:
+            for opt in self._COLOR_OPTIONS:
+                if opt not in keys:
+                    continue
+                try: current = str(widget.cget(opt)).lower()
+                except tk.TclError: continue
+                new = (full if opt in self._ACCENT_OPTIONS else plain).get(current)
+                if new:
+                    try: widget.configure(**{opt: new})
+                    except tk.TclError: pass
+            for attr in ("base_bg", "hover_bg"):   # make_button's remembered colours
+                value = getattr(widget, attr, None)
+                if isinstance(value, str) and value.lower() in full:
+                    setattr(widget, attr, full[value.lower()])
+        if remap_font and "font" in keys:
+            try: new_font = remap_font(widget.cget("font"))
+            except tk.TclError: new_font = None
+            if new_font:
+                try: widget.configure(font=new_font)
+                except tk.TclError: pass
+        if isinstance(widget, tk.Text):
+            try: tags = widget.tag_names()
+            except tk.TclError: tags = ()
+            for tag in tags:
+                if full:
+                    for opt in self._TAG_COLOR_OPTIONS:
+                        try: current = str(widget.tag_cget(tag, opt)).lower()
+                        except tk.TclError: continue
+                        new = (full if opt == "background" else plain).get(current) if current else None
+                        if new:
+                            try: widget.tag_configure(tag, **{opt: new})
+                            except tk.TclError: pass
+                if remap_font:
+                    try: new_font = remap_font(widget.tag_cget(tag, "font"))
+                    except tk.TclError: new_font = None
+                    if new_font:
+                        try: widget.tag_configure(tag, font=new_font)
+                        except tk.TclError: pass
+        retheme = getattr(widget, "retheme", None)
+        if callable(retheme):
+            try: retheme()
+            except tk.TclError: pass
+
+    # ---- the picture behind the main menu ----
+
+    def _style_corner_links(self, over_picture: bool):
+        """The links in the bottom-right corner sit on the plain background as before; over a picture they get a small panel
+        behind them so they stay readable."""
+        widgets = getattr(self, "_corner_widgets", None)
+        if not widgets:
+            return
+        frame, *labels = widgets
+        bg = BG_PANEL if over_picture else BG_DARK
+        frame.configure(bg=bg, padx=px(10) if over_picture else 0, pady=px(5) if over_picture else 0)
+        for label in labels:
+            label.configure(bg=bg)
+
+    def _apply_home_picture(self):
+        label = getattr(self, "home_pic_label", None)
+        if label is None:
+            return
+        self._style_corner_links(False)
+        if not (self.appearance.get("home_image") and Image is not None and os.path.exists(HOME_IMAGE_FILE)):
+            label.place_forget()
+            label.configure(image="")
+            self._home_photo = self._home_src = None
+            return
+        w, h = self.connect_frame.winfo_width(), self.connect_frame.winfo_height()
+        if w < 60 or h < 60:
+            w, h = px(900), px(600)
+        try:
+            from PIL import ImageOps
+            if self._home_src is None:
+                self._home_src = Image.open(HOME_IMAGE_FILE).convert("RGB")
+            self._home_photo = ImageTk.PhotoImage(ImageOps.fit(self._home_src, (w, h), Image.LANCZOS))
+        except Exception:
+            label.place_forget()
+            return
+        label.configure(image=self._home_photo)
+        label.place(x=0, y=0, relwidth=1, relheight=1)
+        label.lower()
+        self._style_corner_links(True)
+
+    def _set_home_picture(self, path):
+        """Copies the chosen picture next to the app (shrunk to screen size) so it still works if the original is moved."""
+        if Image is None:
+            raise ValueError("Pictures need the Pillow library, which isn't installed.")
+        from PIL import ImageOps
+        try:
+            img = ImageOps.exif_transpose(Image.open(path)).convert("RGB")
+        except Exception:
+            raise ValueError("That file couldn't be opened as a picture.")
+        img.thumbnail((2560, 1600))
+        try:
+            img.save(HOME_IMAGE_FILE, "JPEG", quality=88)
+        except OSError as e:
+            raise ValueError(f"Couldn't save the picture: {e}")
+        self._home_src = None
+        new = dict(self.appearance, home_image=True)
+        self._apply_appearance(new)
+
+    # ---- the Appearance window ----
+
+    def _open_appearance(self):
+        popup = self._open_dialog("appearance", "Appearance", padx=0, pady=0, resizable=True)
+        if popup is None:
+            return
+        popup.minsize(px(420), px(300))
+        # Everything sits in a scrolling area, so on a short screen (or with the Dock in the way) the bottom is still reachable,
+        # and the window can be dragged bigger or smaller.
+        shell = tk.Frame(popup, bg=BG_PANEL)
+        shell.pack(fill="both", expand=True)
+        canvas = tk.Canvas(shell, bg=BG_PANEL, highlightthickness=0, bd=0, width=px(470), height=px(300))
+        if sys.platform == "darwin":
+            scroll = tk.Scrollbar(shell, command=canvas.yview)
+        else:
+            scroll = FlatScrollbar(shell, bg=BG_PANEL)
+            scroll.command = canvas.yview
+        canvas.configure(yscrollcommand=scroll.set)
+        scroll.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
+        body = tk.Frame(canvas, bg=BG_PANEL, padx=px(22), pady=px(18))
+        body_id = canvas.create_window(0, 0, window=body, anchor="nw")
+        body.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.bind("<Configure>", lambda e: canvas.itemconfigure(body_id, width=e.width))
+        def wheel(event):
+            if str(event.widget).startswith(str(box)):   # the font list scrolls itself
+                return
+            step = -1 if (getattr(event, "delta", 0) > 0 or event.num == 4) else 1
+            canvas.yview_scroll(step * (1 if sys.platform == "darwin" else 2), "units")
+        for sequence in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+            popup.bind(sequence, wheel)
+        tk.Label(body, text="🎨  Appearance", bg=BG_PANEL, fg=FG_TEXT, font=fnt(14, "bold")).pack(anchor="w")
+        tk.Label(body, text="Just for this computer — nobody else sees your choices, and they're remembered next time.",
+                 bg=BG_PANEL, fg=FG_MUTED, font=fnt(9), wraplength=px(440), justify="left").pack(anchor="w", pady=(4, 10))
+
+        def change(**fields):
+            self._apply_appearance(dict(self.appearance, **fields))
+            refresh()
+
+        def heading(text, top=10):
+            tk.Label(body, text=text, bg=BG_PANEL, fg=FG_MUTED, font=fnt(8, "bold")).pack(anchor="w", pady=(top, 2))
+
+        # -- theme swatches --
+        heading("THEME", top=0)
+        grid = tk.Frame(body, bg=BG_PANEL)
+        grid.pack(anchor="w")
+        swatches = {}
+        entries = [(key, label, pal) for key, (label, pal) in THEME_PRESETS.items()] + [("custom", "Custom", None)]
+        for i, (key, label, pal) in enumerate(entries):
+            sw = tk.Frame(grid, highlightthickness=2, cursor="hand2", width=px(104), height=px(56))
+            sw._no_retheme = True
+            sw.grid(row=i // 4, column=i % 4, padx=3, pady=3)
+            sw.pack_propagate(False)
+            name = tk.Label(sw, text=label, font=fnt(9, "bold"), anchor="w", padx=6)
+            name.pack(anchor="w", pady=(6, 0), fill="x")
+            chips = tk.Frame(sw)
+            chips.pack(anchor="w", padx=6, pady=(4, 0))
+            chip_widgets = [tk.Frame(chips, width=px(20), height=px(9)) for _ in range(3)]
+            for chip in chip_widgets:
+                chip.pack(side="left", padx=(0, 3))
+            for w in (sw, name, chips, *chip_widgets):
+                w._no_retheme = True
+                w.bind("<Button-1>", lambda e, key=key: change(theme=key))
+            swatches[key] = (sw, name, chips, chip_widgets, pal)
+
+        custom_row = tk.Frame(body, bg=BG_PANEL)
+        custom_chips = {}
+        def pick(which, title):
+            current = theme_for(self.appearance)["bg" if which == "custom_bg" else "accent"]
+            _rgb_value, chosen = colorchooser.askcolor(color=current, title=title, parent=popup)
+            if chosen:
+                change(theme="custom", **{which: chosen.upper()})
+        for col, (which, label) in enumerate((("custom_bg", "Background"), ("custom_accent", "Accent"))):
+            tk.Label(custom_row, text=label, bg=BG_PANEL, fg=FG_MUTED, font=CHAT_FONT).grid(row=0, column=col * 3, padx=(0 if col == 0 else 18, 6))
+            chip = tk.Frame(custom_row, width=px(34), height=px(20), highlightthickness=1, cursor="hand2")
+            chip._no_retheme = True
+            chip.grid(row=0, column=col * 3 + 1)
+            chip.bind("<Button-1>", lambda e, which=which, label=label: pick(which, f"{label} colour"))
+            make_button(custom_row, "Pick…", lambda which=which, label=label: pick(which, f"{label} colour"),
+                        bg=BTN_NEUTRAL, hover_bg=BTN_NEUTRAL_HOVER, padx=10, pady=2, font=fnt(9)).grid(row=0, column=col * 3 + 2, padx=(6, 0))
+            custom_chips[which] = chip
+        tk.Label(custom_row, text="Backgrounds stay fairly dark and light accents get a little darker, so text stays readable.",
+                 bg=BG_PANEL, fg=FG_MUTED, font=fnt(8), wraplength=px(440), justify="left").grid(row=1, column=0, columnspan=6, sticky="w", pady=(4, 0))
+
+        # -- font --
+        heading("TEXT", top=12)
+        tk.Label(body, text="Only fonts installed on this computer are listed.", bg=BG_PANEL, fg=FG_MUTED, font=fnt(8)).pack(anchor="w")
+        search_var = tk.StringVar()
+        search = tk.Entry(body, textvariable=search_var, bg=BG_INPUT, fg=FG_TEXT, insertbackground=FG_TEXT, relief="flat", font=CHAT_FONT)
+        search.pack(fill="x", pady=(4, 4), ipady=(0 if sys.platform == "darwin" else px(3)))
+        list_frame = tk.Frame(body, bg=BG_INPUT)
+        list_frame.pack(fill="x")
+        box = tk.Listbox(list_frame, height=6, width=38, bg=BG_INPUT, fg=FG_TEXT, selectbackground=ACCENT, selectforeground="white",
+                         relief="flat", font=CHAT_FONT, activestyle="none", exportselection=False, highlightthickness=0)
+        if sys.platform == "darwin":
+            bar = tk.Scrollbar(list_frame, command=box.yview)
+        else:
+            bar = FlatScrollbar(list_frame, bg=BG_INPUT)
+            bar.command = box.yview
+        box.configure(yscrollcommand=bar.set)
+        bar.pack(side="right", fill="y")
+        box.pack(side="left", fill="x", expand=True)
+        families = system_font_families(self)
+        shown = []   # (list row text, family value) for what's in the box right now
+        def fill_fonts(*_):
+            needle = search_var.get().strip().lower()
+            shown.clear()
+            if not needle or needle in "default":
+                shown.append((f"Default  ({DEFAULT_FONT_FAMILY})", ""))
+            shown.extend((f, f) for f in families if needle in f.lower())
+            box.delete(0, "end")
+            for text, _value in shown:
+                box.insert("end", text)
+            chosen = self.appearance["font_family"]
+            for i, (_text, value) in enumerate(shown):
+                if value == chosen:
+                    box.selection_set(i)
+                    box.see(i)
+                    break
+        def on_font_pick(_event=None):
+            sel = box.curselection()
+            if sel and shown[sel[0]][1] != self.appearance["font_family"]:
+                change(font_family=shown[sel[0]][1])
+        box.bind("<<ListboxSelect>>", on_font_pick)
+        search_var.trace_add("write", fill_fonts)
+        fill_fonts()
+
+        size_row = tk.Frame(body, bg=BG_PANEL)
+        size_row.pack(anchor="w", pady=(8, 0))
+        tk.Label(size_row, text="Size", bg=BG_PANEL, fg=FG_MUTED, font=CHAT_FONT).pack(side="left", padx=(0, 10))
+        def nudge(step):
+            size = (self.appearance["font_size"] or DEFAULT_FONT_SIZE) + step
+            size = max(FONT_SIZE_RANGE[0], min(FONT_SIZE_RANGE[1], size))
+            change(font_size=0 if size == DEFAULT_FONT_SIZE else size)
+        make_button(size_row, "−", lambda: nudge(-1), bg=BTN_NEUTRAL, hover_bg=BTN_NEUTRAL_HOVER, padx=12, pady=2).pack(side="left")
+        size_label = tk.Label(size_row, text="", bg=BG_PANEL, fg=FG_TEXT, font=BOLD_FONT, width=7)
+        size_label.pack(side="left")
+        make_button(size_row, "+", lambda: nudge(1), bg=BTN_NEUTRAL, hover_bg=BTN_NEUTRAL_HOVER, padx=12, pady=2).pack(side="left")
+        make_button(size_row, "Reset text", lambda: change(font_family="", font_size=0), bg=BTN_NEUTRAL, hover_bg=BTN_NEUTRAL_HOVER,
+                    padx=10, pady=2, font=fnt(9)).pack(side="left", padx=(14, 0))
+
+        preview = tk.Frame(body, bg=BG_DARK, padx=10, pady=8)
+        preview.pack(fill="x", pady=(10, 0))
+        line = tk.Frame(preview, bg=BG_DARK)
+        line.pack(anchor="w")
+        tk.Label(line, text="[12:30]", bg=BG_DARK, fg=FG_MUTED, font=fnt(8)).pack(side="left")
+        tk.Label(line, text=" Richy:", bg=BG_DARK, fg=COLOR_PALETTE["green"], font=BOLD_FONT).pack(side="left")
+        tk.Label(line, text=" The quick brown fox jumps over the lazy dog", bg=BG_DARK, fg=FG_TEXT, font=CHAT_FONT).pack(side="left")
+        tk.Label(preview, text="* A system message looks like this *", bg=BG_DARK, fg=FG_MUTED, font=fnt(9, "italic")).pack(anchor="w")
+
+        # -- home picture --
+        heading("MAIN MENU PICTURE", top=12)
+        pic_row = tk.Frame(body, bg=BG_PANEL)
+        pic_row.pack(anchor="w")
+        pic_status = tk.Label(body, text="", bg=BG_PANEL, fg=FG_MUTED, font=fnt(9), wraplength=px(440), justify="left")
+        def choose_picture():
+            path = filedialog.askopenfilename(parent=popup, title="Choose a picture",
+                                              filetypes=[("Pictures", "*.png *.jpg *.jpeg *.gif *.bmp *.webp"), ("All files", "*.*")])
+            if not path:
+                return
+            try: self._set_home_picture(path)
+            except ValueError as e:
+                pic_status.configure(text=str(e), fg=COLOR_PALETTE["red"])
+                return
+            refresh()
+        make_button(pic_row, "Choose picture…", choose_picture, bg=BTN_NEUTRAL, hover_bg=BTN_NEUTRAL_HOVER, padx=12, pady=4).pack(side="left")
+        remove_btn = make_button(pic_row, "Remove", lambda: change(home_image=False), bg=BTN_NEUTRAL, hover_bg=BTN_NEUTRAL_HOVER, padx=12, pady=4)
+        remove_btn.pack(side="left", padx=(8, 0))
+        pic_status.pack(anchor="w", pady=(4, 0))
+        tk.Label(body, text="It's shown behind the main menu. The chat itself keeps a plain background so messages stay readable.",
+                 bg=BG_PANEL, fg=FG_MUTED, font=fnt(8), wraplength=px(440), justify="left").pack(anchor="w")
+
+        buttons = tk.Frame(body, bg=BG_PANEL)
+        buttons.pack(fill="x", pady=(14, 0))
+        make_button(buttons, "Done", lambda: self._close_popup("appearance"), bg=ACCENT, hover_bg=ACCENT_HOVER, padx=22, pady=5).pack(side="right")
+        make_button(buttons, "Reset everything", lambda: (self._set_default_appearance(), refresh()), bg=BTN_NEUTRAL, hover_bg=BTN_NEUTRAL_HOVER,
+                    padx=14, pady=5).pack(side="right", padx=(0, 8))
+
+        def refresh():
+            cfg = self.appearance
+            effective = theme_for(cfg)
+            for key, (sw, name, chips, chip_widgets, pal) in swatches.items():
+                pal = pal or make_theme(cfg["custom_bg"], cfg["custom_accent"])
+                sw.configure(bg=pal["bg"], highlightbackground=ACCENT if cfg["theme"] == key else BG_PANEL, highlightcolor=ACCENT)
+                name.configure(bg=pal["bg"], fg=pal["text"])
+                chips.configure(bg=pal["bg"])
+                for chip, color in zip(chip_widgets, (pal["panel"], pal["input"], pal["accent"])):
+                    chip.configure(bg=color)
+            if cfg["theme"] == "custom":
+                custom_row.pack(anchor="w", pady=(6, 0), after=grid)
+            else:
+                custom_row.pack_forget()
+            custom_chips["custom_bg"].configure(bg=effective["bg"], highlightbackground=FG_MUTED)
+            custom_chips["custom_accent"].configure(bg=effective["accent"], highlightbackground=FG_MUTED)
+            size_label.configure(text=f"{cfg['font_size'] or DEFAULT_FONT_SIZE} pt")
+            if cfg["home_image"]: remove_btn.pack(side="left", padx=(8, 0))
+            else: remove_btn.pack_forget()
+            if not pic_status.cget("fg") == COLOR_PALETTE["red"]:
+                pic_status.configure(text="")
+            popup.update_idletasks()
+        refresh()
+        # open at the natural size, but never taller than the screen leaves room for (menu bar and Dock)
+        popup.update_idletasks()
+        room = popup.winfo_screenheight() - px(190)
+        canvas.configure(width=body.winfo_reqwidth(), height=min(body.winfo_reqheight(), room))
+        canvas.configure(scrollregion=canvas.bbox("all"))
+
+    def _set_default_appearance(self):
+        try: os.remove(HOME_IMAGE_FILE)
+        except OSError: pass
+        self._home_src = None
+        self._apply_appearance(dict(DEFAULT_APPEARANCE))
+
     # ------------------------------------------------------------------
     # Connect screen
     # ------------------------------------------------------------------
@@ -5638,28 +6623,32 @@ class ChatApp(tk.Tk):
     def _build_connect_frame(self):
         f = tk.Frame(self, bg=BG_DARK)
         self.connect_frame = f
+        # Optional picture behind the card (Appearance). Created first, so everything else sits on top of it.
+        self.home_pic_label = tk.Label(f, bd=0, highlightthickness=0, bg=BG_DARK)
+        f.bind("<Configure>", lambda e: self._set_timer("home_pic", 150, self._apply_home_picture) if self.appearance.get("home_image") else None)
 
-        card = tk.Frame(f, bg=BG_PANEL, padx=32, pady=28)
+        card = tk.Frame(f, bg=BG_PANEL, padx=px(32), pady=px(28))
         card.place(relx=0.5, rely=0.5, anchor="center")
 
         corner_frame = tk.Frame(f, bg=BG_DARK)
         corner_frame.place(relx=1.0, rely=1.0, anchor="se", x=-10, y=-8)
-        link_font = (CHAT_FONT[0], 8, "underline")
+        link_font = fnt(8, "underline")
         changelog_label = tk.Label(corner_frame, text="View Changelog", bg=BG_DARK, fg=FG_MUTED, font=link_font, cursor="hand2")
         changelog_label.pack(anchor="e", pady=(0, 2))
         changelog_label.bind("<Button-1>", lambda e: self.on_show_changelog())
         version_label = tk.Label(corner_frame, text=f"v{VERSION} — Check for Updates", bg=BG_DARK, fg=FG_MUTED, font=link_font, cursor="hand2")
         version_label.pack(anchor="e")
         version_label.bind("<Button-1>", lambda e: self.on_check_updates())
+        self._corner_widgets = (corner_frame, changelog_label, version_label)
 
         # Sits across the top of the main menu whenever there's something to say about updates (see _set_update_banner).
         self.update_banner = tk.Frame(f, bg=BG_PANEL, padx=14, pady=8)
-        self.update_banner_label = tk.Label(self.update_banner, text="", bg=BG_PANEL, fg=FG_TEXT, font=CHAT_FONT, anchor="w", justify="left", wraplength=560)
+        self.update_banner_label = tk.Label(self.update_banner, text="", bg=BG_PANEL, fg=FG_TEXT, font=CHAT_FONT, anchor="w", justify="left", wraplength=px(560))
         self.update_banner_label.pack(side="left")
         self.update_banner_buttons = tk.Frame(self.update_banner, bg=BG_PANEL)
         self.update_banner_buttons.pack(side="right")
 
-        tk.Label(card, text="chat_gui", font=(CHAT_FONT[0], 20, "bold"), bg=BG_PANEL, fg=FG_TEXT).grid(row=0, column=0, columnspan=3, pady=(0, 16))
+        tk.Label(card, text="chat_gui", font=fnt(20, "bold"), bg=BG_PANEL, fg=FG_TEXT).grid(row=0, column=0, columnspan=3, pady=(0, 16))
 
         saved_mode = self.settings.get("mode")
         self.mode_var = tk.StringVar(value=saved_mode if saved_mode in ("host", "join") else "host")
@@ -5682,7 +6671,7 @@ class ChatApp(tk.Tk):
                 # near-white system color that makes light text unreadable.
                 readonlybackground=BG_INPUT, **kwargs,
             )
-            entry.grid(row=row, column=1, sticky="ew", pady=(6, 0), padx=(10, 0))
+            entry.grid(row=row, column=1, sticky="ew", pady=(6, 0), padx=(10, 0), ipady=(0 if sys.platform == "darwin" else px(3)))
             entry.bind("<Return>", lambda e: self.on_connect_clicked())
             entry.label = label_widget
             return entry
@@ -5712,7 +6701,7 @@ class ChatApp(tk.Tk):
         self.host_ip_entry = field(5, "Host IP (only if Room Code fails)")
         self.key_entry = field(6, "Shared key", show="*")
 
-        self.status_label = tk.Label(card, text="", bg=BG_PANEL, fg=self.STATUS_COLORS["error"], wraplength=300, justify="left", font=CHAT_FONT)
+        self.status_label = tk.Label(card, text="", bg=BG_PANEL, fg=self.STATUS_COLORS["error"], wraplength=px(300), justify="left", font=CHAT_FONT)
         self.status_label.grid(row=7, column=0, columnspan=3, sticky="w", pady=(10, 0))
 
         self.connect_btn = make_button(card, "Connect", self.on_connect_clicked, bg=BTN_GREEN, hover_bg=BTN_GREEN_HOVER)
@@ -5726,7 +6715,7 @@ class ChatApp(tk.Tk):
         report_link.bind("<Button-1>", lambda e: self._open_reports_menu())
         more_links = tk.Frame(card, bg=BG_PANEL)
         more_links.grid(row=11, column=0, columnspan=3, pady=(6, 0))
-        for text, action in (("📢 Announcements", self._open_announcements_window), ("🛠 Restore a previous version", self._open_restore_flow)):
+        for text, action in (("🎨 Appearance", self._open_appearance), ("📢 Announcements", self._open_announcements_window), ("🛠 Restore a previous version", self._open_restore_flow)):
             link = tk.Label(more_links, text=text, bg=BG_PANEL, fg=FG_MUTED, font=link_font, cursor="hand2")
             link.pack(side="left", padx=10)
             link.bind("<Button-1>", lambda e, action=action: action())
@@ -5824,7 +6813,7 @@ class ChatApp(tk.Tk):
         return None
 
     def on_connect_clicked(self):
-        if self._connecting or self.connection: return
+        if self._connecting or self.connection or self._gban_entry: return
         if self._ban_ctx and self._ban_ctx.get("name") != self.name_entry.get().strip():
             self._set_ban_context(None)  # a different name: it's a new attempt, not a follow-up to that ban
         name, key = self.name_entry.get().strip(), self.key_entry.get()
@@ -5847,9 +6836,9 @@ class ChatApp(tk.Tk):
         """Runs on a worker thread so the window never freezes while we do
         network work (ban-list lookup, room discovery, the handshake)."""
         put = self.event_queue.put
-        ban = check_global_ban()
+        ban, ban_skew = check_global_ban()
         if ban:
-            return put(("connect_fail", f"This device isn't able to use chat_gui. ({ban.get('reason', 'no reason given')})"))
+            return put(("connect_fail", global_ban_message(ban, ban_skew)))
 
         if mode == "host":
             # The code on screen was worked out when this screen opened; the IP may have changed
@@ -5939,8 +6928,8 @@ class ChatApp(tk.Tk):
             self._toast("Appeal accepted" if appeal_accepted else ("Unbanned" if state == "unbanned" else "Ban ended"), message.lstrip("✅ "))
             popup = self._open_dialog("unbanned", "Unbanned", padx=24, pady=20)
             if popup is not None:
-                tk.Label(popup, text="✅  You have been unbanned", bg=BG_PANEL, fg=COLOR_PALETTE["green"], font=(CHAT_FONT[0], 14, "bold")).pack(anchor="w")
-                tk.Label(popup, text=body.split("\n\n", 1)[1], bg=BG_PANEL, fg=FG_TEXT, font=CHAT_FONT, wraplength=380, justify="left").pack(anchor="w", pady=(10, 0))
+                tk.Label(popup, text="✅  You have been unbanned", bg=BG_PANEL, fg=COLOR_PALETTE["green"], font=fnt(14, "bold")).pack(anchor="w")
+                tk.Label(popup, text=body.split("\n\n", 1)[1], bg=BG_PANEL, fg=FG_TEXT, font=CHAT_FONT, wraplength=px(380), justify="left").pack(anchor="w", pady=(10, 0))
                 make_button(popup, "OK", lambda: self._close_popup("unbanned"), bg=BTN_NEUTRAL, hover_bg=BTN_NEUTRAL_HOVER, padx=18, pady=5).pack(anchor="e", pady=(16, 0))
                 popup.lift()
                 self._raise_for_attention(popup)
@@ -5960,7 +6949,7 @@ class ChatApp(tk.Tk):
         popup = self._open_dialog("report", "Report a bug or suggest a feature", padx=24, pady=20)
         if popup is None:
             return
-        tk.Label(popup, text="💡  Report a bug or suggest a feature", bg=BG_PANEL, fg=FG_TEXT, font=(CHAT_FONT[0], 14, "bold")).pack(anchor="w")
+        tk.Label(popup, text="💡  Report a bug or suggest a feature", bg=BG_PANEL, fg=FG_TEXT, font=fnt(14, "bold")).pack(anchor="w")
         kind_var = tk.StringVar(value="bug")
         kinds = tk.Frame(popup, bg=BG_PANEL)
         kinds.pack(anchor="w", pady=(10, 4))
@@ -5976,7 +6965,7 @@ class ChatApp(tk.Tk):
         detail.pack(anchor="w")
         where = "It's saved on this computer and sent to the developer." if report_server() else "It's saved on this computer."
         tk.Label(popup, text=f"Added automatically: the date, v{VERSION} and your operating system — no name, address or messages. {where}",
-                 bg=BG_PANEL, fg=FG_MUTED, font=(CHAT_FONT[0], 8), wraplength=420, justify="left").pack(anchor="w", pady=(8, 0))
+                 bg=BG_PANEL, fg=FG_MUTED, font=fnt(8), wraplength=px(420), justify="left").pack(anchor="w", pady=(8, 0))
         status = tk.Label(popup, text="", bg=BG_PANEL, fg=self.STATUS_COLORS["error"], font=CHAT_FONT)
         status.pack(anchor="w", pady=(6, 0))
         buttons = tk.Frame(popup, bg=BG_PANEL)
@@ -5999,7 +6988,7 @@ class ChatApp(tk.Tk):
                 if ok: update_report(report["id"], delivered=True)
                 self.event_queue.put(("report_result", {"report": report, "delivered": ok}))
             threading.Thread(target=deliver, daemon=True).start()
-        make_button(buttons, "Send", send, bg=COLOR_PALETTE["blue"], hover_bg=BTN_BLUE_HOVER, padx=18, pady=5).pack(side="left", padx=(0, 8))
+        make_button(buttons, "Send", send, bg=ACCENT, hover_bg=ACCENT_HOVER, padx=18, pady=5).pack(side="left", padx=(0, 8))
         make_button(buttons, "Cancel", lambda: self._close_popup("report"), bg=BTN_NEUTRAL, hover_bg=BTN_NEUTRAL_HOVER, padx=18, pady=5).pack(side="left")
         summary.focus_set()
 
@@ -6031,18 +7020,18 @@ class ChatApp(tk.Tk):
         if popup is None:
             return
         many = len(finished) > 1
-        tk.Label(popup, text="✔  Your report was completed" if not many else "✔  Your reports were completed", bg=BG_PANEL, fg=COLOR_PALETTE["green"], font=(CHAT_FONT[0], 14, "bold")).pack(anchor="w")
+        tk.Label(popup, text="✔  Your report was completed" if not many else "✔  Your reports were completed", bg=BG_PANEL, fg=COLOR_PALETTE["green"], font=fnt(14, "bold")).pack(anchor="w")
         for r in finished[:6]:
             icon = "💡" if r.get("kind") == "feature" else "🐞"
-            tk.Label(popup, text=f"{icon}  {r.get('summary', '')}", bg=BG_PANEL, fg=FG_TEXT, font=CHAT_FONT, wraplength=400, justify="left").pack(anchor="w", pady=(8, 0))
+            tk.Label(popup, text=f"{icon}  {r.get('summary', '')}", bg=BG_PANEL, fg=FG_TEXT, font=CHAT_FONT, wraplength=px(400), justify="left").pack(anchor="w", pady=(8, 0))
             if r.get("completed_at"):
-                tk.Label(popup, text=f"Completed {friendly_ago(time.time() - r['completed_at'])} — {format_time(r['completed_at'])}", bg=BG_PANEL, fg=FG_MUTED, font=(CHAT_FONT[0], 9)).pack(anchor="w")
+                tk.Label(popup, text=f"Completed {friendly_ago(time.time() - r['completed_at'])} — {format_time(r['completed_at'])}", bg=BG_PANEL, fg=FG_MUTED, font=fnt(9)).pack(anchor="w")
         if len(finished) > 6:
             tk.Label(popup, text=f"…and {len(finished) - 6} more", bg=BG_PANEL, fg=FG_MUTED, font=CHAT_FONT).pack(anchor="w", pady=(4, 0))
         tk.Label(popup, text=("They've been marked as completed and will be released in the next update. " if many else
                               "It's been marked as completed and will be released in the next update. ") + "Thanks for helping make chat_gui better!",
-                 bg=BG_PANEL, fg=FG_TEXT, font=CHAT_FONT, wraplength=400, justify="left").pack(anchor="w", pady=(12, 0))
-        make_button(popup, "OK", lambda: self._close_popup(popup_name), bg=COLOR_PALETTE["blue"], hover_bg=BTN_BLUE_HOVER, padx=18, pady=5).pack(anchor="e", pady=(14, 0))
+                 bg=BG_PANEL, fg=FG_TEXT, font=CHAT_FONT, wraplength=px(400), justify="left").pack(anchor="w", pady=(12, 0))
+        make_button(popup, "OK", lambda: self._close_popup(popup_name), bg=ACCENT, hover_bg=ACCENT_HOVER, padx=18, pady=5).pack(anchor="e", pady=(14, 0))
         popup.lift()
 
     # ---- a password prompt shared by the admin tools ----
@@ -6056,7 +7045,7 @@ class ChatApp(tk.Tk):
         popup = self._open_dialog(name, heading, padx=24, pady=20)
         if popup is None:
             return
-        tk.Label(popup, text=f"🔒  {heading}", bg=BG_PANEL, fg=FG_TEXT, font=(CHAT_FONT[0], 14, "bold")).pack(anchor="w")
+        tk.Label(popup, text=f"🔒  {heading}", bg=BG_PANEL, fg=FG_TEXT, font=fnt(14, "bold")).pack(anchor="w")
         tk.Label(popup, text="Admin password", bg=BG_PANEL, fg=FG_MUTED, font=CHAT_FONT).pack(anchor="w", pady=(10, 2))
         entry = tk.Entry(popup, show="•", width=30, bg=BG_INPUT, fg=FG_TEXT, insertbackground=FG_TEXT, relief="flat", font=CHAT_FONT)
         entry.pack(anchor="w", ipady=3)
@@ -6087,7 +7076,7 @@ class ChatApp(tk.Tk):
             status.configure(text="Checking…", fg=FG_MUTED)
             self._run_bg(lambda: verify(password), lambda result: answered(password, result))
         entry.bind("<Return>", submit)
-        make_button(popup, "Open", submit, bg=COLOR_PALETTE["blue"], hover_bg=BTN_BLUE_HOVER, padx=18, pady=5).pack(anchor="e", pady=(8, 0))
+        make_button(popup, "Open", submit, bg=ACCENT, hover_bg=ACCENT_HOVER, padx=18, pady=5).pack(anchor="e", pady=(8, 0))
         entry.focus_set()
 
     # ---- restore a previous version ----
@@ -6101,19 +7090,19 @@ class ChatApp(tk.Tk):
         win = self._open_dialog("restore", "Restore a previous version", padx=20, pady=16)
         if win is None:
             return
-        tk.Label(win, text="🛠  Restore a previous version", bg=BG_PANEL, fg=FG_TEXT, font=(CHAT_FONT[0], 14, "bold")).pack(anchor="w")
+        tk.Label(win, text="🛠  Restore a previous version", bg=BG_PANEL, fg=FG_TEXT, font=fnt(14, "bold")).pack(anchor="w")
         tk.Label(win, text=f"You're running v{VERSION}.", bg=BG_PANEL, fg=FG_MUTED, font=CHAT_FONT).pack(anchor="w", pady=(4, 8))
         backups = list_backups()
         if not backups:
-            tk.Label(win, text="There's no earlier version on this computer yet — one is saved each time the app updates itself.", bg=BG_PANEL, fg=FG_TEXT, font=CHAT_FONT, wraplength=420, justify="left").pack(anchor="w")
+            tk.Label(win, text="There's no earlier version on this computer yet — one is saved each time the app updates itself.", bg=BG_PANEL, fg=FG_TEXT, font=CHAT_FONT, wraplength=px(420), justify="left").pack(anchor="w")
             make_button(win, "OK", lambda: self._close_popup("restore"), bg=BTN_NEUTRAL, hover_bg=BTN_NEUTRAL_HOVER, padx=18, pady=5).pack(anchor="e", pady=(14, 0))
             return
-        box = tk.Listbox(win, width=64, height=min(8, len(backups)), bg=BG_INPUT, fg=FG_TEXT, selectbackground=COLOR_PALETTE["blue"], relief="flat", font=CHAT_FONT, activestyle="none", exportselection=False)
+        box = tk.Listbox(win, width=64, height=min(8, len(backups)), bg=BG_INPUT, fg=FG_TEXT, selectbackground=ACCENT, relief="flat", font=CHAT_FONT, activestyle="none", exportselection=False)
         box.pack(fill="x")
         for i, b in enumerate(backups):
             box.insert("end", f"{'★ last version  ' if i == 0 else ''}v{b['version']}   ·   replaced {format_time(b['stamp'])}   ·   {b['size'] // 1024} KB")
         box.selection_set(0)
-        status = tk.Label(win, text="", bg=BG_PANEL, fg=FG_MUTED, font=(CHAT_FONT[0], 9), wraplength=420, justify="left")
+        status = tk.Label(win, text="", bg=BG_PANEL, fg=FG_MUTED, font=fnt(9), wraplength=px(420), justify="left")
         status.pack(anchor="w", pady=(8, 0))
         buttons = tk.Frame(win, bg=BG_PANEL)
         buttons.pack(fill="x", pady=(10, 0))
@@ -6193,7 +7182,7 @@ class ChatApp(tk.Tk):
         self._announce_shown_seq = seq
         self._cancel_timer("announce_flash")
         self.announce_label.configure(text=("🚨 " if urgent else "📢 ") + text)
-        self._paint_announce(BTN_RED if urgent else COLOR_PALETTE["blue"], "white")
+        self._paint_announce(BTN_RED if urgent else ACCENT, "white")
         anchor = self.notice_bar if self.notice_bar.winfo_ismapped() else (self.chat_frame if self.chat_frame.winfo_ismapped() else self.connect_frame)
         try: self.announce_bar.pack(side="top", fill="x", before=anchor)
         except tk.TclError: self.announce_bar.pack(side="top", fill="x")
@@ -6223,12 +7212,12 @@ class ChatApp(tk.Tk):
         win = self._open_dialog("announcements", "Announcements", padx=24, pady=20)
         if win is None:
             return
-        tk.Label(win, text="📢  Announcements", bg=BG_PANEL, fg=FG_TEXT, font=(CHAT_FONT[0], 14, "bold")).pack(anchor="w")
-        body = tk.Label(win, text="", bg=BG_PANEL, fg=FG_TEXT, font=CHAT_FONT, wraplength=420, justify="left")
+        tk.Label(win, text="📢  Announcements", bg=BG_PANEL, fg=FG_TEXT, font=fnt(14, "bold")).pack(anchor="w")
+        body = tk.Label(win, text="", bg=BG_PANEL, fg=FG_TEXT, font=CHAT_FONT, wraplength=px(420), justify="left")
         body.pack(anchor="w", pady=(10, 0))
-        meta = tk.Label(win, text="", bg=BG_PANEL, fg=FG_MUTED, font=(CHAT_FONT[0], 9), justify="left")
+        meta = tk.Label(win, text="", bg=BG_PANEL, fg=FG_MUTED, font=fnt(9), justify="left")
         meta.pack(anchor="w", pady=(8, 0))
-        message = tk.Label(win, text="", bg=BG_PANEL, fg=FG_MUTED, font=(CHAT_FONT[0], 9))
+        message = tk.Label(win, text="", bg=BG_PANEL, fg=FG_MUTED, font=fnt(9))
         message.pack(anchor="w", pady=(4, 0))
 
         def render():
@@ -6251,7 +7240,7 @@ class ChatApp(tk.Tk):
 
         buttons = tk.Frame(win, bg=BG_PANEL)
         buttons.pack(anchor="e", pady=(14, 0))
-        make_button(buttons, "🔄 Refresh", refresh, bg=COLOR_PALETTE["blue"], hover_bg=BTN_BLUE_HOVER, padx=14, pady=5).pack(side="left", padx=(0, 8))
+        make_button(buttons, "🔄 Refresh", refresh, bg=ACCENT, hover_bg=ACCENT_HOVER, padx=14, pady=5).pack(side="left", padx=(0, 8))
         make_button(buttons, "Close", lambda: self._close_popup("announcements"), bg=BTN_NEUTRAL, hover_bg=BTN_NEUTRAL_HOVER, padx=14, pady=5).pack(side="left")
         render()
 
@@ -6272,17 +7261,17 @@ class ChatApp(tk.Tk):
         win = self._open_dialog("announce_editor", "Publish an announcement", padx=24, pady=20)
         if win is None:
             return
-        tk.Label(win, text="📢  Publish an announcement", bg=BG_PANEL, fg=FG_TEXT, font=(CHAT_FONT[0], 14, "bold")).pack(anchor="w")
-        live = tk.Label(win, text="", bg=BG_PANEL, fg=FG_MUTED, font=(CHAT_FONT[0], 9), wraplength=440, justify="left")
+        tk.Label(win, text="📢  Publish an announcement", bg=BG_PANEL, fg=FG_TEXT, font=fnt(14, "bold")).pack(anchor="w")
+        live = tk.Label(win, text="", bg=BG_PANEL, fg=FG_MUTED, font=fnt(9), wraplength=px(440), justify="left")
         live.pack(anchor="w", pady=(4, 8))
         box = tk.Text(win, width=58, height=5, wrap="word", bg=BG_INPUT, fg=FG_TEXT, insertbackground=FG_TEXT, relief="flat", font=CHAT_FONT, padx=6, pady=4)
         box.pack(anchor="w")
-        counter = tk.Label(win, text="", bg=BG_PANEL, fg=FG_MUTED, font=(CHAT_FONT[0], 8))
+        counter = tk.Label(win, text="", bg=BG_PANEL, fg=FG_MUTED, font=fnt(8))
         counter.pack(anchor="e")
         urgent_var = tk.BooleanVar(value=False)
         tk.Checkbutton(win, text="🚨 Urgent — flashes red, jumps to the front (even on Do Not Disturb) and arrives within about 2 minutes",
                        variable=urgent_var, bg=BG_PANEL, fg=FG_TEXT, selectcolor=BG_INPUT, activebackground=BG_PANEL, activeforeground=FG_TEXT,
-                       font=CHAT_FONT, wraplength=440, justify="left", cursor="hand2").pack(anchor="w", pady=(6, 4))
+                       font=CHAT_FONT, wraplength=px(440), justify="left", cursor="hand2").pack(anchor="w", pady=(6, 4))
         hours_var = tk.IntVar(value=0)
         row = tk.Frame(win, bg=BG_PANEL)
         row.pack(anchor="w")
@@ -6290,7 +7279,7 @@ class ChatApp(tk.Tk):
         for text, value in (("1 hour", 1), ("1 day", 24), ("7 days", 168), ("until I clear it", 0)):
             tk.Radiobutton(row, text=text, variable=hours_var, value=value, bg=BG_PANEL, fg=FG_TEXT, selectcolor=BG_INPUT, activebackground=BG_PANEL,
                            activeforeground=FG_TEXT, font=CHAT_FONT, cursor="hand2").pack(side="left", padx=(0, 8))
-        status = tk.Label(win, text="", bg=BG_PANEL, fg=FG_MUTED, font=CHAT_FONT, wraplength=440, justify="left")
+        status = tk.Label(win, text="", bg=BG_PANEL, fg=FG_MUTED, font=CHAT_FONT, wraplength=px(440), justify="left")
         status.pack(anchor="w", pady=(10, 0))
         buttons = tk.Frame(win, bg=BG_PANEL)
         buttons.pack(anchor="e", pady=(8, 0))
@@ -6341,7 +7330,7 @@ class ChatApp(tk.Tk):
             status.configure(text="Clearing…", fg=FG_MUTED)
             self._run_bg(lambda: worker_call("/announcement/clear", body={}, password=password), lambda result: show_result(result, "Cleared ✔"))
 
-        make_button(buttons, "Publish", publish, bg=COLOR_PALETTE["blue"], hover_bg=BTN_BLUE_HOVER, padx=16, pady=5).pack(side="left", padx=(0, 8))
+        make_button(buttons, "Publish", publish, bg=ACCENT, hover_bg=ACCENT_HOVER, padx=16, pady=5).pack(side="left", padx=(0, 8))
         make_button(buttons, "Clear announcement", clear, bg=BTN_RED, hover_bg=BTN_RED_HOVER, padx=14, pady=5).pack(side="left", padx=(0, 8))
         make_button(buttons, "Close", lambda: self._close_popup("announce_editor"), bg=BTN_NEUTRAL, hover_bg=BTN_NEUTRAL_HOVER, padx=14, pady=5).pack(side="left")
         box.focus_set()
@@ -6352,12 +7341,12 @@ class ChatApp(tk.Tk):
         popup = self._open_dialog("reports_menu", "Reports", padx=24, pady=20)
         if popup is None:
             return
-        tk.Label(popup, text="💡  Reports", bg=BG_PANEL, fg=FG_TEXT, font=(CHAT_FONT[0], 14, "bold")).pack(anchor="w")
-        tk.Label(popup, text="Found a bug, or have an idea? Or see how the ones you sent are getting on.", bg=BG_PANEL, fg=FG_MUTED, font=CHAT_FONT, wraplength=340, justify="left").pack(anchor="w", pady=(6, 14))
+        tk.Label(popup, text="💡  Reports", bg=BG_PANEL, fg=FG_TEXT, font=fnt(14, "bold")).pack(anchor="w")
+        tk.Label(popup, text="Found a bug, or have an idea? Or see how the ones you sent are getting on.", bg=BG_PANEL, fg=FG_MUTED, font=CHAT_FONT, wraplength=px(340), justify="left").pack(anchor="w", pady=(6, 14))
         def choose(action):
             self._close_popup("reports_menu")
             action()
-        make_button(popup, "📝  Send a bug report or suggestion", lambda: choose(self._open_report_dialog), bg=COLOR_PALETTE["blue"], hover_bg=BTN_BLUE_HOVER, padx=16, pady=8).pack(fill="x")
+        make_button(popup, "📝  Send a bug report or suggestion", lambda: choose(self._open_report_dialog), bg=ACCENT, hover_bg=ACCENT_HOVER, padx=16, pady=8).pack(fill="x")
         make_button(popup, "📂  My previous reports", lambda: choose(self._open_my_reports_window), bg=BTN_NEUTRAL, hover_bg=BTN_NEUTRAL_HOVER, padx=16, pady=8).pack(fill="x", pady=(8, 0))
         make_button(popup, "Close", lambda: self._close_popup("reports_menu"), bg=BTN_NEUTRAL, hover_bg=BTN_NEUTRAL_HOVER, padx=16, pady=5).pack(anchor="e", pady=(14, 0))
 
@@ -6368,14 +7357,14 @@ class ChatApp(tk.Tk):
             return
         top = tk.Frame(win, bg=BG_PANEL)
         top.pack(fill="x")
-        tk.Label(top, text="📂  My previous reports", bg=BG_PANEL, fg=FG_TEXT, font=(CHAT_FONT[0], 13, "bold")).pack(side="left")
-        info = tk.Label(win, text="", bg=BG_PANEL, fg=FG_MUTED, font=(CHAT_FONT[0], 9), anchor="w", justify="left", wraplength=600)
+        tk.Label(top, text="📂  My previous reports", bg=BG_PANEL, fg=FG_TEXT, font=fnt(13, "bold")).pack(side="left")
+        info = tk.Label(win, text="", bg=BG_PANEL, fg=FG_MUTED, font=fnt(9), anchor="w", justify="left", wraplength=px(600))
         info.pack(fill="x", pady=(4, 6))
-        listbox = tk.Listbox(win, width=86, height=9, bg=BG_INPUT, fg=FG_TEXT, selectbackground=COLOR_PALETTE["blue"], relief="flat", font=CHAT_FONT, activestyle="none", exportselection=False)
+        listbox = tk.Listbox(win, width=86, height=9, bg=BG_INPUT, fg=FG_TEXT, selectbackground=ACCENT, relief="flat", font=CHAT_FONT, activestyle="none", exportselection=False)
         listbox.pack(fill="x")
         detail = tk.Text(win, width=86, height=9, wrap="word", bg=BG_INPUT, fg=FG_TEXT, relief="flat", font=CHAT_FONT, padx=8, pady=6, state="disabled")
         detail.pack(fill="both", expand=True, pady=(8, 0))
-        message = tk.Label(win, text="", bg=BG_PANEL, fg=FG_MUTED, font=(CHAT_FONT[0], 9), anchor="w")
+        message = tk.Label(win, text="", bg=BG_PANEL, fg=FG_MUTED, font=fnt(9), anchor="w")
         message.pack(fill="x", pady=(6, 0))
         buttons = tk.Frame(win, bg=BG_PANEL)
         buttons.pack(fill="x", pady=(6, 0))
@@ -6448,7 +7437,7 @@ class ChatApp(tk.Tk):
                 message.configure(text="Copied.", fg=FG_MUTED)
 
         listbox.bind("<<ListboxSelect>>", show_selected)
-        make_button(buttons, "🔄 Refresh", refresh_clicked, bg=COLOR_PALETTE["blue"], hover_bg=BTN_BLUE_HOVER, padx=14, pady=5).pack(side="left", padx=(0, 8))
+        make_button(buttons, "🔄 Refresh", refresh_clicked, bg=ACCENT, hover_bg=ACCENT_HOVER, padx=14, pady=5).pack(side="left", padx=(0, 8))
         make_button(buttons, "Copy", copy, bg=BTN_NEUTRAL, hover_bg=BTN_NEUTRAL_HOVER, padx=14, pady=5).pack(side="left", padx=(0, 8))
         make_button(buttons, "New report", lambda: (self._close_popup("my_reports"), self._open_report_dialog()), bg=BTN_NEUTRAL, hover_bg=BTN_NEUTRAL_HOVER, padx=14, pady=5).pack(side="left", padx=(0, 8))
         make_button(buttons, "Close", lambda: self._close_popup("my_reports"), bg=BTN_NEUTRAL, hover_bg=BTN_NEUTRAL_HOVER, padx=14, pady=5).pack(side="left")
@@ -6548,14 +7537,14 @@ class ChatApp(tk.Tk):
         if popup is None:
             return
         word = "suggestion" if report["kind"] == "feature" else "bug report"
-        tk.Label(popup, text=f"✔  Thanks — your {word} is saved", bg=BG_PANEL, fg=COLOR_PALETTE["green"], font=(CHAT_FONT[0], 14, "bold")).pack(anchor="w")
+        tk.Label(popup, text=f"✔  Thanks — your {word} is saved", bg=BG_PANEL, fg=COLOR_PALETTE["green"], font=fnt(14, "bold")).pack(anchor="w")
         if delivered:
             note = "It's been sent to the developer."
         elif attempted:
             note = "It's saved on this computer, but couldn't be sent to the developer just now (offline, or the network is blocking it)."
         else:
             note = "It's saved on this computer."
-        tk.Label(popup, text=note, bg=BG_PANEL, fg=FG_TEXT, font=CHAT_FONT, wraplength=380, justify="left").pack(anchor="w", pady=(8, 0))
+        tk.Label(popup, text=note, bg=BG_PANEL, fg=FG_TEXT, font=CHAT_FONT, wraplength=px(380), justify="left").pack(anchor="w", pady=(8, 0))
         buttons = tk.Frame(popup, bg=BG_PANEL)
         buttons.pack(anchor="e", pady=(14, 0))
         def copy():
@@ -6564,7 +7553,7 @@ class ChatApp(tk.Tk):
             copy_btn.label.configure(text="Copied ✔")
         copy_btn = make_button(buttons, "Copy report", copy, bg=BTN_NEUTRAL, hover_bg=BTN_NEUTRAL_HOVER, padx=14, pady=5)
         copy_btn.pack(side="left", padx=(0, 8))
-        make_button(buttons, "Close", lambda: self._close_popup("report_done"), bg=COLOR_PALETTE["blue"], hover_bg=BTN_BLUE_HOVER, padx=18, pady=5).pack(side="left")
+        make_button(buttons, "Close", lambda: self._close_popup("report_done"), bg=ACCENT, hover_bg=ACCENT_HOVER, padx=18, pady=5).pack(side="left")
         popup.lift()
 
     def _run_bg(self, work, done):
@@ -6589,7 +7578,7 @@ class ChatApp(tk.Tk):
         popup = self._open_dialog("reports_login", "Report inbox", padx=24, pady=20)
         if popup is None:
             return "break"
-        tk.Label(popup, text="🔒  Report inbox", bg=BG_PANEL, fg=FG_TEXT, font=(CHAT_FONT[0], 14, "bold")).pack(anchor="w")
+        tk.Label(popup, text="🔒  Report inbox", bg=BG_PANEL, fg=FG_TEXT, font=fnt(14, "bold")).pack(anchor="w")
         tk.Label(popup, text="Password", bg=BG_PANEL, fg=FG_MUTED, font=CHAT_FONT).pack(anchor="w", pady=(10, 2))
         entry = tk.Entry(popup, show="•", width=30, bg=BG_INPUT, fg=FG_TEXT, insertbackground=FG_TEXT, relief="flat", font=CHAT_FONT)
         entry.pack(anchor="w", ipady=3)
@@ -6637,7 +7626,7 @@ class ChatApp(tk.Tk):
             else:
                 fail("Wrong password.")
         entry.bind("<Return>", submit)
-        make_button(popup, "Open", submit, bg=COLOR_PALETTE["blue"], hover_bg=BTN_BLUE_HOVER, padx=18, pady=5).pack(anchor="e", pady=(8, 0))
+        make_button(popup, "Open", submit, bg=ACCENT, hover_bg=ACCENT_HOVER, padx=18, pady=5).pack(anchor="e", pady=(8, 0))
         entry.focus_set()
         return "break"
 
@@ -6657,8 +7646,8 @@ class ChatApp(tk.Tk):
             tk.Radiobutton(top, text=text, variable=show_var, value=value, bg=BG_PANEL, fg=FG_TEXT, selectcolor=BG_INPUT, activebackground=BG_PANEL,
                            activeforeground=FG_TEXT, font=CHAT_FONT, cursor="hand2", command=lambda: refresh()).pack(side="left", padx=(0, 10))
         if note:
-            tk.Label(win, text=note, bg=BG_PANEL, fg=self.STATUS_COLORS["error"], font=(CHAT_FONT[0], 9), wraplength=620, justify="left").pack(anchor="w", pady=(6, 0))
-        listbox = tk.Listbox(win, width=86, height=10, bg=BG_INPUT, fg=FG_TEXT, selectbackground=COLOR_PALETTE["blue"], relief="flat", font=CHAT_FONT, activestyle="none", exportselection=False)
+            tk.Label(win, text=note, bg=BG_PANEL, fg=self.STATUS_COLORS["error"], font=fnt(9), wraplength=px(620), justify="left").pack(anchor="w", pady=(6, 0))
+        listbox = tk.Listbox(win, width=86, height=10, bg=BG_INPUT, fg=FG_TEXT, selectbackground=ACCENT, relief="flat", font=CHAT_FONT, activestyle="none", exportselection=False)
         listbox.pack(fill="x", pady=(8, 8))
         detail = tk.Text(win, width=86, height=12, wrap="word", bg=BG_INPUT, fg=FG_TEXT, relief="flat", font=CHAT_FONT, padx=8, pady=6, state="disabled")
         detail.pack(fill="both", expand=True)
@@ -6671,7 +7660,7 @@ class ChatApp(tk.Tk):
                 self._set_report_alerts(alerts_var.get(), password=password, baseline=newest)
             tk.Checkbutton(win, text="Tell me when a new report arrives (saves the inbox password on this computer)", variable=alerts_var, command=alerts_toggled,
                            bg=BG_PANEL, fg=FG_MUTED, selectcolor=BG_INPUT, activebackground=BG_PANEL, activeforeground=FG_TEXT,
-                           font=(CHAT_FONT[0], 9), cursor="hand2").pack(anchor="w", pady=(8, 0))
+                           font=fnt(9), cursor="hand2").pack(anchor="w", pady=(8, 0))
         shown = []
 
         def all_items():
@@ -6818,12 +7807,12 @@ class ChatApp(tk.Tk):
         popup = self._open_dialog(name, heading, padx=24, pady=20)
         if popup is None:
             return
-        tk.Label(popup, text=heading, bg=BG_PANEL, fg=color, font=(CHAT_FONT[0], 14, "bold")).pack(anchor="w")
-        tk.Label(popup, text=localize_times(message), bg=BG_PANEL, fg=FG_TEXT, font=CHAT_FONT, wraplength=400, justify="left").pack(anchor="w", pady=(10, 0))
+        tk.Label(popup, text=heading, bg=BG_PANEL, fg=color, font=fnt(14, "bold")).pack(anchor="w")
+        tk.Label(popup, text=localize_times(message), bg=BG_PANEL, fg=FG_TEXT, font=CHAT_FONT, wraplength=px(400), justify="left").pack(anchor="w", pady=(10, 0))
         buttons = tk.Frame(popup, bg=BG_PANEL)
         buttons.pack(anchor="e", pady=(16, 0))
         if appeal_button and self._ban_ctx:
-            make_button(buttons, "Appeal", lambda: (self._close_popup(name), self._open_ban_appeal()), bg=COLOR_PALETTE["blue"], hover_bg=BTN_BLUE_HOVER, padx=16, pady=5).pack(side="left", padx=(0, 8))
+            make_button(buttons, "Appeal", lambda: (self._close_popup(name), self._open_ban_appeal()), bg=ACCENT, hover_bg=ACCENT_HOVER, padx=16, pady=5).pack(side="left", padx=(0, 8))
         make_button(buttons, "OK", lambda: self._close_popup(name), bg=BTN_NEUTRAL, hover_bg=BTN_NEUTRAL_HOVER, padx=18, pady=5).pack(side="left")
         self._raise_for_attention(popup)
 
@@ -6844,8 +7833,127 @@ class ChatApp(tk.Tk):
         self._set_ban_context(ctx)
         self._teardown_connection()
 
+    # ---- banned from the whole app (the publisher's /globalban) ----
+
+    def _global_ban_tick(self):
+        """Every 20 seconds: ask the report server one tiny question (\"has the ban list changed?\") and only read the whole
+        list when it has. Also lifts a ban that has run out, without asking anyone."""
+        self._set_timer("gban_tick", GLOBAL_BAN_BEACON_SECONDS * 1000, self._global_ban_tick)
+        self._evaluate_global_ban()
+        if self._gban_seq_seen is None or report_server() is None:
+            return self._fetch_global_bans()
+        def got(result):
+            code, data = result if isinstance(result, tuple) else (None, None)
+            if code == 200 and isinstance(data, dict) and data.get("seq") != self._gban_seq_seen:
+                self._fetch_global_bans()
+        self._run_bg(lambda: worker_call("/bans/beacon", timeout=6), got)
+
+    def _fetch_global_bans(self):
+        def done(result):
+            if not isinstance(result, dict):
+                return   # couldn't read it (offline, server down): carry on with what we had — and ask again next time
+            self._gban_seq_seen = result["seq"]
+            self._gban_entries, self._gban_skew = result["entries"], result["skew"]
+            save_global_bans_cache(result)
+            self._evaluate_global_ban()
+        self._run_bg(fetch_global_bans, done)
+
+    def _evaluate_global_ban(self):
+        entry = global_ban_match(self._gban_entries, get_machine_fingerprint(), time.time() + self._gban_skew) if self._gban_entries else None
+        if entry is not None and entry != self._gban_entry:
+            self._show_global_ban(entry)
+        elif entry is None and self._gban_entry is not None:
+            self._hide_global_ban()
+
+    def _show_global_ban(self, entry):
+        """Takes this device out of the app at once: leaves any chat (a host's room closes), closes every window, and covers the
+        screen with who banned it for what, and until when."""
+        self._gban_entry = entry
+        if self.connection is not None:
+            self._return_to_connect_screen("This device has been banned from chat_gui.", "error")
+        self._set_connecting(False)
+        for name in list(self._popups):
+            self._close_popup(name)
+        for win in list(self._game_wins.values()):
+            try: win.destroy()
+            except tk.TclError: pass
+        if self._gban_overlay is not None:
+            try: self._gban_overlay.destroy()
+            except tk.TclError: pass
+        overlay = tk.Frame(self, bg=BG_DARK)
+        overlay.place(x=0, y=0, relwidth=1, relheight=1)
+        card = tk.Frame(overlay, bg=BG_PANEL, padx=px(40), pady=px(32))
+        card.place(relx=0.5, rely=0.5, anchor="center")
+        tk.Label(card, text="🚫  You've been banned from chat_gui", bg=BG_PANEL, fg=COLOR_PALETTE["red"], font=fnt(16, "bold")).pack()
+        tk.Label(card, text="This device can't use the app while the ban is in place.", bg=BG_PANEL, fg=FG_TEXT, font=CHAT_FONT).pack(pady=(10, 14))
+        for label, value in (("Reason", entry.get("reason") or "no reason given"), ("Banned until", global_ban_until_text(entry, self._gban_skew))):
+            row = tk.Frame(card, bg=BG_PANEL)
+            row.pack(anchor="w", pady=2)
+            tk.Label(row, text=f"{label}:", bg=BG_PANEL, fg=FG_MUTED, font=BOLD_FONT).pack(side="left")
+            tk.Label(row, text=f" {value}", bg=BG_PANEL, fg=FG_TEXT, font=CHAT_FONT, wraplength=px(380), justify="left").pack(side="left")
+        tk.Label(card, text=f"Device ID: {entry.get('fingerprint', '')}", bg=BG_PANEL, fg=FG_MUTED, font=fnt(8)).pack(pady=(14, 0))
+        make_button(card, "Close app", self.on_close, bg=BTN_RED, hover_bg=BTN_RED_HOVER, padx=22, pady=6).pack(pady=(14, 0))
+        overlay.lift()
+        self._gban_overlay = overlay
+        self.bell()
+        notify_toast("Banned from chat_gui", f"Reason: {entry.get('reason') or 'no reason given'}", root=self)
+        self._raise_for_attention(force=True)
+
+    def _hide_global_ban(self):
+        self._gban_entry = None
+        if self._gban_overlay is not None:
+            try: self._gban_overlay.destroy()
+            except tk.TclError: pass
+            self._gban_overlay = None
+        notify_toast("chat_gui", "Your ban has ended — you can use the app again.", root=self)
+        self._focus_first_empty()
+
+    def _handle_global_ban_command(self, cmd: str, arg: str):
+        """/globalban, /unglobalban, /globalbans — the publisher only (it needs the signing key file, and the admin password to publish)."""
+        if _load_local_signing_key() is None:
+            return self.append_system_line("This command requires the signing key file, which only the app's publisher has.")
+        if report_server() is None:
+            return self.append_system_line("No report server is set (REPORT_WORKER_URL), so there's nowhere to publish the ban list.")
+        hub = self.connection.hub if isinstance(self.connection, HostConnection) else None
+        lookup = (lambda token: hub.find_device(token)) if hub is not None else None
+
+        def run(password):
+            def done(result):
+                if isinstance(result, Exception):
+                    return self.append_system_line(f"Something went wrong: {result}")
+                text, kick, bad_password = result
+                if bad_password:
+                    self._gban_pw = None
+                self.append_system_line(text)
+                if kick:
+                    self._fetch_global_bans()   # this computer too, straight away
+                    if hub is not None:  # carry it out in this room right now; their own app does the rest the moment it hears
+                        sock = hub._find_socket(lambda info: info.get("fingerprint") == kick["fp"])
+                        if sock is not None:
+                            hub.eject(sock, BAN_NOTICE_PREFIX + make_ban_notice(kick["until"], GLOBAL_BAN_REASON_PREFIX + kick["reason"], hub.host_name),
+                                      f"* {kick['name']} has been banned from chat_gui *")
+                elif cmd == "/unglobalban":
+                    self._fetch_global_bans()
+            self._run_bg(lambda: run_global_ban_command(cmd, arg, lookup, password), done)
+
+        if cmd == "/globalbans":
+            return run(None)
+        password = self.settings.get("report_admin_key") or self._gban_pw
+        if password:
+            return run(password)
+        def verify(pw):
+            code, data = worker_call("/bans/admin", password=pw)
+            if code == 200 and isinstance(data, dict): return True, data
+            return False, "Wrong password." if code == 401 else "Couldn't reach the server."
+        def accepted(pw, _data):
+            self._gban_pw = pw
+            run(pw)
+        self._ask_admin_password("gban_login", "Global ban", verify, accepted)
+
     def _on_banned_live(self, payload):
         """We were banned while in the chat. Remember how to reach the host so the appeal works."""
+        if GLOBAL_BAN_REASON_PREFIX in str(payload.get("message", "")):
+            self._fetch_global_bans()   # the publisher banned this device from the whole app: read the list now
         conn = self.connection
         ctx = None
         if isinstance(conn, GuestConnection):
@@ -6910,12 +8018,12 @@ class ChatApp(tk.Tk):
         popup = self._open_dialog(dialog_name, title, padx=20, pady=16)
         if popup is None:
             return
-        tk.Label(popup, text=title, bg=BG_PANEL, fg=FG_TEXT, font=(CHAT_FONT[0], 14, "bold")).pack(anchor="w")
-        tk.Label(popup, text=intro, bg=BG_PANEL, fg=FG_MUTED, font=CHAT_FONT, wraplength=470, justify="left").pack(anchor="w", pady=(4, 6))
+        tk.Label(popup, text=title, bg=BG_PANEL, fg=FG_TEXT, font=fnt(14, "bold")).pack(anchor="w")
+        tk.Label(popup, text=intro, bg=BG_PANEL, fg=FG_MUTED, font=CHAT_FONT, wraplength=px(470), justify="left").pack(anchor="w", pady=(4, 6))
         getters = []
         for item in questions:
             kind, question = item[0], item[1]
-            tk.Label(popup, text=question, bg=BG_PANEL, fg=FG_TEXT, font=BOLD_FONT, wraplength=470, justify="left", anchor="w").pack(fill="x", pady=(8, 2))
+            tk.Label(popup, text=question, bg=BG_PANEL, fg=FG_TEXT, font=BOLD_FONT, wraplength=px(470), justify="left", anchor="w").pack(fill="x", pady=(8, 2))
             if kind == "text":
                 box = tk.Text(popup, height=2, width=58, bg=BG_INPUT, fg=FG_TEXT, insertbackground=FG_TEXT, relief="flat", font=CHAT_FONT, wrap="word")
                 box.pack(fill="x")
@@ -7178,9 +8286,9 @@ class ChatApp(tk.Tk):
         if popup is None:
             return
         self._warn_view = number
-        tk.Label(popup, text="⚠  You have been warned", bg=BG_PANEL, fg=COLOR_PALETTE["red"], font=(CHAT_FONT[0], 14, "bold")).pack(anchor="w")
+        tk.Label(popup, text="⚠  You have been warned", bg=BG_PANEL, fg=COLOR_PALETTE["red"], font=fnt(14, "bold")).pack(anchor="w")
         tk.Label(popup, text=f"By {by}   ·   warning #{count}", bg=BG_PANEL, fg=FG_MUTED, font=CHAT_FONT).pack(anchor="w", pady=(6, 10))
-        tk.Label(popup, text=reason, bg=BG_PANEL, fg=FG_TEXT, font=CHAT_FONT, wraplength=380, justify="left").pack(anchor="w")
+        tk.Label(popup, text=reason, bg=BG_PANEL, fg=FG_TEXT, font=CHAT_FONT, wraplength=px(380), justify="left").pack(anchor="w")
         buttons = tk.Frame(popup, bg=BG_PANEL)
         buttons.pack(anchor="e", pady=(16, 0))
         if warning["state"] == "rejected":
@@ -7188,12 +8296,12 @@ class ChatApp(tk.Tk):
         elif count in self._appealed_warnings:
             tk.Label(popup, text="Appeal sent ✔ — the host and admins have it.", bg=BG_PANEL, fg=COLOR_PALETTE["green"], font=CHAT_FONT).pack(anchor="w", pady=(10, 0))
         else:
-            make_button(buttons, "Appeal", lambda: self._open_warning_appeal(count, by, reason), bg=COLOR_PALETTE["blue"], hover_bg=BTN_BLUE_HOVER, padx=16, pady=5).pack(side="left", padx=(0, 8))
+            make_button(buttons, "Appeal", lambda: self._open_warning_appeal(count, by, reason), bg=ACCENT, hover_bg=ACCENT_HOVER, padx=16, pady=5).pack(side="left", padx=(0, 8))
         make_button(buttons, "Close", lambda: self._close_popup("warning_view"), bg=BTN_NEUTRAL, hover_bg=BTN_NEUTRAL_HOVER, padx=18, pady=5).pack(side="left")
         others = [n for n in sorted(self._warnings) if n != count]
         if others:
-            tk.Label(popup, text="You also have: " + ", ".join(f"#{n}" for n in others) + " — click the ⚠ button to look at them.", bg=BG_PANEL, fg=FG_MUTED, font=(CHAT_FONT[0], 9)).pack(anchor="w", pady=(10, 0))
-        tk.Label(popup, text="Closing this is fine — the ⚠ button at the top of the chat brings it back, and /warnings lists them all.", bg=BG_PANEL, fg=FG_MUTED, font=(CHAT_FONT[0], 8)).pack(anchor="w", pady=(6, 0))
+            tk.Label(popup, text="You also have: " + ", ".join(f"#{n}" for n in others) + " — click the ⚠ button to look at them.", bg=BG_PANEL, fg=FG_MUTED, font=fnt(9)).pack(anchor="w", pady=(10, 0))
+        tk.Label(popup, text="Closing this is fine — the ⚠ button at the top of the chat brings it back, and /warnings lists them all.", bg=BG_PANEL, fg=FG_MUTED, font=fnt(8)).pack(anchor="w", pady=(6, 0))
         popup.lift()
 
     def _on_warn_state(self, payload):
@@ -7313,6 +8421,9 @@ class ChatApp(tk.Tk):
             self.dnd_btn.bind(bind, lambda e: self.on_dnd_keybind_picker())
             self.dnd_btn.label.bind(bind, lambda e: self.on_dnd_keybind_picker())
 
+        self.appearance_btn = make_button(top, "🎨", self._open_appearance, bg=BTN_NEUTRAL, hover_bg=BTN_NEUTRAL_HOVER, padx=10, pady=5)
+        self.appearance_btn.pack(side="right", padx=(12, 0), pady=6)
+
         self.warn_btn = make_button(top, "⚠ Warning", self._on_warn_btn_clicked, bg=self.WARN_YELLOW[0], hover_bg=self.WARN_YELLOW[1], padx=12, pady=5)  # shown by _refresh_warn_button
 
         body = tk.Frame(self.chat_frame, bg=BG_DARK)  # packed last — see the end of this method
@@ -7324,15 +8435,16 @@ class ChatApp(tk.Tk):
         # anything drawn over the Text too — smearing the button up the screen. Nothing overlaps the log now.
         self.jump_bar = tk.Frame(log_col, bg=BG_DARK)
         self.jump_bar.pack(side="bottom", fill="x")
-        self.log = scrolledtext.ScrolledText(log_col, bg=BG_DARK, fg=FG_TEXT, insertbackground=FG_TEXT, relief="flat", state="disabled", wrap="word", padx=10, pady=8, font=CHAT_FONT, highlightthickness=0, bd=0)
+        self.log = ScrolledText(log_col, bg=BG_DARK, fg=FG_TEXT, insertbackground=FG_TEXT, relief="flat", state="disabled", wrap="word", padx=px(12), pady=px(8), font=CHAT_FONT, highlightthickness=0, bd=0, width=10, height=5,
+                              spacing1=(0 if sys.platform == "darwin" else 2), spacing3=(0 if sys.platform == "darwin" else 2))
         self.log.pack(side="top", fill="both", expand=True)
-        self.log.tag_configure("system", foreground=FG_MUTED, font=(CHAT_FONT[0], 9, "italic"))
+        self.log.tag_configure("system", foreground=FG_MUTED, font=fnt(9, "italic"))
         self.log.tag_configure("private", foreground=COLOR_PALETTE["yellow"])
-        self.log.tag_configure("timestamp", foreground=FG_MUTED, font=(CHAT_FONT[0], 8))
-        self.log.tag_configure("reaction_style", foreground=COLOR_PALETTE["yellow"], font=(CHAT_FONT[0], 9))
-        self.log.tag_configure("edited_mark", foreground=FG_MUTED, font=(CHAT_FONT[0], 8, "italic"))
-        self.log.tag_configure("deleted_mark", foreground=FG_MUTED, font=(CHAT_FONT[0], 9, "italic"))
-        self.log.tag_configure("quote", foreground=FG_MUTED, font=(CHAT_FONT[0], 9, "italic"))
+        self.log.tag_configure("timestamp", foreground=FG_MUTED, font=fnt(8))
+        self.log.tag_configure("reaction_style", foreground=COLOR_PALETTE["yellow"], font=fnt(9))
+        self.log.tag_configure("edited_mark", foreground=FG_MUTED, font=fnt(8, "italic"))
+        self.log.tag_configure("deleted_mark", foreground=FG_MUTED, font=fnt(9, "italic"))
+        self.log.tag_configure("quote", foreground=FG_MUTED, font=fnt(9, "italic"))
         self.log.tag_configure("flash", background=BTN_NEUTRAL)
         self.log.tag_configure("align_right", justify="right")
         self.log.tag_configure("align_left", justify="left")
@@ -7345,7 +8457,7 @@ class ChatApp(tk.Tk):
         # (also when the window is resized, which can put the end back in view).
         self.log.bind("<Configure>", lambda e: self.after_idle(self._sync_jump_btn), add="+")
 
-        self.jump_btn = tk.Label(self.jump_bar, text="↓ New messages", bg=COLOR_PALETTE["blue"], fg="white", font=(CHAT_FONT[0], 9, "bold"), padx=8, pady=2, cursor="hand2")
+        self.jump_btn = tk.Label(self.jump_bar, text="↓ New messages", bg=ACCENT, fg="white", font=fnt(9, "bold"), padx=8, pady=2, cursor="hand2")
         self.jump_btn.bind("<Button-1>", lambda e: self._scroll_to_bottom())
         # The wheel over the button would otherwise do nothing — pass it on to the log.
         for bind in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
@@ -7354,24 +8466,24 @@ class ChatApp(tk.Tk):
         # through the scrollbar callback, so the button can't miss the reader getting back to the bottom.
         self.log.configure(yscrollcommand=self._on_log_yscroll)
 
-        member_panel = tk.Frame(body, bg=BG_PANEL, width=160)
+        member_panel = tk.Frame(body, bg=BG_PANEL, width=px(160))
         member_panel.pack(side="right", fill="y")
         member_panel.pack_propagate(False)
-        tk.Label(member_panel, text="ONLINE", bg=BG_PANEL, fg=FG_MUTED, font=(CHAT_FONT[0], 8, "bold")).pack(anchor="w", padx=10, pady=(10, 4))
+        tk.Label(member_panel, text="ONLINE", bg=BG_PANEL, fg=FG_MUTED, font=fnt(8, "bold")).pack(anchor="w", padx=10, pady=(10, 4))
         self.member_list_frame = tk.Frame(member_panel, bg=BG_PANEL)
         self.member_list_frame.pack(fill="both", expand=True, padx=10)
 
         self.typing_var = tk.StringVar(value="")
-        self.typing_label = tk.Label(self.chat_frame, textvariable=self.typing_var, bg=BG_DARK, fg=FG_MUTED, font=(CHAT_FONT[0], 9, "italic"), anchor="w")
+        self.typing_label = tk.Label(self.chat_frame, textvariable=self.typing_var, bg=BG_DARK, fg=FG_MUTED, font=fnt(9, "italic"), anchor="w")
 
         self.upload_var = tk.StringVar(value="")
         self.upload_row = tk.Frame(self.chat_frame, bg=BG_DARK)  # packed only while a transfer is in progress
-        self.upload_label = tk.Label(self.upload_row, textvariable=self.upload_var, bg=BG_DARK, fg=COLOR_PALETTE["yellow"], font=(CHAT_FONT[0], 9, "bold"), anchor="w")
+        self.upload_label = tk.Label(self.upload_row, textvariable=self.upload_var, bg=BG_DARK, fg=COLOR_PALETTE["yellow"], font=fnt(9, "bold"), anchor="w")
         self.upload_label.pack(side="left", fill="x", expand=True)
-        self.cancel_upload_btn = make_button(self.upload_row, "✕ Cancel", self._cancel_uploads, bg=BTN_RED, hover_bg=BTN_RED_HOVER, padx=8, pady=1, font=(CHAT_FONT[0], 9, "bold"))
+        self.cancel_upload_btn = make_button(self.upload_row, "✕ Cancel", self._cancel_uploads, bg=BTN_RED, hover_bg=BTN_RED_HOVER, padx=8, pady=1, font=fnt(9, "bold"))
 
         self.mute_status_var = tk.StringVar(value="")
-        self.mute_label = tk.Label(self.chat_frame, textvariable=self.mute_status_var, bg=BG_DARK, fg=COLOR_PALETTE["red"], font=(CHAT_FONT[0], 9, "bold"), anchor="w")
+        self.mute_label = tk.Label(self.chat_frame, textvariable=self.mute_status_var, bg=BG_DARK, fg=COLOR_PALETTE["red"], font=fnt(9, "bold"), anchor="w")
 
         self.reply_bar = tk.Frame(self.chat_frame, bg=BG_PANEL)  # packed only while replying
         self.reply_label = tk.Label(self.reply_bar, text="", bg=BG_PANEL, fg=FG_TEXT, font=CHAT_FONT, anchor="w")
@@ -7392,7 +8504,7 @@ class ChatApp(tk.Tk):
         self.emoji_btn = tool_button("😀", self.on_emoji_picker)
 
         self.msg_entry = tk.Entry(self.bottom_bar, bg=BG_INPUT, fg=FG_TEXT, insertbackground=FG_TEXT, relief="flat", font=CHAT_FONT)
-        self.msg_entry.pack(side="left", fill="x", expand=True, ipady=6)
+        self.msg_entry.pack(side="left", fill="x", expand=True, ipady=px(6))
         self.msg_entry.bind("<Return>", self.on_send)
         self.msg_entry.bind("<KeyRelease>", self.on_entry_key)
         self.msg_entry.bind("<Tab>", self.on_tab_autocomplete)
@@ -7402,7 +8514,7 @@ class ChatApp(tk.Tk):
         self.msg_entry.bind("<<Paste>>", self._on_paste)  # Ctrl+V, Cmd+V and the right-click Paste all arrive as this
         self.msg_entry.bind("<FocusOut>", lambda e: self.after(150, self.destroy_suggestions))
 
-        self.send_btn = make_button(self.bottom_bar, "Send", self.on_send, bg=COLOR_PALETTE["blue"], hover_bg=BTN_BLUE_HOVER, padx=16, pady=6)
+        self.send_btn = make_button(self.bottom_bar, "Send", self.on_send, bg=ACCENT, hover_bg=ACCENT_HOVER, padx=16, pady=6)
         self.send_btn.pack(side="left", padx=(6, 0))
 
         # Pack order is how Tk shares out a short window: widgets packed first are satisfied first
@@ -7512,7 +8624,7 @@ class ChatApp(tk.Tk):
                 is_host = isinstance(self.connection, HostConnection)
                 commands = list(self.BASE_COMMANDS)
                 if self.is_admin: commands.extend(self.ADMIN_COMMANDS)
-                if is_host: commands.extend(("/ipban", "/rename"))
+                if is_host: commands.append("/rename")
                 suggestions = [c for c in commands if c.startswith(base_cmd)]
             elif len(words) == 2:
                 arg = words[1].lower()
@@ -7692,11 +8804,8 @@ class ChatApp(tk.Tk):
             self._handle_clear_command(text.split())
             return "break"
 
-        if first_word == "/globalban":
-            parts = text.split(maxsplit=2)
-            fingerprint = parts[1] if len(parts) > 1 else ""
-            reason = parts[2] if len(parts) > 2 else "no reason given"
-            self.append_system_line(perform_globalban(fingerprint, reason))
+        if first_word in ("/globalban", "/unglobalban", "/globalbans"):
+            self._handle_global_ban_command(first_word, text.partition(" ")[2].strip())
             return "break"
 
         self._remember_sent(text)
@@ -8033,9 +9142,9 @@ class ChatApp(tk.Tk):
         # Buttons first (packed at the bottom) so shrinking the window never hides Close.
         make_button(popup, "Close", lambda: self._close_popup("changelog"), bg=BTN_NEUTRAL, hover_bg=BTN_NEUTRAL_HOVER, padx=12, pady=5).pack(side="bottom", pady=(10, 0))
 
-        text = scrolledtext.ScrolledText(popup, width=64, height=20, bg=BG_INPUT, fg=FG_TEXT, font=CHAT_FONT, wrap="word", relief="flat", padx=8, pady=8)
+        text = ScrolledText(popup, width=64, height=20, bg=BG_INPUT, fg=FG_TEXT, font=CHAT_FONT, wrap="word", relief="flat", padx=8, pady=8)
         text.pack(fill="both", expand=True)
-        text.tag_configure("ver", font=(CHAT_FONT[0], CHAT_FONT[1], "bold"), foreground=COLOR_PALETTE["blue"])
+        text.tag_configure("ver", font=(CHAT_FONT[0], CHAT_FONT[1], "bold"), foreground=ACCENT)
 
         entries = full_changelog()
         if not entries:
@@ -8112,9 +9221,9 @@ class ChatApp(tk.Tk):
         if not manifest: return
         popup = self._open_dialog("update_notes", "What's new", padx=24, pady=20)
         if popup is None: return
-        tk.Label(popup, text=f"What's new in v{manifest.get('version', '?')}", bg=BG_PANEL, fg=FG_TEXT, font=(CHAT_FONT[0], 14, "bold")).pack(anchor="w")
-        tk.Label(popup, text=manifest.get("notes") or "(no notes for this release)", bg=BG_PANEL, fg=FG_TEXT, font=CHAT_FONT, wraplength=420, justify="left").pack(anchor="w", pady=(10, 0))
-        tk.Label(popup, text="It's signature-verified before anything is installed.", bg=BG_PANEL, fg=FG_MUTED, font=(CHAT_FONT[0], 9)).pack(anchor="w", pady=(10, 0))
+        tk.Label(popup, text=f"What's new in v{manifest.get('version', '?')}", bg=BG_PANEL, fg=FG_TEXT, font=fnt(14, "bold")).pack(anchor="w")
+        tk.Label(popup, text=manifest.get("notes") or "(no notes for this release)", bg=BG_PANEL, fg=FG_TEXT, font=CHAT_FONT, wraplength=px(420), justify="left").pack(anchor="w", pady=(10, 0))
+        tk.Label(popup, text="It's signature-verified before anything is installed.", bg=BG_PANEL, fg=FG_MUTED, font=fnt(9)).pack(anchor="w", pady=(10, 0))
         make_button(popup, "Close", lambda: self._close_popup("update_notes"), bg=BTN_NEUTRAL, hover_bg=BTN_NEUTRAL_HOVER, padx=18, pady=5).pack(anchor="e", pady=(14, 0))
 
     def _start_update_install(self):
@@ -8254,7 +9363,7 @@ class ChatApp(tk.Tk):
 
     def _picker_cell(self, parent, row, col, command, text=None, image=None, on_right=None, muted=False):
         cell = tk.Label(
-            parent, text=text, image=image, font=(CHAT_FONT[0], 9) if muted else BOLD_FONT, bg=BG_INPUT,
+            parent, text=text, image=image, font=fnt(9) if muted else BOLD_FONT, bg=BG_INPUT,
             fg=FG_MUTED if muted else FG_TEXT, padx=10, pady=10, cursor="hand2", bd=1, relief="solid",
         )
         cell.grid(row=row, column=col, padx=4, pady=4)
@@ -8289,7 +9398,7 @@ class ChatApp(tk.Tk):
 
         self._picker_cell(grid, row, col, self.on_upload_sticker, text="➕\nUpload", muted=True)
         if custom:
-            tk.Label(popup, text="Right-click a custom sticker to delete it", bg=BG_PANEL, fg=FG_MUTED, font=(CHAT_FONT[0], 8)).pack(pady=(4, 0))
+            tk.Label(popup, text="Right-click a custom sticker to delete it", bg=BG_PANEL, fg=FG_MUTED, font=fnt(8)).pack(pady=(4, 0))
 
     def _reopen_sticker_picker(self):
         self._close_popup("stickers")
@@ -8972,6 +10081,7 @@ class ChatApp(tk.Tk):
 
 
 def main():
+    enable_hidpi()   # before the first window exists
     app = ChatApp()
     app.mainloop()
 
