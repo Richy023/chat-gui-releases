@@ -1,6 +1,17 @@
 #!/usr/bin/env python3
 """
-chat_gui.py — v1.5.1 — ENCRYPTED instant messenger with a desktop GUI.
+chat_gui.py — v1.5.1a — ENCRYPTED instant messenger with a desktop GUI.
+
+Changes in 1.5.1a:
+- Global bans: someone banned from the whole app now gets one clear ban screen (no more stray room-ban notices or repeated
+  notifications) and can APPEAL it from that screen. The publisher gets an alert and decides with /globalappeals and
+  /globalappeal accept|reject; the banned person sees the decision, and the reason, on their screen. One appeal per ban.
+- Reports: a suggestion can now be rejected with a reason; a bug can be marked "More evidence required" or "Intended
+  feature" (as well as Completed). The sender is told, with the reason, and can see it in My previous reports.
+- Muting: a muted person who disconnects and rejoins is muted again only once, and unmuting them really clears it, even
+  if they rejoined under a different nickname. Their app is also told the moment a mute ends.
+- The emoji on the chat buttons no longer go missing on some Windows computers (the buttons now use an emoji font
+  directly, or show a word if the computer has none).
 
 Changes in 1.5.1:
 - Appearance (new): a 🎨 button in the chat, an "Appearance" link on the main menu, or Ctrl+Shift+T. Pick a theme
@@ -87,26 +98,6 @@ Changes in 1.5.0b:
   With more than one, clicking it opens a menu of them; pick one to see who warned you, why, its
   appeal status, and to appeal it. Warnings (and their appeal status) are remembered by the host,
   so they're still there if you leave and rejoin the chat.
-
-Changes in 1.5.0a:
-- Toast notifications for moderation outcomes: a warning appeal accepted or rejected, being banned,
-  a ban appeal rejected, and being unbanned (including by an accepted appeal). Not shown while
-  Do Not Disturb is on.
-- Warnings, mutes, kicks and bans now jump to the front of everything (even if the app was
-  minimised) with a notice window — unless you were on Do Not Disturb, in which case they wait
-  quietly until you next open the window, as before.
-- Fixed: times in mute / ban messages (and the admin log, /history and /appeals) were written in the
-  HOST's time zone, so they could be hours out for everyone else. They're now sent as a duration and
-  turned into your own local time on your own computer.
-- The ban message names the host ("…the chat hosted by Richy…") instead of their IP address.
-- The ⚠ button shows "appeal rejected" for 3 seconds after its flash, then goes back to
-  "⚠ Warning #N".
-- /warning is now /warnings: it lists your warnings — current and previous, with what happened to
-  each. Admins can add a name (/warnings Bob). The host can't be warned, so /warnings tells them so.
-- Recent chats keeps one entry per room you've joined (two different rooms show as two); joining the
-  same room again just refreshes its entry.
-- Fixed: the Changelog window could show the notes typed when signing a release instead of the
-  built-in changelog. The built-in changelog now always wins.
 """
 
 import sys
@@ -189,12 +180,43 @@ except ImportError:
 if sys.platform == "darwin":
     ensure_installed("pyobjus", required=False)
 
-VERSION = "1.5.1"
+VERSION = "1.5.1a"
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 
 def app_path(filename: str) -> str:
     return os.path.join(APP_DIR, filename)
+
+def local_data_dir() -> str:
+    """A per-user folder OUTSIDE wherever chat_gui.py lives — so if that's a git repo (or a shared/synced folder), what's
+    saved here never ends up there. Created on first use, and locked to this account where the OS supports it."""
+    if sys.platform == "win32":
+        base = os.environ.get("APPDATA") or os.path.join(os.path.expanduser("~"), "AppData", "Roaming")
+    elif sys.platform == "darwin":
+        base = os.path.join(os.path.expanduser("~"), "Library", "Application Support")
+    else:
+        base = os.environ.get("XDG_CONFIG_HOME") or os.path.join(os.path.expanduser("~"), ".config")
+    path = os.path.join(base, "chat_gui")
+    try:
+        os.makedirs(path, exist_ok=True)
+        if sys.platform != "win32":
+            os.chmod(path, 0o700)
+    except OSError:
+        return APP_DIR   # couldn't make it (read-only home, odd permissions): fall back rather than crash
+    return path
+
+def local_path(filename: str) -> str:
+    return os.path.join(local_data_dir(), filename)
+
+def migrate_to_local(old_path: str, new_path: str):
+    """One-time move for anything that used to save next to chat_gui.py. Runs at import time, before anything reads
+    these files, so every code path sees only the new location. Doesn't overwrite a file that's already there (e.g. from
+    a second computer), and leaves nothing behind in the old, possibly-shared location."""
+    if old_path != new_path and os.path.exists(old_path) and not os.path.exists(new_path):
+        try:
+            os.replace(old_path, new_path)
+        except OSError:
+            pass
 
 def load_json(path: str, expected_type: type):
     """Reads a small JSON file; returns an empty `expected_type()` if it's
@@ -288,6 +310,26 @@ def px(n) -> int:
 def fnt(size: int, *styles) -> tuple:
     """A font in the current family, `size` points at the default text size (so it follows the chosen size)."""
     return (CHAT_FONT[0], max(6, size + FONT_DELTA), *styles)
+
+EMOJI_OK = True   # False when this computer has no font that can draw emoji (the chat buttons then show words instead of blank squares)
+
+def pick_emoji_font(root):
+    """Chooses an emoji font that is really installed. The chat's emoji-only buttons name it directly instead of hoping the text
+    font falls back to one, which some Windows setups don't do (the buttons came out blank)."""
+    global EMOJI_FONT, EMOJI_OK
+    if sys.platform == "darwin":
+        return   # Apple Color Emoji is always there
+    try: have = set(tkfont.families(root))
+    except tk.TclError: return
+    candidates = ("Segoe UI Emoji", "Segoe UI Symbol") if sys.platform == "win32" else ("Noto Color Emoji", "Noto Emoji", "Symbola", "DejaVu Sans")
+    for family in candidates:
+        if family in have:
+            EMOJI_FONT, EMOJI_OK = (family, EMOJI_FONT[1]), True
+            return
+    EMOJI_OK = False
+
+def emoji_button_font() -> tuple:
+    return (EMOJI_FONT[0], max(11, CHAT_FONT[1] + 2))
 
 def enable_hidpi():
     """Windows only, and before the first window exists: tell Windows this app draws its own pixels. Without
@@ -547,7 +589,8 @@ SNAKE_ROWS = 18
 SNAKE_CELL_PX = 20
 SNAKE_TICK_MS = 130
 FLAPPY_TICK_MS = 20
-SETTINGS_FILE = app_path("chat_gui_settings.json")
+SETTINGS_FILE = local_path("chat_gui_settings.json")   # holds the Worker admin password once report alerts are on — kept out of the app's own folder
+migrate_to_local(app_path("chat_gui_settings.json"), SETTINGS_FILE)
 BANS_FILE = app_path("chat_gui_bans.json")   # the host's ban list — kept between sessions (1.5.1)
 
 class SnakeGame:
@@ -1882,29 +1925,53 @@ def friendly_ago(seconds: float) -> str:
             return f"{n} {unit}{'s' if n != 1 else ''} ago"
     return "just now"
 
+REPORT_RESOLUTIONS = {   # what can become of a report, besides staying open
+    "done": ("✔", "Completed"),
+    "rejected": ("✖", "Rejected"),
+    "need_evidence": ("🔎", "More evidence required"),
+    "intended": ("🧩", "Intended feature"),
+}
+
 def apply_report_statuses(data: dict) -> list:
-    """Records what the report server says about this computer's reports (done / reopened, and when). Returns the reports
-    that have JUST turned out to be completed and haven't been announced yet."""
+    """Records what the report server says about this computer's reports (completed, rejected, more evidence needed, intended,
+    or reopened — plus the note that goes with it, and when). Returns the reports whose outcome hasn't been announced yet."""
     statuses = data.get("statuses") or {}
     completed = data.get("completed") or {}
+    notes = data.get("notes") or {}
     server_now = data.get("now")
     newly = []
     for r in load_reports():
-        status = statuses.get(str(r.get("id")))
+        rid = str(r.get("id"))
+        status = statuses.get(rid)
         if status is None:
             continue  # the server doesn't know it (deleted, or never arrived)
-        if status == "done":
-            changes = {"status": "done"}
-            when_ms = completed.get(str(r.get("id")))
+        if status in REPORT_RESOLUTIONS:
+            changes = {"status": status, "note": str(notes.get(rid) or "")}
+            when_ms = completed.get(rid)
             if when_ms and server_now:  # work out WHEN on this computer's clock, from how long ago the server says it was
                 changes["completed_at"] = time.time() - max(0, (server_now - when_ms) / 1000)
             if any(r.get(k) != v for k, v in changes.items()):
                 update_report(r["id"], **changes)
-            if not r.get("notified"):
+            if not r.get("notified") or r.get("notified_status", "done") != status:   # not told yet, or the outcome has changed since
                 newly.append(dict(r, **changes))
-        elif r.get("status") == "done":  # the developer reopened it
-            update_report(r["id"], status="open", notified=False, completed_at=None)
+        elif r.get("status") in REPORT_RESOLUTIONS:  # the developer reopened it
+            update_report(r["id"], status="open", notified=False, notified_status=None, completed_at=None, note="")
     return newly
+
+def report_resolution_text(r: dict) -> str:
+    """What became of a report, in words, for the sender."""
+    status, note = r.get("status"), (r.get("note") or "").strip()
+    when = f" {friendly_ago(time.time() - r['completed_at'])} — {format_time(r['completed_at'])}" if r.get("completed_at") else ""
+    if status == "done":
+        return f"✔ Completed{when}. It will be released in the next update."
+    if status == "rejected":
+        return f"✖ Suggestion rejected{when}." + (f"\nReason: {note}" if note else "")
+    if status == "need_evidence":
+        return (f"🔎 More evidence required{when}." + (f"\n{note}" if note else "") +
+                "\nSend a new report with more detail (what you did, what happened, a screenshot if you can) and it will be looked at again.")
+    if status == "intended":
+        return f"🧩 Intended feature{when} — this is how it's meant to work." + (f"\n{note}" if note else "")
+    return ""
 
 def relative_time_str(timestamp: float) -> str:
     delta = max(0, time.time() - timestamp)
@@ -2090,7 +2157,8 @@ def restore_from_backup(path: str) -> str:
 # Left empty, this feature is completely inert — no network call, no
 # possibility of a false ban — until GLOBAL_BANLIST_URL is set.
 GLOBAL_BANLIST_URL = "https://raw.githubusercontent.com/Richy023/chat-gui-releases/main/global_banlist_signed.json"
-GLOBAL_BANLIST_SIGNING_KEY_FILE = app_path("update_signing_key.b64")
+GLOBAL_BANLIST_SIGNING_KEY_FILE = local_path("update_signing_key.b64")   # the publisher's private key — never goes near the app's own folder
+migrate_to_local(app_path("update_signing_key.b64"), GLOBAL_BANLIST_SIGNING_KEY_FILE)
 
 def get_machine_fingerprint() -> str:
     """A best-effort, stable-ish per-machine identifier — not the IP
@@ -2299,6 +2367,47 @@ def run_global_ban_command(cmd: str, arg: str, lookup, password):
             return error, None, error == "Wrong password."
         return (f"{target.get('name') or 'device ' + str(target.get('fingerprint', ''))[:8]} can use the app again. "
                 f"Running copies notice within about {GLOBAL_BAN_BEACON_SECONDS} seconds."), None, False
+    if cmd in ("/globalappeals", "/globalappeal"):
+        code, data = worker_call("/bans/appeals", password=password, timeout=10)
+        if code == 401:
+            return "Wrong password.", None, True
+        if code != 200 or not isinstance(data, dict):
+            return "Couldn't read the appeals from the report server.", None, False
+        waiting = sorted((a for a in data.get("appeals", []) if a.get("status") == "open"), key=lambda a: a.get("created", 0))
+        if cmd == "/globalappeals":
+            if not waiting:
+                return "No global ban appeals are waiting.", None, False
+            lines = [f"Global ban appeals waiting ({len(waiting)}):"]
+            for n, a in enumerate(waiting, 1):
+                lines.append(f"  #{n}  {a.get('name') or '(unnamed)'}  (device {str(a.get('fingerprint', ''))[:8]}) — {friendly_ago(time.time() - a.get('created', 0) / 1000)}")
+                lines.append(f"        Banned for: {a.get('ban_reason') or 'no reason given'}")
+                lines.append(f"        They say: {a.get('message', '')}")
+            lines.append("Decide with /globalappeal accept <#> [note]  or  /globalappeal reject <#> <reason>.")
+            return "\n".join(lines), None, False
+        parts = arg.split(maxsplit=2)
+        usage = "Usage: /globalappeal accept <#> [note]   or   /globalappeal reject <#> <reason>   (# from /globalappeals)"
+        if len(parts) < 2 or parts[0].lower() not in ("accept", "reject") or not parts[1].lstrip("#").isdigit():
+            return usage, None, False
+        number, note = int(parts[1].lstrip("#")), (parts[2] if len(parts) > 2 else "").strip()
+        if not 1 <= number <= len(waiting):
+            return f"There's no appeal #{number} waiting. /globalappeals shows them.", None, False
+        appeal = waiting[number - 1]
+        who = appeal.get("name") or f"device {str(appeal.get('fingerprint', ''))[:8]}"
+        accepting = parts[0].lower() == "accept"
+        if not accepting and not note:
+            return "Say why it's rejected — they'll see it:  /globalappeal reject <#> <reason>", None, False
+        if accepting:   # lift the ban first (signed, published), then record the decision
+            remaining = [e for e in info["entries"] if not (isinstance(e, dict) and e.get("fingerprint") == appeal.get("fingerprint") and str(e.get("id", "")) == str(appeal.get("ban_id")))]
+            error = publish(remaining)
+            if error:
+                return error, None, error == "Wrong password."
+        code, _ = worker_call("/bans/appeals/decide", body={"id": appeal["id"], "status": "accepted" if accepting else "rejected", "note": note}, password=password, timeout=10)
+        if code != 200:
+            return ("The ban was lifted, but I couldn't record the decision — try the same command again." if accepting
+                    else "Couldn't record the decision — try again."), None, code == 401
+        if accepting:
+            return f"Appeal from {who} accepted — they're unbanned and their app will say so within about {GLOBAL_BAN_BEACON_SECONDS} seconds.", None, False
+        return f"Appeal from {who} rejected. They'll see your reason.", None, False
     return "Unknown command.", None, False
 
 
@@ -2310,6 +2419,17 @@ def run_global_ban_command(cmd: str, arg: str, lookup, password):
 # install time, so the in-app viewer stays complete going forward
 # without needing the whole history re-embedded on every release.
 EMBEDDED_CHANGELOG = [
+    {   "version": "1.5.1a",
+        "date": "2026-11-19",
+        "notes": (
+            "Global bans: a person banned from the whole app gets one clear ban screen and can appeal it from there; the "
+            "publisher decides with /globalappeals and /globalappeal accept|reject, and the banned person sees the answer "
+            "and the reason. Reports: suggestions can be rejected with a reason, and bugs can be marked 'More evidence "
+            "required' or 'Intended feature' as well as Completed - the sender is told, with the reason. Muting: unmuting "
+            "someone now really clears it when they rejoin, even under a different nickname, and their app is told the "
+            "moment a mute ends. The emoji on the chat buttons no longer go missing on some Windows computers."
+        ),
+    },
     {   "version": "1.5.1",
         "date": "2026-11-18",
         "notes": (
@@ -3584,7 +3704,7 @@ class Hub:
             info = self.clients.pop(sock, None)
             if info and time.time() < info["muted_until"]:
                 self.ghost_mutes[info["name"].lower()] = {
-                    "name": info["name"], "ip": info.get("ip"),
+                    "name": info["name"], "ip": info.get("ip"), "fp": info.get("fingerprint"),
                     "muted_until": info["muted_until"],
                     "muted_by": info["muted_by"], "mute_reason": info["mute_reason"],
                 }
@@ -3763,21 +3883,46 @@ class Hub:
 
     # ---- mutes / slowmode ----
 
-    def apply_ghost_ip_mute(self, sock, ip):
-        """Re-applies a still-running mute if the same IP reconnects under a new name."""
+    def apply_ghost_mute(self, sock, name, ip):
+        """A muted person who rejoins is muted again — exactly once. The saved mute is found by their name, else their device, else
+        their address (so a new nickname doesn't shed it), then CONSUMED: from here the live connection carries it, so /unmute on
+        whatever name they use now clears it for good. (It used to be kept and matched by address every time, which could re-mute
+        someone who'd already been unmuted.)"""
         with self.lock:
             self._purge_expired()
-            now = time.time()
-            for g_info in self.ghost_mutes.values():
-                if g_info.get("ip") == ip and now < g_info["muted_until"]:
-                    if sock in self.clients:
-                        self.clients[sock].update(
-                            muted_until=g_info["muted_until"],
-                            muted_by=g_info["muted_by"],
-                            mute_reason=g_info["mute_reason"],
-                        )
-                    return True
-        return False
+            info = self.clients.get(sock)
+            if info is None:
+                return False
+            fp = info.get("fingerprint")
+            key = name.lower() if name.lower() in self.ghost_mutes else next(
+                (k for k, g in self.ghost_mutes.items() if (fp and g.get("fp") == fp) or g.get("ip") == ip), None)
+            if key is None:
+                return False
+            ghost = self.ghost_mutes.pop(key)
+            if time.time() >= ghost["muted_until"]:
+                return False
+            info.update(muted_until=ghost["muted_until"], muted_by=ghost["muted_by"], mute_reason=ghost["mute_reason"])
+        self._schedule_mute_expiry(sock, ghost["muted_until"])
+        return True
+
+    def _schedule_mute_expiry(self, sock, until):
+        """Tells the muted person's app the moment their mute runs out. (Their app used to work it out from its own clock, which
+        could be a little off — so a mute could look like it was still on, or end early, after a reconnect.)"""
+        def check():
+            with self.lock:
+                info = self.clients.get(sock)
+                if info is None or info.get("muted_until") != until:   # gone, unmuted, or muted again for a different time
+                    return
+                remaining = until - time.time()
+            if remaining > 0:
+                arm(remaining)
+            else:
+                self.send_private(sock, MUTE_STATUS_PREFIX + "0")
+        def arm(remaining):
+            timer = threading.Timer(min(remaining, 3600) + 0.3, check)
+            timer.daemon = True
+            timer.start()
+        arm(max(0.0, until - time.time()))
 
     def is_muted(self, sock):
         with self.lock:
@@ -3791,17 +3936,25 @@ class Hub:
             if sock not in self.clients: return False
             self.clients[sock].update(muted_until=until, muted_by=by, mute_reason=reason)
         self.mark_stopped_typing(name)
+        self._schedule_mute_expiry(sock, until)
         return True
 
     def unmute(self, name):
+        """Lifts a mute — on the live connection, and on any saved mute for this person (by name, or the same device/address),
+        so it can't come back when they disconnect and rejoin."""
         sock = self.find_socket_by_name(name)
         found = False
         with self.lock:
-            if sock and sock in self.clients:
-                self.clients[sock].update(muted_until=0.0, muted_by=None, mute_reason=None)
-                found = True
             self._purge_expired()
-            if self.ghost_mutes.pop(name.lower(), None) is not None:
+            info = self.clients.get(sock) if sock else None
+            ip = fp = None
+            if info is not None:
+                ip, fp = info.get("ip"), info.get("fingerprint")
+                info.update(muted_until=0.0, muted_by=None, mute_reason=None)
+                found = True
+            for key in [k for k, g in self.ghost_mutes.items()
+                        if k == name.lower() or (ip and g.get("ip") == ip) or (fp and g.get("fp") == fp)]:
+                del self.ghost_mutes[key]
                 found = True
         return found
 
@@ -4596,7 +4749,7 @@ def handle_guest_connection(sock, addr, hub: Hub, host_name: str, event_queue: q
     # Everything from here on is inside try/finally so that *any* failure still
     # removes the guest — otherwise a "ghost" would block the name until restart.
     try:
-        hub.apply_ghost_ip_mute(sock, addr[0])
+        hub.apply_ghost_mute(sock, guest_name, addr[0])
         hub.assign_color(guest_name)
 
         event_queue.put(("system", f"{guest_name} joined from {addr[0]}"))
@@ -5800,6 +5953,7 @@ class ChatApp(tk.Tk):
     def __init__(self):
         super().__init__()
         init_ui_scale(self)
+        pick_emoji_font(self)
         self.settings = load_json(SETTINGS_FILE, dict)
         self._home_src = None            # the home-screen picture, opened once (see _apply_home_picture)
         self._home_photo = None
@@ -5810,6 +5964,8 @@ class ChatApp(tk.Tk):
         self._gban_entry = None          # the entry banning THIS device right now, or None
         self._gban_overlay = None
         self._gban_pw = None             # the publisher's admin password, for this run only
+        self._gban_toasted = None        # which ban we've already shown a notification for
+        self._gban_appeal = {"status": "unknown", "note": ""}   # where this device's appeal stands, as the server last said
         self._load_appearance()          # themes and fonts first: every widget below is built in them
         if sys.platform == "win32":
             self.after_idle(lambda: style_titlebar(self))
@@ -7010,29 +7166,57 @@ class ChatApp(tk.Tk):
         self._announce_completed(apply_report_statuses(data))
 
     def _announce_completed(self, finished: list):
-        """The window saying one or more of this computer's reports were completed (and when)."""
+        """The window telling the sender what became of one or more of their reports (completed, rejected, more evidence
+        needed, or intended), with the reason where there is one."""
         if not finished:
             return
         for r in finished:
-            update_report(r["id"], notified=True)
+            update_report(r["id"], notified=True, notified_status=r.get("status"))
         popup_name = f"report_completed_{time.time_ns()}"
-        popup = self._open_dialog(popup_name, "Report completed", padx=24, pady=20)
+        popup = self._open_dialog(popup_name, "Report update", padx=24, pady=20)
         if popup is None:
             return
         many = len(finished) > 1
-        tk.Label(popup, text="✔  Your report was completed" if not many else "✔  Your reports were completed", bg=BG_PANEL, fg=COLOR_PALETTE["green"], font=fnt(14, "bold")).pack(anchor="w")
+        statuses = {r.get("status") for r in finished}
+        if many:
+            heading, color = ("✔  Your reports were completed", COLOR_PALETTE["green"]) if statuses == {"done"} else ("📬  Updates on your reports", COLOR_PALETTE["yellow"])
+        else:
+            icon, label = REPORT_RESOLUTIONS.get(finished[0].get("status"), ("📬", "Updated"))
+            heading = {"done": "✔  Your report was completed", "rejected": "✖  Your suggestion was rejected"}.get(finished[0].get("status"), f"{icon}  {label}")
+            color = COLOR_PALETTE["green"] if finished[0].get("status") == "done" else COLOR_PALETTE["yellow"]
+        tk.Label(popup, text=heading, bg=BG_PANEL, fg=color, font=fnt(14, "bold")).pack(anchor="w")
         for r in finished[:6]:
             icon = "💡" if r.get("kind") == "feature" else "🐞"
-            tk.Label(popup, text=f"{icon}  {r.get('summary', '')}", bg=BG_PANEL, fg=FG_TEXT, font=CHAT_FONT, wraplength=px(400), justify="left").pack(anchor="w", pady=(8, 0))
-            if r.get("completed_at"):
-                tk.Label(popup, text=f"Completed {friendly_ago(time.time() - r['completed_at'])} — {format_time(r['completed_at'])}", bg=BG_PANEL, fg=FG_MUTED, font=fnt(9)).pack(anchor="w")
+            tk.Label(popup, text=f"{icon}  {r.get('summary', '')}", bg=BG_PANEL, fg=FG_TEXT, font=CHAT_FONT, wraplength=px(420), justify="left").pack(anchor="w", pady=(10, 0))
+            tk.Label(popup, text=report_resolution_text(r), bg=BG_PANEL, fg=FG_MUTED, font=fnt(9), wraplength=px(420), justify="left").pack(anchor="w", pady=(2, 0))
         if len(finished) > 6:
             tk.Label(popup, text=f"…and {len(finished) - 6} more", bg=BG_PANEL, fg=FG_MUTED, font=CHAT_FONT).pack(anchor="w", pady=(4, 0))
-        tk.Label(popup, text=("They've been marked as completed and will be released in the next update. " if many else
-                              "It's been marked as completed and will be released in the next update. ") + "Thanks for helping make chat_gui better!",
-                 bg=BG_PANEL, fg=FG_TEXT, font=CHAT_FONT, wraplength=px(400), justify="left").pack(anchor="w", pady=(12, 0))
+        tk.Label(popup, text="Thanks for helping make chat_gui better!", bg=BG_PANEL, fg=FG_TEXT, font=CHAT_FONT).pack(anchor="w", pady=(12, 0))
         make_button(popup, "OK", lambda: self._close_popup(popup_name), bg=ACCENT, hover_bg=ACCENT_HOVER, padx=18, pady=5).pack(anchor="e", pady=(14, 0))
         popup.lift()
+
+    def _ask_note(self, name: str, heading: str, prompt: str, required: bool, on_ok):
+        """A small window asking for a note (a reason). `on_ok(text)` runs when it's saved; a required note can't be left empty."""
+        popup = self._open_dialog(name, heading, padx=24, pady=20)
+        if popup is None:
+            return
+        tk.Label(popup, text=heading, bg=BG_PANEL, fg=FG_TEXT, font=fnt(14, "bold")).pack(anchor="w")
+        tk.Label(popup, text=prompt, bg=BG_PANEL, fg=FG_MUTED, font=CHAT_FONT, wraplength=px(420), justify="left").pack(anchor="w", pady=(6, 8))
+        box = tk.Text(popup, width=52, height=5, wrap="word", bg=BG_INPUT, fg=FG_TEXT, insertbackground=FG_TEXT, relief="flat", font=CHAT_FONT, padx=8, pady=6)
+        box.pack(fill="x")
+        problem = tk.Label(popup, text="", bg=BG_PANEL, fg=COLOR_PALETTE["red"], font=fnt(9))
+        problem.pack(anchor="w", pady=(4, 0))
+        def save():
+            text = " ".join(box.get("1.0", "end").split())[:500]
+            if required and not text:
+                return problem.configure(text="A reason is needed.")
+            self._close_popup(name)
+            on_ok(text)
+        buttons = tk.Frame(popup, bg=BG_PANEL)
+        buttons.pack(anchor="e", pady=(10, 0))
+        make_button(buttons, "Save", save, bg=ACCENT, hover_bg=ACCENT_HOVER, padx=18, pady=5).pack(side="left", padx=(0, 8))
+        make_button(buttons, "Cancel", lambda: self._close_popup(name), bg=BTN_NEUTRAL, hover_bg=BTN_NEUTRAL_HOVER, padx=18, pady=5).pack(side="left")
+        box.focus_set()
 
     # ---- a password prompt shared by the admin tools ----
 
@@ -7371,10 +7555,8 @@ class ChatApp(tk.Tk):
         shown = []
 
         def status_text(r):
-            if r.get("status") == "done":
-                if r.get("completed_at"):
-                    return f"✔ Completed {friendly_ago(time.time() - r['completed_at'])} — {format_time(r['completed_at'])}. It will be released in the next update."
-                return "✔ Completed — it will be released in the next update."
+            if r.get("status") in REPORT_RESOLUTIONS:
+                return report_resolution_text(r)
             if r.get("delivered"):
                 return "⏳ Sent to the developer — not completed yet."
             if report_server() is None:
@@ -7386,7 +7568,7 @@ class ChatApp(tk.Tk):
             shown = load_reports()
             listbox.delete(0, "end")
             for r in shown:
-                mark = "✔" if r.get("status") == "done" else ("⏳" if r.get("delivered") else "📝")
+                mark = REPORT_RESOLUTIONS[r["status"]][0] if r.get("status") in REPORT_RESOLUTIONS else ("⏳" if r.get("delivered") else "📝")
                 icon = "💡" if r.get("kind") == "feature" else "🐞"
                 listbox.insert("end", f"{mark} {icon}  {r.get('date', '?')}  ·  v{r.get('version', '?')}  ·  {r.get('summary', '')}")
             index = next((i for i, r in enumerate(shown) if r.get("id") == keep_id), 0 if shown else None)
@@ -7425,7 +7607,7 @@ class ChatApp(tk.Tk):
                 newly = apply_report_statuses(data)
                 keep = shown[listbox.curselection()[0]].get("id") if listbox.curselection() else None
                 refresh_list(keep_id=keep)
-                message.configure(text="Up to date." if not newly else f"{len(newly)} newly completed!", fg=COLOR_PALETTE["green"])
+                message.configure(text="Up to date." if not newly else f"{len(newly)} updated!", fg=COLOR_PALETTE["green"])
                 self._announce_completed(newly)
             self._run_bg(lambda: worker_call("/status", body={"ids": ids}), finished)
 
@@ -7459,6 +7641,25 @@ class ChatApp(tk.Tk):
         since = int(self.settings.get("report_last_seen") or 0)
         self._set_timer("report_watch", 60 * 1000, self._poll_new_reports)
         self._run_bg(lambda: worker_call(f"/reports/since?t={since}", password=key), lambda result: self._on_new_reports_polled(result, since))
+        since_appeals = int(self.settings.get("appeal_last_seen") or 0)
+        self._run_bg(lambda: worker_call(f"/bans/appeals/since?t={since_appeals}", password=key), lambda result: self._on_new_appeals_polled(result, since_appeals))
+
+    def _on_new_appeals_polled(self, result, since):
+        code, data = result if isinstance(result, tuple) else (None, None)
+        if code != 200 or not isinstance(data, dict):
+            return   # (a wrong password is already handled by the report check beside it; an older server has no appeals yet)
+        latest = int(data.get("latest") or 0)
+        if latest > int(self.settings.get("appeal_last_seen") or 0):
+            self.settings["appeal_last_seen"] = latest
+            self._save_settings()
+        if since <= 0:
+            return
+        appeals = data.get("appeals") or []
+        if int(data.get("count") or len(appeals)) > 5:
+            self._queue_notice("📨 Several global ban appeals arrived at once — /globalappeals shows them.")
+            return
+        for a in appeals:
+            self._queue_notice(f"📨 New global ban appeal from {str(a.get('name') or 'someone')[:30]} — /globalappeals to read it")
 
     def _on_new_reports_polled(self, result, since):
         code, data = result if isinstance(result, tuple) else (None, None)
@@ -7492,6 +7693,7 @@ class ChatApp(tk.Tk):
         else:
             self.settings.pop("report_admin_key", None)
             self.settings.pop("report_last_seen", None)
+            self.settings.pop("appeal_last_seen", None)
             self._cancel_timer("report_watch")
         self._save_settings()
         if on and password:
@@ -7679,11 +7881,11 @@ class ChatApp(tk.Tk):
             nonlocal shown
             mode = show_var.get()
             everything = all_items()
-            shown = [r for r in everything if mode == "all" or (mode == "open" and r.get("status") != "done") or r.get("kind") == mode]
+            shown = [r for r in everything if mode == "all" or (mode == "open" and r.get("status", "open") == "open") or r.get("kind") == mode]
             listbox.delete(0, "end")
             for r in shown:
                 icon = "💡" if r.get("kind") == "feature" else "🐞"
-                done = "✔ " if r.get("status") == "done" else ""
+                done = REPORT_RESOLUTIONS[r["status"]][0] + " " if r.get("status") in REPORT_RESOLUTIONS else ""
                 listbox.insert("end", f"{icon} {done}{r.get('date', '?')}  ·  v{r.get('version', '?')}  ·  {r.get('summary', '')}")
             count_label.configure(text=f"{len(shown)} of {len(everything)}")
             index = next((i for i, r in enumerate(shown) if str(r.get("id")) == str(keep_id)), 0 if shown else None)
@@ -7698,33 +7900,53 @@ class ChatApp(tk.Tk):
         def show_selected(event=None):
             r = selected()
             where = "stored on the report server" if r and r["_source"] == "server" else "saved on this computer only"
-            if r and r["_source"] == "server" and r.get("status") == "done" and r.get("completed"):
-                where = f"completed {friendly_ago(time.time() - r['completed'] / 1000)}, {format_time(r['completed'] / 1000)} · " + where
+            label = REPORT_RESOLUTIONS[r["status"]][1] if r and r.get("status") in REPORT_RESOLUTIONS else "open"
+            if r and r["_source"] == "server" and r.get("status", "open") != "open" and r.get("completed"):
+                where = f"{label.lower()} {friendly_ago(time.time() - r['completed'] / 1000)}, {format_time(r['completed'] / 1000)} · " + where
+            note_line = f"\nNote to the sender: {r['note']}" if r and r.get("note") else ""
             detail.configure(state="normal")
             detail.delete("1.0", "end")
-            detail.insert("1.0", f"{format_report_text(r)}\n\n[{r.get('status', 'open')} · {where}]" if r else "No reports here yet.")
+            detail.insert("1.0", f"{format_report_text(r)}\n\n[{label} · {where}]{note_line}" if r else "No reports here yet.")
             detail.configure(state="disabled")
 
         def server_failed():
             messagebox.showerror("Report inbox", "Couldn't reach the report server — nothing was changed.", parent=win)
 
-        def toggle_done():
-            r = selected()
-            if not r:
-                return
-            new_status = "open" if r.get("status") == "done" else "done"
+        def set_status(r, new_status, note=""):
+            """Completed / rejected / more evidence required / intended / reopened — saved on the server (or locally for a report that never reached it)."""
             if r["_source"] == "server":
                 def finished(result):
                     if isinstance(result, tuple) and result[0] == 200:
                         for item in state["remote"]:
-                            if str(item.get("id")) == str(r["id"]): item["status"] = new_status
+                            if str(item.get("id")) == str(r["id"]):
+                                item["status"], item["note"] = new_status, (note or None) if new_status != "open" else None
+                                item["completed"] = int(time.time() * 1000) if new_status != "open" else None
                         refresh(keep_id=r["id"])
                     else:
                         server_failed()
-                self._run_bg(lambda: worker_call("/reports/status", body={"id": str(r["id"]), "status": new_status}, password=password), finished)
+                self._run_bg(lambda: worker_call("/reports/status", body={"id": str(r["id"]), "status": new_status, "note": note}, password=password), finished)
             else:
-                update_report(r["id"], status=new_status)
+                update_report(r["id"], status=new_status, note=note)
                 refresh(keep_id=r["id"])
+
+        def status_menu():
+            r = selected()
+            if not r:
+                return
+            def ask(heading, prompt, status, required):
+                self._ask_note("report_note", heading, prompt, required, lambda text: set_status(r, status, text))
+            menu = tk.Menu(win, tearoff=0, bg=BG_PANEL, fg=FG_TEXT, activebackground=ACCENT, activeforeground="white", bd=0, font=CHAT_FONT)
+            menu.add_command(label="✔  Completed", command=lambda: set_status(r, "done"))
+            if r.get("kind") == "feature":
+                menu.add_command(label="✖  Reject suggestion…", command=lambda: ask("Reject suggestion", "Why is this suggestion being rejected? The sender will see this.", "rejected", True))
+            else:
+                menu.add_command(label="🔎  More evidence required…", command=lambda: ask("More evidence required", "What do you need from them? (optional — the sender will see this)", "need_evidence", False))
+                menu.add_command(label="🧩  Intended feature…", command=lambda: ask("Intended feature", "Anything to explain? (optional — the sender will see this)", "intended", False))
+            if r.get("status", "open") != "open":
+                menu.add_separator()
+                menu.add_command(label="↩  Reopen", command=lambda: set_status(r, "open"))
+            try: menu.tk_popup(*win.winfo_pointerxy())
+            finally: menu.grab_release()
 
         def remove():
             r = selected()
@@ -7757,7 +7979,7 @@ class ChatApp(tk.Tk):
                 self.clipboard_append(format_report_text(r))
 
         listbox.bind("<<ListboxSelect>>", show_selected)
-        actions = [("Mark done / reopen", toggle_done, (BTN_GREEN, BTN_GREEN_HOVER)), ("Copy", copy, (BTN_NEUTRAL, BTN_NEUTRAL_HOVER)),
+        actions = [("Set status ▾", status_menu, (BTN_GREEN, BTN_GREEN_HOVER)), ("Copy", copy, (BTN_NEUTRAL, BTN_NEUTRAL_HOVER)),
                    ("Delete", remove, (BTN_RED, BTN_RED_HOVER)), ("Close", lambda: self._close_popup("reports"), (BTN_NEUTRAL, BTN_NEUTRAL_HOVER))]
         if password:
             actions.insert(0, ("Refresh", reload_from_server, (BTN_NEUTRAL, BTN_NEUTRAL_HOVER)))
@@ -7840,6 +8062,8 @@ class ChatApp(tk.Tk):
         list when it has. Also lifts a ban that has run out, without asking anyone."""
         self._set_timer("gban_tick", GLOBAL_BAN_BEACON_SECONDS * 1000, self._global_ban_tick)
         self._evaluate_global_ban()
+        if self._gban_entry is not None:
+            self._refresh_gban_appeal()   # a decision on the appeal shows up on the ban screen
         if self._gban_seq_seen is None or report_server() is None:
             return self._fetch_global_bans()
         def got(result):
@@ -7892,20 +8116,107 @@ class ChatApp(tk.Tk):
             tk.Label(row, text=f"{label}:", bg=BG_PANEL, fg=FG_MUTED, font=BOLD_FONT).pack(side="left")
             tk.Label(row, text=f" {value}", bg=BG_PANEL, fg=FG_TEXT, font=CHAT_FONT, wraplength=px(380), justify="left").pack(side="left")
         tk.Label(card, text=f"Device ID: {entry.get('fingerprint', '')}", bg=BG_PANEL, fg=FG_MUTED, font=fnt(8)).pack(pady=(14, 0))
+        self._gban_appeal = {"status": "unknown", "note": ""}
+        self._gban_appeal_box = tk.Frame(card, bg=BG_PANEL)
+        self._gban_appeal_box.pack(fill="x", pady=(12, 0))
+        self._render_gban_appeal()
+        self._refresh_gban_appeal()
         make_button(card, "Close app", self.on_close, bg=BTN_RED, hover_bg=BTN_RED_HOVER, padx=22, pady=6).pack(pady=(14, 0))
         overlay.lift()
         self._gban_overlay = overlay
-        self.bell()
-        notify_toast("Banned from chat_gui", f"Reason: {entry.get('reason') or 'no reason given'}", root=self)
-        self._raise_for_attention(force=True)
+        ban_key = str(entry.get("id") or entry.get("fingerprint"))
+        if ban_key != self._gban_toasted:   # once per ban — not again if the same ban is re-read or its end time changes
+            self._gban_toasted = ban_key
+            notify_toast("Banned from chat_gui", f"Reason: {entry.get('reason') or 'no reason given'}", root=self)
+            self._raise_for_attention(force=True)
+
+    def _gban_appeal_ids(self):
+        entry = self._gban_entry
+        if not entry or not entry.get("id") or report_server() is None:
+            return None   # an older ban (from before appeals) can't be appealed here
+        return {"fingerprint": str(entry["fingerprint"]), "ban_id": str(entry["id"])}
+
+    def _refresh_gban_appeal(self):
+        """Asks the report server where this device's appeal stands (runs when the ban screen opens, then every check)."""
+        ids, entry = self._gban_appeal_ids(), self._gban_entry
+        if ids is None:
+            return
+        def got(result):
+            code, data = result if isinstance(result, tuple) else (None, None)
+            if code == 200 and isinstance(data, dict) and self._gban_entry is entry:
+                self._gban_appeal = {"status": str(data.get("status") or "none"), "note": str(data.get("note") or "")}
+                self._render_gban_appeal()
+        self._run_bg(lambda: worker_call("/bans/appeal/status", body=ids, timeout=8), got)
+
+    def _render_gban_appeal(self, message=None, message_color=None, composing=False, draft=""):
+        box = getattr(self, "_gban_appeal_box", None)
+        entry = self._gban_entry
+        if box is None or entry is None:
+            return
+        try:
+            for child in box.winfo_children():
+                child.destroy()
+        except tk.TclError:
+            return
+        status, note = self._gban_appeal["status"], self._gban_appeal["note"]
+        def line(text, color=None, bold=False):
+            tk.Label(box, text=text, bg=BG_PANEL, fg=color or FG_TEXT, font=BOLD_FONT if bold else CHAT_FONT, wraplength=px(420), justify="left").pack(anchor="w", pady=(2, 0))
+        ids = self._gban_appeal_ids()
+        if ids is None:
+            line("To appeal, contact the app's publisher.", FG_MUTED)
+        elif status == "open":
+            line("📨  Your appeal was sent. The answer will appear here.", COLOR_PALETTE["yellow"])
+        elif status == "rejected":
+            line("✖  Your appeal was rejected.", COLOR_PALETTE["red"], bold=True)
+            if note:
+                line(f"Reason: {note}")
+        elif status == "accepted":
+            line("✔  Your appeal was accepted — the ban is being lifted.", COLOR_PALETTE["green"], bold=True)
+        elif status == "none" and composing:
+            line("Tell the publisher why this ban should be lifted (one appeal per ban):", FG_MUTED)
+            field = tk.Text(box, width=46, height=4, wrap="word", bg=BG_INPUT, fg=FG_TEXT, insertbackground=FG_TEXT, relief="flat", font=CHAT_FONT, padx=8, pady=6)
+            field.pack(fill="x", pady=(4, 0))
+            field.insert("1.0", draft)
+            field.focus_set()
+            def send():
+                text = " ".join(field.get("1.0", "end").split())[:1000]
+                if not text:
+                    return self._render_gban_appeal("Write a few words first.", COLOR_PALETTE["red"], composing=True)
+                name = self.name_entry.get().strip()[:40] if hasattr(self, "name_entry") else ""
+                body = dict(ids, name=name, message=text)
+                def done(result):
+                    code, data = result if isinstance(result, tuple) else (None, None)
+                    data = data if isinstance(data, dict) else {}
+                    if code == 200:
+                        self._gban_appeal = {"status": "open", "note": ""}
+                        self._render_gban_appeal()
+                    elif code == 409:   # already appealed (perhaps from another copy): show what became of it
+                        self._gban_appeal = {"status": str(data.get("status") or "open"), "note": str(data.get("note") or "")}
+                        self._render_gban_appeal()
+                    elif code == 400:
+                        self._render_gban_appeal("This ban isn't on the list any more — it may already have been lifted.")
+                    elif code == 429:
+                        self._render_gban_appeal("Too many appeals just now — try again later.", COLOR_PALETTE["red"], composing=True, draft=text)
+                    else:
+                        self._render_gban_appeal("Couldn't reach the server — try again.", COLOR_PALETTE["red"], composing=True, draft=text)
+                self._run_bg(lambda: worker_call("/bans/appeal", body=body, timeout=10), done)
+            row = tk.Frame(box, bg=BG_PANEL)
+            row.pack(anchor="e", pady=(8, 0))
+            make_button(row, "Send appeal", send, bg=ACCENT, hover_bg=ACCENT_HOVER, padx=16, pady=5).pack(side="left", padx=(0, 8))
+            make_button(row, "Cancel", lambda: self._render_gban_appeal(), bg=BTN_NEUTRAL, hover_bg=BTN_NEUTRAL_HOVER, padx=16, pady=5).pack(side="left")
+        elif status == "none":
+            make_button(box, "Appeal this ban", lambda: self._render_gban_appeal(composing=True), bg=ACCENT, hover_bg=ACCENT_HOVER, padx=18, pady=6).pack(anchor="w", pady=(2, 0))
+        if message:
+            line(message, message_color or FG_MUTED)
 
     def _hide_global_ban(self):
+        accepted = self._gban_appeal.get("status") == "accepted"
         self._gban_entry = None
         if self._gban_overlay is not None:
             try: self._gban_overlay.destroy()
             except tk.TclError: pass
             self._gban_overlay = None
-        notify_toast("chat_gui", "Your ban has ended — you can use the app again.", root=self)
+        notify_toast("chat_gui", "Your appeal was accepted — you can use the app again." if accepted else "Your ban has ended — you can use the app again.", root=self)
         self._focus_first_empty()
 
     def _handle_global_ban_command(self, cmd: str, arg: str):
@@ -7932,7 +8243,7 @@ class ChatApp(tk.Tk):
                         if sock is not None:
                             hub.eject(sock, BAN_NOTICE_PREFIX + make_ban_notice(kick["until"], GLOBAL_BAN_REASON_PREFIX + kick["reason"], hub.host_name),
                                       f"* {kick['name']} has been banned from chat_gui *")
-                elif cmd == "/unglobalban":
+                elif cmd in ("/unglobalban", "/globalappeal"):
                     self._fetch_global_bans()
             self._run_bg(lambda: run_global_ban_command(cmd, arg, lookup, password), done)
 
@@ -7953,7 +8264,11 @@ class ChatApp(tk.Tk):
     def _on_banned_live(self, payload):
         """We were banned while in the chat. Remember how to reach the host so the appeal works."""
         if GLOBAL_BAN_REASON_PREFIX in str(payload.get("message", "")):
-            self._fetch_global_bans()   # the publisher banned this device from the whole app: read the list now
+            # The publisher banned this device from the whole app. The app-wide ban screen deals with it (one screen, one notification),
+            # so none of the room-ban machinery runs: no "you were banned" toast, no notice window, no appeal to this host.
+            self._return_to_connect_screen("You've been banned from chat_gui — one moment…", "error")
+            self._fetch_global_bans()
+            return
         conn = self.connection
         ctx = None
         if isinstance(conn, GuestConnection):
@@ -8421,7 +8736,8 @@ class ChatApp(tk.Tk):
             self.dnd_btn.bind(bind, lambda e: self.on_dnd_keybind_picker())
             self.dnd_btn.label.bind(bind, lambda e: self.on_dnd_keybind_picker())
 
-        self.appearance_btn = make_button(top, "🎨", self._open_appearance, bg=BTN_NEUTRAL, hover_bg=BTN_NEUTRAL_HOVER, padx=10, pady=5)
+        self.appearance_btn = make_button(top, "🎨" if EMOJI_OK else "Look", self._open_appearance, bg=BTN_NEUTRAL, hover_bg=BTN_NEUTRAL_HOVER, padx=10, pady=5,
+                                          font=emoji_button_font() if EMOJI_OK else fnt(9, "bold"))
         self.appearance_btn.pack(side="right", padx=(12, 0), pady=6)
 
         self.warn_btn = make_button(top, "⚠ Warning", self._on_warn_btn_clicked, bg=self.WARN_YELLOW[0], hover_bg=self.WARN_YELLOW[1], padx=12, pady=5)  # shown by _refresh_warn_button
@@ -8494,14 +8810,16 @@ class ChatApp(tk.Tk):
 
         self.bottom_bar = tk.Frame(self.chat_frame, bg=BG_DARK)
 
-        def tool_button(text, command):
-            btn = make_button(self.bottom_bar, text, command, bg=BG_INPUT, hover_bg=BTN_NEUTRAL_HOVER, padx=10, pady=6)
+        def tool_button(emoji, word, command):
+            # Emoji-only buttons name the emoji font themselves; with no emoji font at all they say a word instead of showing nothing.
+            btn = make_button(self.bottom_bar, emoji if EMOJI_OK else word, command, bg=BG_INPUT, hover_bg=BTN_NEUTRAL_HOVER,
+                              padx=10, pady=6, font=emoji_button_font() if EMOJI_OK else fnt(9, "bold"))
             btn.pack(side="left", padx=(0, 6))
             return btn
 
-        self.attach_btn = tool_button("📎", self.on_attach_file)
-        self.sticker_btn = tool_button("🌠", self.on_sticker_picker)
-        self.emoji_btn = tool_button("😀", self.on_emoji_picker)
+        self.attach_btn = tool_button("📎", "Attach", self.on_attach_file)
+        self.sticker_btn = tool_button("🌠", "Stickers", self.on_sticker_picker)
+        self.emoji_btn = tool_button("😀", "Emoji", self.on_emoji_picker)
 
         self.msg_entry = tk.Entry(self.bottom_bar, bg=BG_INPUT, fg=FG_TEXT, insertbackground=FG_TEXT, relief="flat", font=CHAT_FONT)
         self.msg_entry.pack(side="left", fill="x", expand=True, ipady=px(6))
@@ -8804,7 +9122,7 @@ class ChatApp(tk.Tk):
             self._handle_clear_command(text.split())
             return "break"
 
-        if first_word in ("/globalban", "/unglobalban", "/globalbans"):
+        if first_word in ("/globalban", "/unglobalban", "/globalbans", "/globalappeals", "/globalappeal"):
             self._handle_global_ban_command(first_word, text.partition(" ")[2].strip())
             return "break"
 
