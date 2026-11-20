@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-chat_gui.py — v1.5.1a — ENCRYPTED instant messenger with a desktop GUI.
+chat_gui.py — v1.5.1b — ENCRYPTED instant messenger with a desktop GUI.
 
-Changes in 1.5.1a:
+Changes in 1.5.1b:
 - Global bans: someone banned from the whole app now gets one clear ban screen (no more stray room-ban notices or repeated
   notifications) and can APPEAL it from that screen. The publisher gets an alert and decides with /globalappeals and
   /globalappeal accept|reject; the banned person sees the decision, and the reason, on their screen. One appeal per ban.
@@ -12,6 +12,18 @@ Changes in 1.5.1a:
   if they rejoined under a different nickname. Their app is also told the moment a mute ends.
 - The emoji on the chat buttons no longer go missing on some Windows computers (the buttons now use an emoji font
   directly, or show a word if the computer has none).
+- The publisher can mark a global ban "no appeals" (/globalban … --noappeal): the banned person's screen then says appeals
+  are turned off, and the server refuses one anyway.
+- Private data stays on your computer: the admin password is no longer stored (as a hash) inside this file — the report
+  server checks it, and this computer keeps only a slow, salted check of its own for offline use. The host's ban list,
+  the global-ban cache, recent hosts and your reports now live in this computer's private app-data folder instead of next
+  to chat_gui.py (moved automatically); on Windows that folder is the local one, not the one a school/work network copies.
+- The Appearance window now scrolls with the mouse wheel and two-finger scrolling (it only responded to its scroll bar).
+- Colours: a theme change now reaches every window even if one is closing while it happens, with a quick second check for
+  anything missed, and a custom colour that had to be adjusted for readability says so. Custom backgrounds keep more of
+  the colour you picked.
+- Installing a missing dependency (on a new computer) now prints which one it is installing and that it installed
+  successfully, or exactly what to run if it couldn't.
 
 Changes in 1.5.1:
 - Appearance (new): a 🎨 button in the chat, an "Appearance" link on the main menu, or Ctrl+Shift+T. Pick a theme
@@ -136,51 +148,73 @@ from tkinter import colorchooser, filedialog, messagebox, scrolledtext, simpledi
 # FEATURE TOGGLE: WAN (Wide Area Network) / Global Room Support
 ENABLE_WAN_RELAY = False
 
-def ensure_installed(import_name, pip_name=None, required=True):
+def _dep_say(text):
+    try: print(text, flush=True)
+    except Exception: pass   # no console (e.g. started with pythonw): nothing to print to
+
+def ensure_installed(import_name, pip_name=None, required=True, purpose=""):
+    """Imports a module, installing it with pip first if this computer doesn't have it, and says so for each one:
+    which dependency, that it's being installed, and whether that worked."""
     pip_name = pip_name or import_name
     try:
-        module = importlib.import_module(import_name)
-        return module
+        return importlib.import_module(import_name)
     except ImportError:
         pass
 
-    print(f"[deps] {pip_name}: not found — installing automatically...")
+    what = f"{pip_name} ({purpose})" if purpose else pip_name
+    _dep_say(f"[deps] {what}: not found — installing automatically...")
     attempts = [
         [sys.executable, "-m", "pip", "install", "-q", pip_name],
         [sys.executable, "-m", "pip", "install", "-q", "--user", pip_name],
         [sys.executable, "-m", "pip", "install", "-q", "--break-system-packages", pip_name],
     ]
+    last_error = ""
     for cmd in attempts:
         try:
-            subprocess.check_call(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-            return importlib.import_module(import_name)
-        except Exception:
+            result = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=600)
+        except Exception as e:
+            last_error = str(e)
             continue
+        if result.returncode == 0:
+            importlib.invalidate_caches()   # so Python notices what pip just added
+            try:
+                module = importlib.import_module(import_name)
+            except ImportError as e:
+                last_error = f"installed, but it still can't be imported ({e})"
+                continue
+            _dep_say(f"[deps] {pip_name}: installed successfully ✓")
+            return module
+        lines = (result.stderr or b"").decode("utf-8", "replace").strip().splitlines()
+        last_error = lines[-1] if lines else f"pip exited with code {result.returncode}"
+    _dep_say(f"[deps] {pip_name}: could NOT be installed automatically ({last_error}).")
+    _dep_say(f"[deps]   To install it yourself run:  {sys.executable} -m pip install {pip_name}")
     if required:
+        _dep_say(f"[deps] {pip_name} is required, so chat_gui can't start without it.")
         sys.exit(1)
+    _dep_say(f"[deps] Carrying on without {pip_name}" + (f" — {purpose} won't be available." if purpose else "."))
     return None
 
-ensure_installed("cryptography")
+ensure_installed("cryptography", purpose="encryption")
 from cryptography.fernet import Fernet, InvalidToken
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey, Ed25519PrivateKey
 from cryptography.exceptions import InvalidSignature
 
-ensure_installed("plyer", required=False)
+ensure_installed("plyer", required=False, purpose="desktop notifications")
 try:
     from plyer import notification as _plyer_notification
 except ImportError:
     _plyer_notification = None
 
-ensure_installed("PIL", pip_name="Pillow", required=False)
+ensure_installed("PIL", pip_name="Pillow", required=False, purpose="pictures, stickers and screenshots")
 try:
     from PIL import Image, ImageTk, ImageDraw, ImageFont, ImageGrab
 except ImportError:
     Image = ImageTk = ImageDraw = ImageFont = ImageGrab = None
 
 if sys.platform == "darwin":
-    ensure_installed("pyobjus", required=False)
+    ensure_installed("pyobjus", required=False, purpose="Mac notifications")
 
-VERSION = "1.5.1a"
+VERSION = "1.5.1b"
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -191,7 +225,8 @@ def local_data_dir() -> str:
     """A per-user folder OUTSIDE wherever chat_gui.py lives — so if that's a git repo (or a shared/synced folder), what's
     saved here never ends up there. Created on first use, and locked to this account where the OS supports it."""
     if sys.platform == "win32":
-        base = os.environ.get("APPDATA") or os.path.join(os.path.expanduser("~"), "AppData", "Roaming")
+        # LOCAL app data, not Roaming: on a school or work network, Roaming is copied to a server with your profile.
+        base = os.environ.get("LOCALAPPDATA") or os.path.join(os.path.expanduser("~"), "AppData", "Local")
     elif sys.platform == "darwin":
         base = os.path.join(os.path.expanduser("~"), "Library", "Application Support")
     else:
@@ -203,6 +238,17 @@ def local_data_dir() -> str:
             os.chmod(path, 0o700)
     except OSError:
         return APP_DIR   # couldn't make it (read-only home, odd permissions): fall back rather than crash
+    if sys.platform == "win32":   # earlier versions used the Roaming folder: bring anything saved there across, once
+        try:
+            old = os.path.join(os.environ.get("APPDATA") or os.path.join(os.path.expanduser("~"), "AppData", "Roaming"), "chat_gui")
+            if os.path.isdir(old) and os.path.abspath(old) != os.path.abspath(path):
+                for name in os.listdir(old):
+                    if not os.path.exists(os.path.join(path, name)):
+                        os.replace(os.path.join(old, name), os.path.join(path, name))
+                try: os.rmdir(old)
+                except OSError: pass
+        except OSError:
+            pass
     return path
 
 def local_path(filename: str) -> str:
@@ -278,7 +324,7 @@ DEFAULT_TCP_PORT = 47615   # hosts try this port first, so a joiner can reach th
 # how to produce a manifest and keep the signing key itself OFFLINE —
 # only the public key belongs in this file.
 UPDATE_MANIFEST_URL = "https://raw.githubusercontent.com/Richy023/chat-gui-releases/main/update_manifest.json"
-UPDATE_PUBLIC_KEY_B64 = "buYuGiOKh5LYltgmbUH9S63A10/DGcuyGWz9PzZp85A="
+UPDATE_PUBLIC_KEY_B64 = "4LZlItmybHdIwMNCJ/luG+sEtG9uc/W9FEjJz3d6URM="
 
 TYPING_IDLE_TIMEOUT = 2
 TYPING_DISPLAY_TIMEOUT = 2.0  
@@ -591,7 +637,8 @@ SNAKE_TICK_MS = 130
 FLAPPY_TICK_MS = 20
 SETTINGS_FILE = local_path("chat_gui_settings.json")   # holds the Worker admin password once report alerts are on — kept out of the app's own folder
 migrate_to_local(app_path("chat_gui_settings.json"), SETTINGS_FILE)
-BANS_FILE = app_path("chat_gui_bans.json")   # the host's ban list — kept between sessions (1.5.1)
+BANS_FILE = local_path("chat_gui_bans.json")   # the host's ban list (addresses and device ids) — kept between sessions, and out of the app's own folder
+migrate_to_local(app_path("chat_gui_bans.json"), BANS_FILE)
 
 class SnakeGame:
     """Pure game logic — no Tk, no I/O, fully deterministic given a
@@ -1142,7 +1189,7 @@ def make_theme(bg: str, accent: str) -> dict:
     """A whole palette from just a background and an accent colour. The background is kept dark (the text, status
     colours and name colours are all tuned for a dark window) and the accent dark enough for white button text."""
     hue, light, sat = colorsys.rgb_to_hls(*_rgb(bg))
-    bg = _hex(colorsys.hls_to_rgb(hue, max(0.09, min(0.30, light)), min(sat, 0.45)))
+    bg = _hex(colorsys.hls_to_rgb(hue, max(0.09, min(0.34, light)), min(sat, 0.65)))
     text = "#DBDEE1"
     acc = accent.upper()
     while _contrast(acc, "#FFFFFF") < 3.6 and _luminance(acc) > 0.02:
@@ -1766,7 +1813,8 @@ def discover_host(room_code: str, target_ip=None, timeout: float = 4.0) -> tuple
 # to a chat is a click instead of retyping the Room Code / Host IP. Entries
 # older than a day are dropped on load, since a host's IP (and so its Room
 # Code) typically changes by the next day anyway. ----
-RECENT_HOSTS_FILE = app_path("chat_gui_recent_hosts.json")
+RECENT_HOSTS_FILE = local_path("chat_gui_recent_hosts.json")
+migrate_to_local(app_path("chat_gui_recent_hosts.json"), RECENT_HOSTS_FILE)
 RECENT_HOSTS_MAX_AGE = 24 * 60 * 60
 RECENT_HOSTS_MAX_ENTRIES = 6
 
@@ -1796,11 +1844,13 @@ def remember_recent_host(room_code: str, host_ip: str, port: int):
     save_recent_hosts(entries[:RECENT_HOSTS_MAX_ENTRIES])
 
 # ---- Bug reports and feature suggestions ----
-REPORTS_FILE = app_path("chat_gui_reports.json")
+REPORTS_FILE = local_path("chat_gui_reports.json")
+migrate_to_local(app_path("chat_gui_reports.json"), REPORTS_FILE)
 REPORTS_KEYBIND = "<Control-Shift-KeyPress-B>"   # opens the report inbox (asks for the password)
-# The inbox "password" is deliberately light — this is a friends' app and the file is readable anyway. It's stored as a
-# SHA-256 of salt + password; to change it: python3 -c "import hashlib; print(hashlib.sha256(b'chat_gui-reports|YOURPASSWORD').hexdigest())"
-REPORTS_PASSWORD_SHA256 = "b7f6b0c151a099ce850f1da345e9e97db90b5f6cc960f5a895e17f337025c07a"
+# The admin password is NOT in this file any more. The report server (your Cloudflare Worker, secret ADMIN_KEY) is what checks it.
+# After a successful online login this computer keeps a slow, salted check of it in its own local folder, only so the inbox can
+# still open offline here — never in the source, never in the app's folder.
+ADMIN_VERIFIER_FILE = local_path("chat_gui_admin_verifier.json")
 # Optional: where reports go so you receive everyone's. Reports are always saved on the computer they were written on; with this
 # set they're also sent to YOUR report server — a free Cloudflare Worker (the code is in report_worker.js, with setup steps) — and
 # the inbox (Ctrl+Shift+B) then shows reports from everyone's computers. Paste the Worker's address between the quotes,
@@ -1841,10 +1891,34 @@ def format_report_text(r: dict) -> str:
     if r.get("description"): lines += ["", r["description"]]
     return "\n".join(lines)
 
-def check_reports_password(attempt: str) -> bool:
+def remember_admin_password(password: str):
+    """After the server has accepted the admin password: keep a salted, deliberately slow hash of it in this computer's local folder
+    (never the password itself) so the inbox can open offline on THIS computer."""
+    salt = os.urandom(16)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, 200_000)
+    if save_json(ADMIN_VERIFIER_FILE, {"salt": salt.hex(), "hash": digest.hex()}) and sys.platform != "win32":
+        try: os.chmod(ADMIN_VERIFIER_FILE, 0o600)
+        except OSError: pass
+
+def check_local_admin_verifier(attempt: str) -> bool:
     import hmac
-    digest = hashlib.sha256(("chat_gui-reports|" + attempt).encode("utf-8")).hexdigest()
-    return hmac.compare_digest(digest, REPORTS_PASSWORD_SHA256)
+    data = load_json(ADMIN_VERIFIER_FILE, dict)
+    try:
+        digest = hashlib.pbkdf2_hmac("sha256", attempt.encode("utf-8"), bytes.fromhex(data["salt"]), 200_000)
+        return hmac.compare_digest(digest.hex(), data["hash"])
+    except (KeyError, TypeError, ValueError):
+        return False
+
+def verify_admin_online(password: str):
+    """-> (True, data) if the report server accepts the admin password, else (False, a message to show)."""
+    code, data = worker_call("/announcement/admin", password=password)
+    if code == 200 and isinstance(data, dict):
+        return True, data
+    if code == 401:
+        return False, "Wrong password."
+    if report_server() is None:
+        return False, "No report server is set, so the admin password can't be checked."
+    return False, "Couldn't reach the server."
 
 def report_server():
     """The report server's address from REPORT_WORKER_URL, or None if it isn't set."""
@@ -2170,7 +2244,8 @@ def get_machine_fingerprint() -> str:
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
 
 GLOBAL_BAN_BEACON_SECONDS = 20       # how often every running copy asks the report server "has the ban list changed?" (a tiny request)
-GLOBAL_BANS_CACHE_FILE = app_path("chat_gui_globalbans_cache.json")
+GLOBAL_BANS_CACHE_FILE = local_path("chat_gui_globalbans_cache.json")
+migrate_to_local(app_path("chat_gui_globalbans_cache.json"), GLOBAL_BANS_CACHE_FILE)
 GLOBAL_BAN_REASON_PREFIX = "Banned from chat_gui: "   # what a room's ban notice says when the publisher bans someone from the whole app
 
 def fetch_global_banlist_github() -> dict:
@@ -2304,7 +2379,8 @@ def run_global_ban_command(cmd: str, arg: str, lookup, password):
         lines = [f"Banned from the whole app ({len(entries)}):"]
         for n, e in enumerate(entries, 1):
             who = e.get("name") or "(unnamed)"
-            lines.append(f"  #{n}  {who}  (device {str(e.get('fingerprint', ''))[:8]}) — {global_ban_until_text(e, skew)}: {e.get('reason') or 'no reason given'}")
+            lines.append(f"  #{n}  {who}  (device {str(e.get('fingerprint', ''))[:8]}) — {global_ban_until_text(e, skew)}: {e.get('reason') or 'no reason given'}"
+                         + ("  [no appeals]" if e.get("appeals") is False else ""))
         lines.append("Lift one with /unglobalban <#, name or device id>.")
         return "\n".join(lines)
 
@@ -2320,9 +2396,11 @@ def run_global_ban_command(cmd: str, arg: str, lookup, password):
         return listing(), None, False
 
     if cmd == "/globalban":
+        no_appeal = re.search(r"(?:^|\s)--no-?appeals?\b", arg, re.I) is not None   # the "no appeals" mark
+        arg = re.sub(r"(?:^|\s)--no-?appeals?\b", "", arg, flags=re.I).strip()
         parts = arg.split(maxsplit=2)
         if not parts:
-            return "Usage: /globalban <name or device id> [time|perm] [reason]   (time: 30, 2h, 7d, 1y …)", None, False
+            return "Usage: /globalban <name or device id> [time|perm] [reason] [--noappeal]   (time: 30, 2h, 7d, 1y …)", None, False
         token = parts[0].strip()
         if re.fullmatch(r"[0-9a-fA-F]{16}", token):
             fp, name = token.lower(), ""
@@ -2340,11 +2418,14 @@ def run_global_ban_command(cmd: str, arg: str, lookup, password):
         until, reason = parse_ban_args(parts)
         entry = {"id": os.urandom(3).hex(), "fingerprint": fp, "name": name, "reason": reason, "date": time.strftime("%Y-%m-%d"),
                  "until": None if until == float("inf") else int(until + skew)}
+        if no_appeal:
+            entry["appeals"] = False   # signed along with the rest, so it can't be switched back on by editing a copy of the app
         error = publish([e for e in entries if e.get("fingerprint") != fp] + [entry])
         if error:
             return error, None, error == "Wrong password."
         who = name or f"device {fp[:8]}"
         text = (f"{who} is now banned from the whole app — {global_ban_until_text(entry, skew)}. Reason: {reason}. "
+                + ("They can't appeal this ban. " if no_appeal else "") +
                 f"Every running copy acts on it within about {GLOBAL_BAN_BEACON_SECONDS} seconds: anyone in a chat is removed and shown the reason.")
         return text, {"fp": fp, "name": name or who, "until": until, "reason": reason}, False
 
@@ -2419,7 +2500,7 @@ def run_global_ban_command(cmd: str, arg: str, lookup, password):
 # install time, so the in-app viewer stays complete going forward
 # without needing the whole history re-embedded on every release.
 EMBEDDED_CHANGELOG = [
-    {   "version": "1.5.1a",
+    {   "version": "1.5.1b",
         "date": "2026-11-19",
         "notes": (
             "Global bans: a person banned from the whole app gets one clear ban screen and can appeal it from there; the "
@@ -2427,7 +2508,11 @@ EMBEDDED_CHANGELOG = [
             "and the reason. Reports: suggestions can be rejected with a reason, and bugs can be marked 'More evidence "
             "required' or 'Intended feature' as well as Completed - the sender is told, with the reason. Muting: unmuting "
             "someone now really clears it when they rejoin, even under a different nickname, and their app is told the "
-            "moment a mute ends. The emoji on the chat buttons no longer go missing on some Windows computers."
+            "moment a mute ends. The emoji on the chat buttons no longer go missing on some Windows computers. The publisher can "
+            "mark a global ban 'no appeals'. The admin password hash is gone from the source, and the ban list, caches and "
+            "reports are kept in a private folder outside the app's own. The Appearance window scrolls with the mouse wheel "
+            "and two-finger scrolling, theme changes reach every window reliably, and installing a missing dependency now "
+            "says which one it installed and whether that worked."
         ),
     },
     {   "version": "1.5.1",
@@ -6401,10 +6486,20 @@ class ChatApp(tk.Tk):
             remap = None
             if CHAT_FONT[0] != old_family or FONT_DELTA != old_delta:
                 remap = self._font_remapper(old_family, CHAT_FONT[0], FONT_DELTA - old_delta)
-            if full or remap:
-                self._retheme_tree(self, full, plain, remap)
-            self._apply_home_picture()
-            self._restyle_titlebars()
+            try:
+                if full or remap:
+                    self._retheme_tree(self, full, plain, remap)
+                # A second look a moment later, for anything built while the first pass ran. It only touches colours that belong
+                # to the OLD theme and are in no way part of the new one, so it can never undo the first pass.
+                unambiguous = {k: v for k, v in full.items() if k not in {c.lower() for c in new_theme.values()}}
+                if unambiguous:
+                    plain2 = {k: v for k, v in unambiguous.items() if k not in (old_theme["accent"].lower(), old_theme["accent_hover"].lower())}
+                    self.after(150, lambda: self._retheme_tree(self, unambiguous, plain2, None))
+                self._apply_home_picture()
+                self._restyle_titlebars()
+            except Exception:
+                import traceback
+                traceback.print_exc()   # never let a recolouring problem stop the choice being saved below
         if save:
             self.settings["appearance"] = cfg
             save_json(SETTINGS_FILE, self.settings)
@@ -6451,8 +6546,12 @@ class ChatApp(tk.Tk):
     def _retheme_tree(self, widget, full, plain, remap_font):
         if getattr(widget, "_no_retheme", False):   # e.g. the theme swatches, which show other themes' colours on purpose
             return
-        self._retheme_widget(widget, full, plain, remap_font)
-        for child in widget.winfo_children():
+        try:
+            self._retheme_widget(widget, full, plain, remap_font)
+            children = widget.winfo_children()
+        except tk.TclError:
+            return   # a window that is closing as we go by: skip IT, not everything after it (that was how colours sometimes didn't apply)
+        for child in children:
             self._retheme_tree(child, full, plain, remap_font)
 
     def _retheme_widget(self, widget, full, plain, remap_font):
@@ -6586,10 +6685,22 @@ class ChatApp(tk.Tk):
         def wheel(event):
             if str(event.widget).startswith(str(box)):   # the font list scrolls itself
                 return
-            step = -1 if (getattr(event, "delta", 0) > 0 or event.num == 4) else 1
-            canvas.yview_scroll(step * (1 if sys.platform == "darwin" else 2), "units")
-        for sequence in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
-            popup.bind(sequence, wheel)
+            if event.num == 4: units = -2                # Linux wheel
+            elif event.num == 5: units = 2
+            elif sys.platform == "darwin": units = -event.delta   # Mac: trackpad two-finger scrolls send small deltas, many of them
+            else: units = -2 * (event.delta // 120 if abs(event.delta) >= 120 else (1 if event.delta > 0 else -1))   # Windows: 120 per notch
+            if units:
+                canvas.yview_scroll(units, "units")
+            return "break"
+        def bind_wheel(widget):
+            """The wheel only reaches the widget under the pointer, and a binding on the window alone isn't reliably seen from every widget
+            inside it — so every part of the window gets it (the font list is skipped: it scrolls itself)."""
+            if widget is box:
+                return
+            for sequence in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+                widget.bind(sequence, wheel, add="+")
+            for child in widget.winfo_children():
+                bind_wheel(child)
         tk.Label(body, text="🎨  Appearance", bg=BG_PANEL, fg=FG_TEXT, font=fnt(14, "bold")).pack(anchor="w")
         tk.Label(body, text="Just for this computer — nobody else sees your choices, and they're remembered next time.",
                  bg=BG_PANEL, fg=FG_MUTED, font=fnt(9), wraplength=px(440), justify="left").pack(anchor="w", pady=(4, 10))
@@ -6642,6 +6753,8 @@ class ChatApp(tk.Tk):
             custom_chips[which] = chip
         tk.Label(custom_row, text="Backgrounds stay fairly dark and light accents get a little darker, so text stays readable.",
                  bg=BG_PANEL, fg=FG_MUTED, font=fnt(8), wraplength=px(440), justify="left").grid(row=1, column=0, columnspan=6, sticky="w", pady=(4, 0))
+        custom_note = tk.Label(custom_row, text="", bg=BG_PANEL, fg=COLOR_PALETTE["yellow"], font=fnt(8), wraplength=px(440), justify="left")
+        custom_note.grid(row=2, column=0, columnspan=6, sticky="w")
 
         # -- font --
         heading("TEXT", top=12)
@@ -6756,6 +6869,11 @@ class ChatApp(tk.Tk):
             size_label.configure(text=f"{cfg['font_size'] or DEFAULT_FONT_SIZE} pt")
             if cfg["home_image"]: remove_btn.pack(side="left", padx=(8, 0))
             else: remove_btn.pack_forget()
+            adjusted = []
+            if cfg["theme"] == "custom":
+                if cfg["custom_bg"].upper() != effective["bg"].upper(): adjusted.append(f"background → {effective['bg']}")
+                if cfg["custom_accent"].upper() != effective["accent"].upper(): adjusted.append(f"accent → {effective['accent']}")
+            custom_note.configure(text=("Adjusted so text stays readable: " + ", ".join(adjusted)) if adjusted else "")
             if not pic_status.cget("fg") == COLOR_PALETTE["red"]:
                 pic_status.configure(text="")
             popup.update_idletasks()
@@ -6765,6 +6883,7 @@ class ChatApp(tk.Tk):
         room = popup.winfo_screenheight() - px(190)
         canvas.configure(width=body.winfo_reqwidth(), height=min(body.winfo_reqheight(), room))
         canvas.configure(scrollregion=canvas.bbox("all"))
+        bind_wheel(popup)
 
     def _set_default_appearance(self):
         try: os.remove(HOME_IMAGE_FILE)
@@ -7242,6 +7361,7 @@ class ChatApp(tk.Tk):
             ok, value = result if isinstance(result, tuple) else (False, "Something went wrong.")
             if ok:
                 self._report_login_failures = 0
+                remember_admin_password(password)   # a salted, slow hash in this computer's local folder — for offline use of the inbox here
                 self._close_popup(name)
                 on_ok(password, value)
             else:
@@ -7267,7 +7387,7 @@ class ChatApp(tk.Tk):
 
     def _open_restore_flow(self):
         self._ask_admin_password("restore_login", "Restore a previous version",
-                                 lambda pw: (True, None) if check_reports_password(pw) else (False, "Wrong password."),
+                                 verify_admin_online,
                                  lambda pw, _: self._open_restore_window())
 
     def _open_restore_window(self):
@@ -7802,11 +7922,12 @@ class ChatApp(tk.Tk):
             busy["on"] = False
             code, data = result if isinstance(result, tuple) else (None, None)
             if code == 200 and isinstance(data, dict):
+                remember_admin_password(password)
                 opened(password, data.get("reports") or [])
             elif code == 401:
                 fail("Wrong password.")
             elif code is None:  # can't reach the server: fall back to this computer's own reports
-                if check_reports_password(password):
+                if check_local_admin_verifier(password):
                     opened(None, None, "Couldn't reach the report server — showing only the reports saved on this computer.")
                 else:
                     status.configure(text="Couldn't reach the report server (offline? or the address is wrong).", fg=self.STATUS_COLORS["error"])
@@ -7823,7 +7944,7 @@ class ChatApp(tk.Tk):
                 busy["on"] = True
                 status.configure(text="Checking…", fg=FG_MUTED)
                 self._run_bg(lambda: worker_call("/reports", password=password), lambda result: server_answered(password, result))
-            elif check_reports_password(password):
+            elif check_local_admin_verifier(password):
                 opened(None, None)
             else:
                 fail("Wrong password.")
@@ -8132,8 +8253,8 @@ class ChatApp(tk.Tk):
 
     def _gban_appeal_ids(self):
         entry = self._gban_entry
-        if not entry or not entry.get("id") or report_server() is None:
-            return None   # an older ban (from before appeals) can't be appealed here
+        if not entry or not entry.get("id") or report_server() is None or entry.get("appeals") is False:
+            return None   # an older ban (from before appeals), or one the publisher marked "no appeals", can't be appealed here
         return {"fingerprint": str(entry["fingerprint"]), "ban_id": str(entry["id"])}
 
     def _refresh_gban_appeal(self):
@@ -8162,7 +8283,9 @@ class ChatApp(tk.Tk):
         def line(text, color=None, bold=False):
             tk.Label(box, text=text, bg=BG_PANEL, fg=color or FG_TEXT, font=BOLD_FONT if bold else CHAT_FONT, wraplength=px(420), justify="left").pack(anchor="w", pady=(2, 0))
         ids = self._gban_appeal_ids()
-        if ids is None:
+        if entry.get("appeals") is False:
+            line("Appeals are turned off for this ban.", FG_MUTED)
+        elif ids is None:
             line("To appeal, contact the app's publisher.", FG_MUTED)
         elif status == "open":
             line("📨  Your appeal was sent. The answer will appear here.", COLOR_PALETTE["yellow"])
@@ -8193,6 +8316,8 @@ class ChatApp(tk.Tk):
                     elif code == 409:   # already appealed (perhaps from another copy): show what became of it
                         self._gban_appeal = {"status": str(data.get("status") or "open"), "note": str(data.get("note") or "")}
                         self._render_gban_appeal()
+                    elif code == 403:
+                        self._render_gban_appeal("Appeals are turned off for this ban.")
                     elif code == 400:
                         self._render_gban_appeal("This ban isn't on the list any more — it may already have been lifted.")
                     elif code == 429:
