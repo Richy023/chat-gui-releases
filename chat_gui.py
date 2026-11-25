@@ -1,8 +1,19 @@
 #!/usr/bin/env python3
 """
-chat_gui.py — v1.5.1b — ENCRYPTED instant messenger with a desktop GUI.
+chat_gui.py — v1.5.1c — ENCRYPTED instant messenger with a desktop GUI.
 
-Changes in 1.5.1b:
+Changes in 1.5.1c:
+- The Appearance window now scrolls with the mouse wheel and two-finger scrolling (it only responded to its scroll bar).
+- Colours: a theme change now reaches every window even if one is closing while it happens, with a quick second check for
+  anything missed, and a custom colour that had to be adjusted for readability says so. Custom backgrounds keep more of
+  the colour you picked.
+- Installing a missing dependency (on a new computer) now happens in a small window — one line per dependency, ticked
+  when it installed successfully, or showing exactly what to run if it couldn't — instead of in a terminal, and it needs
+  no administrator rights. (It still prints the same lines for anyone running from a terminal.)
+- No more black terminal window on Windows: double-click the new chat_gui.pyw (kept beside chat_gui.py) instead. If
+  chat_gui.py is double-clicked anyway, the window is hidden when it can be.
+
+Changes in 1.5.1a:
 - Global bans: someone banned from the whole app now gets one clear ban screen (no more stray room-ban notices or repeated
   notifications) and can APPEAL it from that screen. The publisher gets an alert and decides with /globalappeals and
   /globalappeal accept|reject; the banned person sees the decision, and the reason, on their screen. One appeal per ban.
@@ -18,12 +29,6 @@ Changes in 1.5.1b:
   server checks it, and this computer keeps only a slow, salted check of its own for offline use. The host's ban list,
   the global-ban cache, recent hosts and your reports now live in this computer's private app-data folder instead of next
   to chat_gui.py (moved automatically); on Windows that folder is the local one, not the one a school/work network copies.
-- The Appearance window now scrolls with the mouse wheel and two-finger scrolling (it only responded to its scroll bar).
-- Colours: a theme change now reaches every window even if one is closing while it happens, with a quick second check for
-  anything missed, and a custom colour that had to be adjusted for readability says so. Custom backgrounds keep more of
-  the colour you picked.
-- Installing a missing dependency (on a new computer) now prints which one it is installing and that it installed
-  successfully, or exactly what to run if it couldn't.
 
 Changes in 1.5.1:
 - Appearance (new): a 🎨 button in the chat, an "Appearance" link on the main menu, or Ctrl+Shift+T. Pick a theme
@@ -98,18 +103,6 @@ Changes in 1.5.0c:
   on the computer they were written on and, if REPORT_WORKER_URL points at your report server (the
   free Cloudflare Worker in report_worker.js), sent there too. Ctrl+Shift+B opens the report inbox
   (password protected) — with a report server set, it shows everyone's reports.
-
-Changes in 1.5.0b:
-- Durations in /mute, /ban and /ipban now take units: 30 (minutes, as before), 90m, 2h, 7d, 2w,
-  3mo, 1y. Months and years are calendar ones — "1y" ends at the same date and time next year.
-  (A year typed as a number of minutes is easy to get slightly wrong: 365 days is 525,600 minutes,
-  and 8,765 hours' worth lands 5 hours late.)
-- /unwarn no longer guesses: with more than one active warning it lists them and asks which to
-  remove (/unwarn <name> <#>, or /unwarn <name> all). With just one, it removes that one.
-- Several warnings at once: the ⚠ button now shows all your active warnings ("⚠ Warnings #1, #3").
-  With more than one, clicking it opens a menu of them; pick one to see who warned you, why, its
-  appeal status, and to appeal it. Warnings (and their appeal status) are remembered by the host,
-  so they're still there if you leave and rejoin the chat.
 """
 
 import sys
@@ -131,6 +124,7 @@ import unicodedata
 import base64
 import hashlib
 import importlib
+import importlib.util
 import subprocess
 import json
 import shutil
@@ -148,44 +142,227 @@ from tkinter import colorchooser, filedialog, messagebox, scrolledtext, simpledi
 # FEATURE TOGGLE: WAN (Wide Area Network) / Global Room Support
 ENABLE_WAN_RELAY = False
 
+# Started with pythonw / chat_gui.pyw (no console)? Then there is no stdout or stderr to write to: give them somewhere harmless to go.
+for _stream_name in ("stdout", "stderr"):
+    if getattr(sys, _stream_name, None) is None:
+        setattr(sys, _stream_name, open(os.devnull, "w", encoding="utf-8"))
+
 def _dep_say(text):
     try: print(text, flush=True)
-    except Exception: pass   # no console (e.g. started with pythonw): nothing to print to
+    except Exception: pass   # no console to print to
+
+def _hide_own_console():
+    """Windows, double-clicked chat_gui.py: python.exe opens a black console window. If that console belongs to this app alone (nobody
+    typed the command into a terminal, only the Python launcher is on it), hide it. Best effort and silent. (chat_gui.pyw avoids the
+    window altogether — and, on Windows 11 with Windows Terminal as the default, only that way is the window avoided.)"""
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+        k32 = ctypes.windll.kernel32
+        k32.OpenProcess.restype = ctypes.c_void_p
+        hwnd = k32.GetConsoleWindow()
+        if not hwnd:
+            return
+        pids = (ctypes.c_uint * 16)()
+        count = k32.GetConsoleProcessList(pids, 16)
+        if count < 1 or count > 16:
+            return
+        for pid in list(pids)[:count]:
+            if pid == os.getpid():
+                continue
+            handle = k32.OpenProcess(0x1000, False, pid)   # PROCESS_QUERY_LIMITED_INFORMATION
+            if not handle:
+                return   # can't tell who else is on this console: leave it alone
+            buf, size = ctypes.create_unicode_buffer(520), ctypes.c_uint(520)
+            found = k32.QueryFullProcessImageNameW(ctypes.c_void_p(handle), 0, buf, ctypes.byref(size))
+            k32.CloseHandle(ctypes.c_void_p(handle))
+            if not found or os.path.basename(buf.value).lower() not in ("py.exe", "pyw.exe", "python.exe", "pythonw.exe"):
+                return   # a shell (cmd, PowerShell…) shares it: someone is using this window
+        ctypes.windll.user32.ShowWindow(hwnd, 0)   # SW_HIDE
+    except Exception:
+        pass
+
+# What the app needs: (import name, pip name, required?, what it's for)
+DEPENDENCIES = [
+    ("cryptography", "cryptography", True, "encryption"),
+    ("plyer", "plyer", False, "desktop notifications"),
+    ("PIL", "Pillow", False, "pictures, stickers and screenshots"),
+] + ([("pyobjus", "pyobjus", False, "Mac notifications")] if sys.platform == "darwin" else [])
+_DEP_FAILED = set()   # pip names that were tried and couldn't be installed (so they aren't tried a second time)
+
+def _pip_install(pip_name):
+    """-> (installed?, last error). Quiet; on Windows pip gets no console window of its own."""
+    flags = {"creationflags": 0x08000000} if sys.platform == "win32" else {}   # CREATE_NO_WINDOW
+    last_error = ""
+    for extra in ([], ["--user"], ["--break-system-packages"]):
+        try:
+            result = subprocess.run([sys.executable, "-m", "pip", "install", "-q", *extra, pip_name],
+                                    stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=600, **flags)
+        except Exception as e:
+            last_error = str(e)
+            continue
+        if result.returncode == 0:
+            return True, ""
+        lines = (result.stderr or b"").decode("utf-8", "replace").strip().splitlines()
+        last_error = lines[-1] if lines else f"pip exited with code {result.returncode}"
+    return False, last_error
+
+def _install_dependencies_window(missing) -> bool:
+    """Installs what's missing while showing it in a small window — one line per dependency, with a tick when it worked — instead of in
+    a terminal. -> False if there's no Tk to draw it with (the terminal version below then does the job)."""
+    try:
+        import tkinter as _tk
+        if sys.platform == "win32":
+            try:
+                import ctypes
+                ctypes.windll.shcore.SetProcessDpiAwareness(2)   # crisp text (the main window asks again later; asking twice is harmless)
+            except Exception:
+                pass
+        root = _tk.Tk()
+    except Exception:
+        return False
+    BG, PANEL, FG, MUTED, GREEN, RED, ACCENT = "#313338", "#2B2D31", "#DBDEE1", "#949BA4", "#57F287", "#ED4245", "#5B8CFF"
+    family = "Segoe UI" if sys.platform == "win32" else ("Helvetica Neue" if sys.platform == "darwin" else "DejaVu Sans")
+    root.title("chat_gui — first-time setup")
+    root.configure(bg=BG)
+    root.resizable(False, False)
+    card = _tk.Frame(root, bg=PANEL, padx=28, pady=22)
+    card.pack(padx=18, pady=18)
+    _tk.Label(card, text="Setting up chat_gui", bg=PANEL, fg=FG, font=(family, 15, "bold")).pack(anchor="w")
+    _tk.Label(card, text="It needs a few extra parts the first time. This happens once, needs no administrator rights, and can take a minute.",
+              bg=PANEL, fg=MUTED, font=(family, 9), wraplength=430, justify="left").pack(anchor="w", pady=(4, 14))
+    rows = {}
+    for import_name, pip_name, required, purpose in missing:
+        row = _tk.Frame(card, bg=PANEL)
+        row.pack(fill="x", pady=3)
+        _tk.Label(row, text=f"{pip_name}", bg=PANEL, fg=FG, font=(family, 10, "bold"), width=14, anchor="w").pack(side="left")
+        _tk.Label(row, text=purpose, bg=PANEL, fg=MUTED, font=(family, 9), width=34, anchor="w").pack(side="left")
+        status = _tk.Label(row, text="waiting", bg=PANEL, fg=MUTED, font=(family, 10), width=24, anchor="w")
+        status.pack(side="left")
+        rows[pip_name] = status
+    summary = _tk.Label(card, text="", bg=PANEL, fg=FG, font=(family, 10), wraplength=430, justify="left")
+    summary.pack(anchor="w", pady=(14, 0))
+    buttons = _tk.Frame(card, bg=PANEL)
+    buttons.pack(anchor="e", pady=(12, 0))
+    root._cg_buttons = {}   # (so a test can press them)
+    events = queue.Queue()
+    results = {}
+    state = {"finished": False, "dots": 0, "current": None}
+
+    def work():
+        for import_name, pip_name, required, purpose in missing:
+            events.put(("start", pip_name))
+            _dep_say(f"[deps] {pip_name} ({purpose}): not found — installing automatically...")
+            ok, error = _pip_install(pip_name)
+            if ok:
+                importlib.invalidate_caches()   # so Python notices what pip just added
+                try:
+                    importlib.import_module(import_name)
+                except ImportError as e:
+                    ok, error = False, f"installed, but it still can't be imported ({e})"
+            if ok:
+                _dep_say(f"[deps] {pip_name}: installed successfully ✓")
+            else:
+                _dep_say(f"[deps] {pip_name}: could NOT be installed automatically ({error}).")
+                _DEP_FAILED.add(pip_name)
+            results[pip_name] = (ok, error)
+            events.put(("done", pip_name))
+        events.put(("finished", None))
+
+    def add_button(text, command, primary=False):
+        button = _tk.Label(buttons, text=text, bg=ACCENT if primary else "#4E5058", fg="white", font=(family, 10, "bold"), padx=16, pady=5, cursor="hand2")
+        button.pack(side="left", padx=(8, 0))
+        button.bind("<Button-1>", lambda e: command())
+        root._cg_buttons[text] = button
+
+    def finish():
+        state["finished"] = True
+        required_failed = [(pn, results[pn][1]) for ic, pn, rq, pu in missing if rq and not results[pn][0]]
+        optional_failed = [(pn, results[pn][1], pu) for ic, pn, rq, pu in missing if not rq and not results[pn][0]]
+        if not required_failed and not optional_failed:
+            summary.configure(text="All set ✓  Starting chat_gui…", fg=GREEN)
+            root.after(900, root.destroy)
+            return
+        failed = required_failed + [(pn, er) for pn, er, pu in optional_failed]
+        commands = "\n".join(f"{sys.executable} -m pip install {pn}" for pn, er in failed)
+        if required_failed:
+            summary.configure(text=(f"{required_failed[0][0]} is required and couldn't be installed ({required_failed[0][1]}). chat_gui can't start "
+                                    f"without it. You can install it yourself by running:\n{commands}"), fg=RED)
+            def close():
+                state["quit"] = True
+                root.destroy()
+            add_button("Copy command", lambda: (root.clipboard_clear(), root.clipboard_append(commands)))
+            add_button("Close", close, primary=True)
+            root.protocol("WM_DELETE_WINDOW", close)
+        else:
+            lost = ", ".join(f"{pu}" for pn, er, pu in optional_failed)
+            summary.configure(text=(f"Some optional parts couldn't be installed, so chat_gui will start without them: {lost} won't work. "
+                                    f"To add them later, run:\n{commands}"), fg="#FEE75C")
+            add_button("Copy command", lambda: (root.clipboard_clear(), root.clipboard_append(commands)))
+            add_button("Continue", root.destroy, primary=True)
+            root.protocol("WM_DELETE_WINDOW", root.destroy)
+
+    def poll():
+        try:
+            while True:
+                kind, name = events.get_nowait()
+                if kind == "start":
+                    state["current"] = name
+                    rows[name].configure(text="installing…", fg=FG)
+                elif kind == "done":
+                    ok, error = results[name]
+                    rows[name].configure(text="installed successfully ✓" if ok else "couldn't be installed ✗", fg=GREEN if ok else RED)
+                    state["current"] = None
+                elif kind == "finished":
+                    return finish()
+        except queue.Empty:
+            pass
+        if state["current"]:   # a little life while pip works
+            state["dots"] = (state["dots"] + 1) % 4
+            rows[state["current"]].configure(text="installing" + "." * (state["dots"] + 1))
+        root.after(350, poll)
+
+    root.protocol("WM_DELETE_WINDOW", lambda: None)   # can't be closed half-way through an install
+    root.update_idletasks()
+    root.geometry(f"+{max(0, (root.winfo_screenwidth() - root.winfo_reqwidth()) // 2)}+{max(0, (root.winfo_screenheight() - root.winfo_reqheight()) // 3)}")
+    threading.Thread(target=work, daemon=True).start()
+    root.after(200, poll)
+    root.mainloop()
+    try: root.destroy()
+    except Exception: pass
+    if state.get("quit"):
+        sys.exit(1)
+    return True
+
+def _install_missing_dependencies():
+    missing = [d for d in DEPENDENCIES if importlib.util.find_spec(d[0]) is None]
+    if missing:
+        _install_dependencies_window(missing)   # (with no Tk it returns False and ensure_installed below does it in the terminal)
 
 def ensure_installed(import_name, pip_name=None, required=True, purpose=""):
-    """Imports a module, installing it with pip first if this computer doesn't have it, and says so for each one:
-    which dependency, that it's being installed, and whether that worked."""
+    """Imports a module, installing it with pip first if this computer doesn't have it (normally the setup window above has already
+    done that). Says which dependency it is and whether it worked."""
     pip_name = pip_name or import_name
     try:
         return importlib.import_module(import_name)
     except ImportError:
         pass
-
+    if pip_name in _DEP_FAILED:   # the setup window already tried, and told the person
+        if required:
+            sys.exit(1)
+        return None
     what = f"{pip_name} ({purpose})" if purpose else pip_name
     _dep_say(f"[deps] {what}: not found — installing automatically...")
-    attempts = [
-        [sys.executable, "-m", "pip", "install", "-q", pip_name],
-        [sys.executable, "-m", "pip", "install", "-q", "--user", pip_name],
-        [sys.executable, "-m", "pip", "install", "-q", "--break-system-packages", pip_name],
-    ]
-    last_error = ""
-    for cmd in attempts:
+    ok, last_error = _pip_install(pip_name)
+    if ok:
+        importlib.invalidate_caches()
         try:
-            result = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=600)
-        except Exception as e:
-            last_error = str(e)
-            continue
-        if result.returncode == 0:
-            importlib.invalidate_caches()   # so Python notices what pip just added
-            try:
-                module = importlib.import_module(import_name)
-            except ImportError as e:
-                last_error = f"installed, but it still can't be imported ({e})"
-                continue
+            module = importlib.import_module(import_name)
             _dep_say(f"[deps] {pip_name}: installed successfully ✓")
             return module
-        lines = (result.stderr or b"").decode("utf-8", "replace").strip().splitlines()
-        last_error = lines[-1] if lines else f"pip exited with code {result.returncode}"
+        except ImportError as e:
+            last_error = f"installed, but it still can't be imported ({e})"
     _dep_say(f"[deps] {pip_name}: could NOT be installed automatically ({last_error}).")
     _dep_say(f"[deps]   To install it yourself run:  {sys.executable} -m pip install {pip_name}")
     if required:
@@ -194,6 +371,9 @@ def ensure_installed(import_name, pip_name=None, required=True, purpose=""):
     _dep_say(f"[deps] Carrying on without {pip_name}" + (f" — {purpose} won't be available." if purpose else "."))
     return None
 
+if __name__ == "__main__":
+    _hide_own_console()
+_install_missing_dependencies()
 ensure_installed("cryptography", purpose="encryption")
 from cryptography.fernet import Fernet, InvalidToken
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey, Ed25519PrivateKey
@@ -214,7 +394,7 @@ except ImportError:
 if sys.platform == "darwin":
     ensure_installed("pyobjus", required=False, purpose="Mac notifications")
 
-VERSION = "1.5.1b"
+VERSION = "1.5.1c"
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -324,7 +504,7 @@ DEFAULT_TCP_PORT = 47615   # hosts try this port first, so a joiner can reach th
 # how to produce a manifest and keep the signing key itself OFFLINE —
 # only the public key belongs in this file.
 UPDATE_MANIFEST_URL = "https://raw.githubusercontent.com/Richy023/chat-gui-releases/main/update_manifest.json"
-UPDATE_PUBLIC_KEY_B64 = "4LZlItmybHdIwMNCJ/luG+sEtG9uc/W9FEjJz3d6URM="
+UPDATE_PUBLIC_KEY_B64 = "buYuGiOKh5LYltgmbUH9S63A10/DGcuyGWz9PzZp85A="
 
 TYPING_IDLE_TIMEOUT = 2
 TYPING_DISPLAY_TIMEOUT = 2.0  
@@ -2500,7 +2680,15 @@ def run_global_ban_command(cmd: str, arg: str, lookup, password):
 # install time, so the in-app viewer stays complete going forward
 # without needing the whole history re-embedded on every release.
 EMBEDDED_CHANGELOG = [
-    {   "version": "1.5.1b",
+    {   "version": "1.5.1c",
+        "date": "2026-11-19",
+        "notes": (
+            "The Appearance window now scrolls with the mouse wheel and two-finger scrolling, theme changes reach every "
+            "window reliably, and installing a missing dependency now happens in a small window (a tick per dependency) instead of "
+            "a terminal. Double-click the new chat_gui.pyw to start the app without a black terminal window."
+        ),
+    },
+    {   "version": "1.5.1a",
         "date": "2026-11-19",
         "notes": (
             "Global bans: a person banned from the whole app gets one clear ban screen and can appeal it from there; the "
@@ -2510,9 +2698,7 @@ EMBEDDED_CHANGELOG = [
             "someone now really clears it when they rejoin, even under a different nickname, and their app is told the "
             "moment a mute ends. The emoji on the chat buttons no longer go missing on some Windows computers. The publisher can "
             "mark a global ban 'no appeals'. The admin password hash is gone from the source, and the ban list, caches and "
-            "reports are kept in a private folder outside the app's own. The Appearance window scrolls with the mouse wheel "
-            "and two-finger scrolling, theme changes reach every window reliably, and installing a missing dependency now "
-            "says which one it installed and whether that worked."
+            "reports are kept in a private folder outside the app's own."
         ),
     },
     {   "version": "1.5.1",
